@@ -237,7 +237,7 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
 
   std::vector<Eigen::Vector3d> start_end_derivative(6, Eigen::Vector3d::Zero());
   Eigen::MatrixXd ctrl_pts;
-  UniformBspline::parameterizeToBspline(bspline_interval_, point_set,
+  ego_planner::UniformBspline::parameterizeToBspline(bspline_interval_, point_set,
                                         start_end_derivative, ctrl_pts);
   if (ctrl_pts.cols() < order_ + 1)
     return false;
@@ -283,7 +283,7 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     cps_.points(row, col) = q[k];
   }
 
-  UniformBspline traj(cps_.points, order_, bspline_interval_);
+  ego_planner::UniformBspline traj(cps_.points, order_, bspline_interval_);
   double tm, tmp;
   traj.getTimeSpan(tm, tmp);
   const double duration = std::max(0.0, tmp - tm);
