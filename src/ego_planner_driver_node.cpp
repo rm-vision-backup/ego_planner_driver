@@ -43,6 +43,7 @@ class EgoPlannerDriverNode
 public:
   EgoPlannerDriverNode()
   {
+    ros::NodeHandle nh;
     ros::NodeHandle pnh("~");
     EgoPlannerConfig config;
     config.ts = pnh.param("ts", 0.4);
@@ -58,26 +59,32 @@ public:
     config.g_epsilon = pnh.param("g_epsilon", 0.01);
     core_.reset(new EgoPlannerCore(config));
     frame_id_ = pnh.param("frame_id", std::string("map"));
-    uav_id_ = pnh.param("uav_id", std::string("A01"));
-    exec_target_ = pnh.param("exec_target", std::string("UAV1"));
+    // Identity parameters live in the public namespace (/UAV1/*) so the
+    // Python driver and topology can discover them; planner tuning stays
+    // private.
+    uav_id_ = nh.param("uav_id", std::string("A01"));
+    exec_target_ = nh.param("exec_target", std::string("UAV1"));
     setpoint_rate_ = pnh.param("setpoint_rate_hz", kSetpointRateHz);
     pose_timeout_ = pnh.param("local_pose_timeout_s", 1.0);
     pos_tol_ = pnh.param("position_tolerance_m", 0.2);
     stable_s_ = pnh.param("arrival_stable_s", 1.0);
     timeout_margin_ = pnh.param("exec_timeout_margin_s", 5.0);
 
-    setpoint_pub_ = pnh.advertise<geometry_msgs::PoseStamped>("setpoint", 10);
-    intent_pub_ = pnh.advertise<swarm_uav_interfaces::UavTrajectoryIntent>("trajectory_intent", 10);
-    state_pub_ = pnh.advertise<std_msgs::String>("exec_state", 10, true);
-    goal_sub_ = pnh.subscribe("goal", 1, &EgoPlannerDriverNode::onGoal, this);
-    goal_yaw_sub_ = pnh.subscribe("goal_yaw", 1, &EgoPlannerDriverNode::onGoalYaw, this);
-    waypoints_sub_ = pnh.subscribe("waypoints", 1, &EgoPlannerDriverNode::onWaypoints, this);
-    pose_sub_ = pnh.subscribe("local_pose", 1, &EgoPlannerDriverNode::onLocalPose, this);
-    intent_sub_ = pnh.subscribe("neighbor_intent", 10, &EgoPlannerDriverNode::onNeighborIntent, this);
-    hold_sub_ = pnh.subscribe("hold", 1, &EgoPlannerDriverNode::onHold, this);
+    // Interface topics live under the public namespace (/UAV1/*) so the
+    // Python EgoSwarmDriver and topology bridge can reach them without
+    // knowing the private roslaunch node name. Parameters stay private.
+    setpoint_pub_ = nh.advertise<geometry_msgs::PoseStamped>("setpoint", 10);
+    intent_pub_ = nh.advertise<swarm_uav_interfaces::UavTrajectoryIntent>("trajectory_intent", 10);
+    state_pub_ = nh.advertise<std_msgs::String>("exec_state", 10, true);
+    goal_sub_ = nh.subscribe("goal", 1, &EgoPlannerDriverNode::onGoal, this);
+    goal_yaw_sub_ = nh.subscribe("goal_yaw", 1, &EgoPlannerDriverNode::onGoalYaw, this);
+    waypoints_sub_ = nh.subscribe("waypoints", 1, &EgoPlannerDriverNode::onWaypoints, this);
+    pose_sub_ = nh.subscribe("local_pose", 1, &EgoPlannerDriverNode::onLocalPose, this);
+    intent_sub_ = nh.subscribe("neighbor_intent", 10, &EgoPlannerDriverNode::onNeighborIntent, this);
+    hold_sub_ = nh.subscribe("hold", 1, &EgoPlannerDriverNode::onHold, this);
     setState(ST_IDLE);
-    timer_ = pnh.createTimer(ros::Duration(1.0 / setpoint_rate_),
-                             &EgoPlannerDriverNode::publishSetpoint, this);
+    timer_ = nh.createTimer(ros::Duration(1.0 / setpoint_rate_),
+                            &EgoPlannerDriverNode::publishSetpoint, this);
     replan_thread_ = std::thread(&EgoPlannerDriverNode::replanLoop, this);
   }
 
@@ -397,7 +404,6 @@ private:
     }
   }
 
-  ros::NodeHandle pnh_;
   std::unique_ptr<EgoPlannerCore> core_;
   std::string frame_id_;
   std::string uav_id_;
