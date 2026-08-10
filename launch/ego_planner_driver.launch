@@ -1,16 +1,15 @@
 <launch>
+  <!-- 机载/仿真统一形态：本机无 namespace 前缀（与 MAVROS /mavros/* 一致），
+       机间区分交给 swarm_topology_bridge 的源前缀（/<邻居>/trajectory_intent）。
+       单 Master 多 UAV 场景由每机独立 ROS Master 承担隔离（见 uav_offboard_sim.launch）。 -->
   <arg name="uav_id" default="A01"/>
   <arg name="exec_target" default="UAV1"/>
-  <arg name="namespace" default="$(arg exec_target)"/>
 
-  <!-- Identity parameters live in the public namespace (/UAV1/*) so the
-       Python EgoSwarmDriver and topology bridge can discover them. -->
-  <group ns="$(arg namespace)">
-    <param name="uav_id" value="$(arg uav_id)"/>
-    <param name="exec_target" value="$(arg exec_target)"/>
-  </group>
+  <!-- 身份参数放全局（/uav_id、/exec_target），供 EgoSwarmDriver 与 bridge 发现。 -->
+  <param name="uav_id" value="$(arg uav_id)"/>
+  <param name="exec_target" value="$(arg exec_target)"/>
 
-  <node pkg="ego_planner_driver" type="ego_planner_driver_node" name="ego_planner_driver" output="screen" ns="$(arg namespace)">
+  <node pkg="ego_planner_driver" type="ego_planner_driver_node" name="ego_planner_driver" output="screen">
     <param name="frame_id" value="map"/>
     <param name="ts" value="0.4"/>
     <param name="max_vel" value="8.0"/>
