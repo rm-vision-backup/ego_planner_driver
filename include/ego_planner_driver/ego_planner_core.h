@@ -25,6 +25,7 @@ struct EgoPlannerConfig
   double lambda_smooth = 1.0;
   double lambda_swarm = 1.0;
   double lambda_feasibility = 1.0;
+  double lambda_terminal = 1.0;
   int max_iterations = 200;
   int mem_size = 16;
   double g_epsilon = 0.01;
@@ -126,6 +127,8 @@ private:
                           Eigen::MatrixXd& gradient) const;
   void calcFeasibilityCost(const Eigen::MatrixXd& q, double& cost,
                            Eigen::MatrixXd& gradient) const;
+  void calcTerminalCost(const Eigen::MatrixXd& q, double& cost,
+                        Eigen::MatrixXd& gradient);
   void calcSwarmCost(const Eigen::MatrixXd& q, double& cost,
                      Eigen::MatrixXd& gradient);
   static double costFunction(void* data, const double* x, double* grad,
@@ -137,6 +140,7 @@ private:
   int variable_num_ = 0;
   ControlPoints cps_;
   std::vector<NeighborTrajectory> neighbors_;
+  Eigen::Vector3d local_target_pt_ = Eigen::Vector3d::Zero();
 };
 
 } // namespace ego_planner_driver

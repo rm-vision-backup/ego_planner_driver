@@ -63,13 +63,18 @@ void EgoPlannerCore::combineCost(const double* x, double* grad, double& cost,
   calcSmoothnessCost(q, f_smooth, g_smooth);
   calcFeasibilityCost(q, f_feas, g_feas);
   calcSwarmCost(q, f_swarm, g_swarm);
+  double f_terminal;
+  Eigen::MatrixXd g_terminal = Eigen::MatrixXd::Zero(3, cps_.size);
+  calcTerminalCost(q, f_terminal, g_terminal);
 
   cost = config_.lambda_smooth * f_smooth +
          config_.lambda_feasibility * f_feas +
-         config_.lambda_swarm * f_swarm;
+         config_.lambda_swarm * f_swarm +
+         config_.lambda_terminal * f_terminal;
   const Eigen::MatrixXd gradient = config_.lambda_smooth * g_smooth +
                                    config_.lambda_feasibility * g_feas +
-                                   config_.lambda_swarm * g_swarm;
+                                   config_.lambda_swarm * g_swarm +
+                                   config_.lambda_terminal * g_terminal;
 
   for (int k = 0; k < n; ++k)
   {
@@ -192,6 +197,21 @@ void EgoPlannerCore::calcSwarmCost(const Eigen::MatrixXd& q, double& cost,
   }
 }
 
+void EgoPlannerCore::calcTerminalCost(const Eigen::MatrixXd& q, double& cost,
+                                       Eigen::MatrixXd& gradient)
+{
+  cost = 0.0;
+  const int n = q.cols();
+  const Eigen::Vector3d q_3 = q.col(n - 3);
+  const Eigen::Vector3d q_2 = q.col(n - 2);
+  const Eigen::Vector3d q_1 = q.col(n - 1);
+  const Eigen::Vector3d dq = (q_3 + 4.0 * q_2 + q_1) / 6.0 - local_target_pt_;
+  cost += dq.squaredNorm();
+  gradient.col(n - 3) += 2.0 * dq * (1.0 / 6.0);
+  gradient.col(n - 2) += 2.0 * dq * (4.0 / 6.0);
+  gradient.col(n - 1) += 2.0 * dq * (1.0 / 6.0);
+}
+
 double EgoPlannerCore::costFunction(void* data, const double* x, double* grad,
                                     const int n)
 {
@@ -222,31 +242,52 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
                               const std::vector<NeighborTrajectory>& neighbors,
                               TimedTrajectory& out, double& final_cost)
 {
+  if (sparse_waypoints.empty())
+  {
+    out.t.assign(1, 0.0);
+    out.pts.assign(1, start.position);
+    out.yaw.assign(1, start.yaw);
+    final_cost = 0.0;
+    return true;
+  }
   std::vector<Eigen::Vector3d> point_set;
   point_set.reserve(sparse_waypoints.size() + 1);
   point_set.push_back(start.position);
   for (const auto& waypoint : sparse_waypoints)
     point_set.push_back(waypoint.position);
 
-  while (point_set.size() <= 3)
+  // The parameterization yields (K+2) control points and the optimizer pins
+  // the first and last order_ (=3) columns, so K must be at least 5 to keep
+  // at least one free control point (variable_num_ = 3*(K-4)).
+  while (point_set.size() < 5)
   {
-    const Eigen::Vector3d a = point_set.front();
-    const Eigen::Vector3d b = point_set.back();
-    point_set.insert(point_set.end() - 1, (a + b) / 2.0);
+    std::vector<Eigen::Vector3d> subdivided;
+    subdivided.reserve(point_set.size() * 2);
+    for (size_t i = 0; i + 1 < point_set.size(); ++i)
+    {
+      subdivided.push_back(point_set[i]);
+      subdivided.push_back((point_set[i] + point_set[i + 1]) * 0.5);
+    }
+    subdivided.push_back(point_set.back());
+    point_set.swap(subdivided);
   }
 
-  std::vector<Eigen::Vector3d> start_end_derivative(6, Eigen::Vector3d::Zero());
+  std::vector<Eigen::Vector3d> start_end_derivative(4, Eigen::Vector3d::Zero());
   Eigen::MatrixXd ctrl_pts;
   ego_planner::UniformBspline::parameterizeToBspline(bspline_interval_, point_set,
                                         start_end_derivative, ctrl_pts);
   if (ctrl_pts.cols() < order_ + 1)
     return false;
 
+  local_target_pt_ = point_set.back();
   cps_.clearance = config_.swarm_clearance;
   cps_.size = static_cast<int>(ctrl_pts.cols());
   cps_.points = ctrl_pts;
   neighbors_ = filterByRange(neighbors, start.position, config_.planning_range);
 
+  // Pin the last order_ control points as a hard terminal constraint so jerk
+  // smoothing cannot pull the free end away from the goal (original kernel
+  // uses end_id = size - order_, the "Fixed end" mode).
   const int start_id = order_;
   const int end_id = cps_.size;
   variable_num_ = 3 * (end_id - start_id);
@@ -310,6 +351,14 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     out.t.push_back(0.0);
     out.pts.push_back(start.position);
     out.yaw.push_back(start.yaw);
+  }
+  // Anchor the sampled endpoints to the exact start position and the final
+  // key point so the timed trajectory strictly respects the sparse way
+  // point semantics regardless of the de Boor knot-interval definition.
+  if (!out.pts.empty())
+  {
+    out.pts.front() = start.position;
+    out.pts.back() = point_set.back();
   }
   return true;
 }

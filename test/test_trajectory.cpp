@@ -25,7 +25,7 @@ EgoPlannerConfig makeConfig()
   return config;
 }
 
-NeighborTrajectory straightNeighbor(double sx, double sy, double ex, double ey)
+NeighborTrajectory straightNeighbor(double sx, double sy, double ex, double ey, double sz = 12.0)
 {
   NeighborTrajectory n;
   n.clearance = 2.0;
@@ -35,7 +35,7 @@ NeighborTrajectory straightNeighbor(double sx, double sy, double ex, double ey)
   {
     const double a = static_cast<double>(i) / 99.0;
     n.t.push_back(a * 10.0);
-    n.pts.emplace_back(sx + (ex - sx) * a, sy + (ey - sy) * a, 12.0);
+    n.pts.emplace_back(sx + (ex - sx) * a, sy + (ey - sy) * a, sz);
   }
   return n;
 }
@@ -101,7 +101,8 @@ TEST(EgoPlannerCore, CheckClearanceCatchesViolation)
   TimedTrajectory trajectory;
   double cost = 0.0;
   ASSERT_TRUE(core.planOnce(start, waypoints, {}, trajectory, cost));
-  std::vector<NeighborTrajectory> neighbors{straightNeighbor(0.0, 5.0, 0.0, 5.0)};
+  // Neighbor parked on the trajectory path at the same altitude.
+  std::vector<NeighborTrajectory> neighbors{straightNeighbor(0.0, 5.0, 0.0, 5.0, 15.0)};
   EXPECT_FALSE(core.checkClearance(trajectory, neighbors, 0.5));
   EXPECT_TRUE(core.checkClearance(trajectory, {}, 0.5));
 }
@@ -111,5 +112,3 @@ int main(int argc, char** argv)
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-</｜｜DSML｜｜>
-</write_to_file>

@@ -17,5 +17,8 @@
     <param name="lambda_feasibility" value="1.0"/>
     <param name="setpoint_rate_hz" value="30.0"/>
     <param name="local_pose_timeout_s" value="1.0"/>
+    <param name="position_tolerance_m" value="0.2"/>
+    <param name="arrival_stable_s" value="1.0"/>
+    <param name="exec_timeout_margin_s" value="5.0"/>
   </node>
 </launch>
