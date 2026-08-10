@@ -1,0 +1,21 @@
+<launch>
+  <arg name="uav_id" default="A01"/>
+  <arg name="exec_target" default="UAV1"/>
+  <arg name="namespace" default="$(arg exec_target)"/>
+
+  <node pkg="ego_planner_driver" type="ego_planner_driver_node" name="ego_planner_driver" output="screen" ns="$(arg namespace)">
+    <param name="uav_id" value="$(arg uav_id)"/>
+    <param name="exec_target" value="$(arg exec_target)"/>
+    <param name="frame_id" value="map"/>
+    <param name="ts" value="0.4"/>
+    <param name="max_vel" value="8.0"/>
+    <param name="max_acc" value="6.0"/>
+    <param name="swarm_clearance" value="2.0"/>
+    <param name="planning_range" value="30.0"/>
+    <param name="lambda_smooth" value="1.0"/>
+    <param name="lambda_swarm" value="1.0"/>
+    <param name="lambda_feasibility" value="1.0"/>
+    <param name="setpoint_rate_hz" value="30.0"/>
+    <param name="local_pose_timeout_s" value="1.0"/>
+  </node>
+</launch>

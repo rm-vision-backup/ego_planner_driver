@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>ego_planner_driver</name>
+  <version>0.1.0</version>
+  <description>Onboard ego-swarm style timed trajectory generation and reciprocal inter-UAV avoidance driver.</description>
+
+  <maintainer email="maintainer@example.com">Swarm Maintainer</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>roscpp</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>swarm_uav_interfaces</build_depend>
+  <build_depend>eigen</build_depend>
+  <build_export_depend>roscpp</build_export_depend>
+  <build_export_depend>geometry_msgs</build_export_depend>
+  <build_export_depend>swarm_uav_interfaces</build_export_depend>
+  <exec_depend>roscpp</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>swarm_uav_interfaces</exec_depend>
+
+  <export/>
+</package>
