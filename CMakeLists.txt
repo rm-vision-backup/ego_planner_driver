@@ -31,10 +31,18 @@ add_library(ego_planner_core
 )
 target_link_libraries(ego_planner_core ${catkin_LIBRARIES})
 
-add_executable(ego_planner_driver_node src/ego_planner_driver_node.cpp)
-target_link_libraries(ego_planner_driver_node ego_planner_core ${catkin_LIBRARIES})
+# 节点实现单独成库，供可执行文件与单测共同链接（状态机逻辑可注入时钟测试）
+add_library(ego_planner_driver_node_lib
+  src/ego_planner_driver_node.cpp
+)
+target_link_libraries(ego_planner_driver_node_lib ego_planner_core ${catkin_LIBRARIES})
+
+add_executable(ego_planner_driver_node src/ego_planner_driver_node_main.cpp)
+target_link_libraries(ego_planner_driver_node ego_planner_driver_node_lib ego_planner_core ${catkin_LIBRARIES})
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(test_trajectory test/test_trajectory.cpp)
-  target_link_libraries(test_trajectory ego_planner_core ${catkin_LIBRARIES})
+  target_link_libraries(test_trajectory ego_planner_driver_node_lib ego_planner_core ${catkin_LIBRARIES})
+  catkin_add_gtest(test_ego_state_machine test/test_ego_state_machine.cpp)
+  target_link_libraries(test_ego_state_machine ego_planner_driver_node_lib ego_planner_core ${catkin_LIBRARIES})
 endif()

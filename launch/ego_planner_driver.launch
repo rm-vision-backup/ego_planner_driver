@@ -12,7 +12,7 @@
   <node pkg="ego_planner_driver" type="ego_planner_driver_node" name="ego_planner_driver" output="screen">
     <param name="frame_id" value="map"/>
     <param name="ts" value="0.4"/>
-    <param name="max_vel" value="8.0"/>
+    <param name="max_vel" value="1.0"/>
     <param name="max_acc" value="6.0"/>
     <param name="swarm_clearance" value="2.0"/>
     <param name="planning_range" value="30.0"/>
@@ -24,5 +24,9 @@
     <param name="position_tolerance_m" value="0.2"/>
     <param name="arrival_stable_s" value="1.0"/>
     <param name="exec_timeout_margin_s" value="5.0"/>
+    <!-- terminal(COMPLETED/HOLD) → IDLE 自动转换窗口（秒） -->
+    <param name="terminal_to_idle_s" value="2.0"/>
+    <!-- IDLE hover 目标每秒刷新频率（Hz） -->
+    <param name="idle_hover_refresh_hz" value="1.0"/>
   </node>
 </launch>
