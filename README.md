@@ -29,3 +29,15 @@
 - 默认不 arm、不切 OFFBOARD；HOLD 始终在最新 fresh local pose 处保持，无 fresh pose 时停止发布 setpoint（fail-safe）。
 - 自动化：`catkin_test_results --all build` 全工作空间 74 tests 全绿（含本包 10 个 gtest）。
 - 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS，详见 `tcp_to_ros/docs/tcp_to_ros_测试记录.md`。
+
+## 环境变量（ROS 日志重定向）
+
+为避免 ROS 运行日志散落在 `~/.ros/log`，本工作空间统一将运行日志重定向到 `.ros_home/`：
+
+```bash
+export ROS_HOME=/home/ub20tg/catkin_swarm6-2/.ros_home
+export ROS_LOG_DIR=/home/ub20tg/catkin_swarm6-2/.ros_home/log
+mkdir -p "$ROS_LOG_DIR"
+```
+
+手动启动前请先在终端执行以上命令，确保当前工作空间所有 ROS 运行日志均写入 `.ros_home/log`。
