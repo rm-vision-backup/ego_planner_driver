@@ -34,6 +34,8 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   timeout_margin_ = pnh_.param("exec_timeout_margin_s", 5.0);
   terminal_to_idle_s_ = pnh_.param("terminal_to_idle_s", kTerminalToIdleS);
   idle_hover_refresh_hz_ = pnh_.param("idle_hover_refresh_hz", kIdleHoverRefreshHz);
+  takeoff_height_ = pnh_.param("takeoff_height_m", 5.0);
+  takeoff_ascend_speed_ = pnh_.param("takeoff_ascend_speed", 1.0);
 
   // Interface topics live under the public namespace (/UAV1/*) so the
   // Python EgoSwarmDriver and topology bridge can reach them without
@@ -47,6 +49,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   pose_sub_ = nh_.subscribe("local_pose", 1, &EgoPlannerDriverNode::onLocalPose, this);
   intent_sub_ = nh_.subscribe("neighbor_intent", 10, &EgoPlannerDriverNode::onNeighborIntent, this);
   hold_sub_ = nh_.subscribe("hold", 1, &EgoPlannerDriverNode::onHold, this);
+  mavros_state_sub_ = nh_.subscribe("/mavros/state", 1, &EgoPlannerDriverNode::onMavrosState, this);
   setState(kStateIdle);
   timer_ = nh_.createTimer(ros::Duration(1.0 / setpoint_rate_),
                            &EgoPlannerDriverNode::publishSetpoint, this);
@@ -71,6 +74,14 @@ void EgoPlannerDriverNode::injectLocalPose(const geometry_msgs::PoseStamped& pos
   std::lock_guard<std::mutex> lock(mutex_);
   local_pose_ = pose;
   local_pose_stamp_ = pose.header.stamp;
+}
+
+void EgoPlannerDriverNode::injectMavrosState(bool armed, bool offboard)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  armed_ = armed;
+  offboard_ = offboard;
+  handleMavrosStateEdgeLocked();
 }
 
 void EgoPlannerDriverNode::sendGoal(double x, double y, double z)
@@ -106,6 +117,8 @@ bool EgoPlannerDriverNode::replanOnce()
       processHoldLocked();
       return true;
     }
+    if (exec_state_ == kStateTakeoff)
+      return false;  // TAKEOFF 未完成前不规划
     if (!planning_requested_ || !pending_goal_ || steady_target_)
       return false;
     planning_requested_ = false;
@@ -195,6 +208,12 @@ boost::optional<Eigen::Vector3d> EgoPlannerDriverNode::idleHoverTarget() const
   return idle_hover_target_;
 }
 
+ros::Time EgoPlannerDriverNode::idleHoverUpdatedAt() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return idle_hover_updated_at_;
+}
+
 geometry_msgs::PoseStamped EgoPlannerDriverNode::lastSetpoint() const
 {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -282,6 +301,47 @@ void EgoPlannerDriverNode::onHold(const std_msgs::Empty::ConstPtr&)
   planning_requested_ = false;
 }
 
+void EgoPlannerDriverNode::onMavrosState(const mavros_msgs::State::ConstPtr& msg)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  armed_ = msg->armed;
+  offboard_ = (msg->mode == "OFFBOARD");
+  handleMavrosStateEdgeLocked();
+}
+
+void EgoPlannerDriverNode::handleMavrosStateEdgeLocked()
+{
+  const bool cur = armed_ && offboard_;
+  if (cur && !prev_arm_offboard_)
+  {
+    // 上升沿：arm+OFFBOARD 就绪。若处于 IDLE，自动切入 TAKEOFF 执行软起飞。
+    // 初始上电与手控落地后再次 arm+切 OFFBOARD 都会触发，无需重启程序即可再次程控起飞。
+    prev_arm_offboard_ = true;
+    if (exec_state_ == kStateIdle)
+    {
+      takeoff_active_ = false;  // 重新开始软起飞计时
+      ROS_INFO("[%s] arm+OFFBOARD detected, entering TAKEOFF (soft takeoff)",
+               uav_id_.c_str());
+      setState(kStateTakeoff);
+    }
+    return;
+  }
+  if (!cur && prev_arm_offboard_)
+  {
+    // 下降沿：arm 或 OFFBOARD 丢失。若正处于 TAKEOFF，安全回退到 IDLE。
+    prev_arm_offboard_ = false;
+    if (exec_state_ == kStateTakeoff)
+    {
+      takeoff_active_ = false;
+      ROS_WARN("[%s] arm/OFFBOARD lost during TAKEOFF, reverting to IDLE",
+               uav_id_.c_str());
+      setState(kStateIdle);
+    }
+    return;
+  }
+  prev_arm_offboard_ = cur;
+}
+
 void EgoPlannerDriverNode::resetRun()
 {
   steady_target_.reset();
@@ -327,6 +387,52 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
 {
   std::lock_guard<std::mutex> lock(mutex_);
   const ros::Time now = nowFunc();
+
+  // ---- TAKEOFF 状态：等待 arm+OFFBOARD 后自动软起飞 ----
+  if (exec_state_ == kStateTakeoff)
+  {
+    if (!armed_ || !offboard_)
+    {
+      // 尚未 arm+OFFBOARD：继续以当前位姿发布 hover setpoint
+      refreshIdleHoverTarget(now);
+      return;
+    }
+
+    const ros::Time now_ts = nowFunc();
+    if (!takeoff_active_)
+    {
+      // 首次检测到 arm+OFFBOARD：记录起始位置和时间
+      takeoff_active_ = true;
+      takeoff_start_z_ = local_pose_ ? local_pose_->pose.position.z : 0.0;
+      takeoff_start_time_ = now_ts;
+      ROS_INFO("[%s] TAKEOFF started from z=%.2f, target z=%.2f",
+               uav_id_.c_str(), takeoff_start_z_, takeoff_start_z_ + takeoff_height_);
+    }
+
+    const double elapsed = (now_ts - takeoff_start_time_).toSec();
+    const double target_z = takeoff_start_z_ + takeoff_height_;
+    const double current_z = takeoff_start_z_ +
+                             std::min(elapsed * takeoff_ascend_speed_, takeoff_height_);
+    const double goal_yaw = local_pose_ ? yawFromQuat(local_pose_->pose.orientation) : 0.0;
+    const double pos_x = local_pose_ ? local_pose_->pose.position.x : 0.0;
+    const double pos_y = local_pose_ ? local_pose_->pose.position.y : 0.0;
+
+    publishPose(pos_x, pos_y, current_z, goal_yaw);
+
+    // 到达目标高度（含容差 0.1m）：起飞完成
+    if (current_z >= target_z - 0.1)
+    {
+      ROS_INFO("[%s] TAKEOFF complete at z=%.2f, switching to IDLE",
+               uav_id_.c_str(), target_z);
+      // 由 IDLE hover 机制接管（1s 刷新周期内以目标点悬停）
+      idle_hover_target_ = Eigen::Vector3d(pos_x, pos_y, target_z);
+      idle_hover_updated_at_ = now_ts;
+      takeoff_active_ = false;
+      setState(kStateIdle);
+    }
+    return;
+  }
+  // ---- TAKEOFF 分支结束 ----
 
   // terminal(COMPLETED/HOLD) → IDLE 自动转换窗口：先冻结发布到窗口结束，回 IDLE 后
   // 继续以当前位姿发布。所有状态下都不停止 setpoint 流，避免 OFFBOARD 掉线。
@@ -511,6 +617,8 @@ void EgoPlannerDriverNode::replanLoop()
         processHoldLocked();
         continue;
       }
+      if (exec_state_ == kStateTakeoff)
+        continue;  // TAKEOFF 未完成前不规划
       if (!planning_requested_ || !pending_goal_ || steady_target_)
         continue;
       planning_requested_ = false;

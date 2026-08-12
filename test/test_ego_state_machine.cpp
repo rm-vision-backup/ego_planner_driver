@@ -18,6 +18,7 @@ using ego_planner_driver::kStateCompleted;
 using ego_planner_driver::kStateExecuting;
 using ego_planner_driver::kStateHold;
 using ego_planner_driver::kStateIdle;
+using ego_planner_driver::kStateTakeoff;
 
 namespace
 {
@@ -54,6 +55,127 @@ void echoSetpoint(EgoPlannerDriverNode& node, FakeClock& clock)
                                 sp.pose.position.z, clock.get()));
 }
 
+// 将节点从初始 TAKEOFF 状态推进到 IDLE（arm+OFFBOARD 触发软起飞并完成）
+// 返回 true 表示成功进入 IDLE
+bool completeTakeoff(EgoPlannerDriverNode& node, FakeClock& clock, double start_z)
+{
+  node.injectLocalPose(makePose(0.0, 0.0, start_z, clock.get()));
+  node.injectMavrosState(true, true);  // armed + OFFBOARD
+  const double step = 1.0 / 30.0;
+  for (int guard = 0; guard < 2000; ++guard)
+  {
+    clock.advance(step);
+    node.publishSetpointTick();
+    echoSetpoint(node, clock);
+    if (node.execState() == kStateIdle)
+      return true;
+  }
+  return node.execState() == kStateIdle;
+}
+
+TEST(EgoStateMachine, InitialStateIsIdle)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  EXPECT_EQ(node.execState(), kStateIdle);
+}
+
+TEST(EgoStateMachine, IdleHoldsBeforeArmOffboard)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.injectLocalPose(makePose(1.0, 2.0, 15.0, 0.0));
+
+  // 未 arm+OFFBOARD：IDLE 状态以当前位姿发布 hover setpoint
+  for (int i = 0; i < 30; ++i)
+  {
+    clock.advance(1.0 / 30.0);
+    node.publishSetpointTick();
+  }
+  EXPECT_EQ(node.execState(), kStateIdle);
+  ASSERT_TRUE(static_cast<bool>(node.idleHoverTarget()));
+  EXPECT_NEAR(node.idleHoverTarget()->x(), 1.0, 1e-6);
+  EXPECT_NEAR(node.idleHoverTarget()->y(), 2.0, 1e-6);
+  EXPECT_NEAR(node.idleHoverTarget()->z(), 15.0, 1e-6);
+}
+
+TEST(EgoStateMachine, ArmOffboardEdgeTriggersTakeoff)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.injectLocalPose(makePose(0.0, 0.0, 2.0, 0.0));
+
+  // 未 arm+OFFBOARD 时保持 IDLE
+  node.injectMavrosState(false, false);
+  EXPECT_EQ(node.execState(), kStateIdle);
+
+  // 上升沿：进入 TAKEOFF
+  node.injectMavrosState(true, true);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+
+  // 下降沿（如手控接管丢失 OFFBOARD）：回 IDLE
+  node.injectMavrosState(true, false);
+  EXPECT_EQ(node.execState(), kStateIdle);
+}
+
+TEST(EgoStateMachine, TakeoffClimbsToTargetHeightThenIdle)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.injectLocalPose(makePose(0.0, 0.0, 2.0, 0.0));
+
+  // 触发 arm+OFFBOARD
+  node.injectMavrosState(true, true);
+
+  // 上升速度 1.0 m/s，目标 5m：需约 5.1s（30Hz=153 ticks）
+  bool reached_idle = false;
+  double last_z = 0.0;
+  for (int i = 0; i < 400; ++i)
+  {
+    clock.advance(1.0 / 30.0);
+    node.publishSetpointTick();
+    last_z = node.lastSetpoint().pose.position.z;
+    if (node.execState() == kStateIdle)
+    {
+      reached_idle = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(reached_idle);
+  // 目标高度 = 2.0 + 5.0 = 7.0
+  EXPECT_NEAR(last_z, 7.0, 0.5);
+}
+
+TEST(EgoStateMachine, CanRetakeoffAfterManualLanding)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+
+  // 第一次起飞
+  ASSERT_TRUE(completeTakeoff(node, clock, 2.0));
+  EXPECT_EQ(node.execState(), kStateIdle);
+
+  // 手控落地：arm/OFFBOARD 丢失 -> 回 IDLE（已处于 IDLE，维持不变）
+  node.injectMavrosState(true, false);
+  EXPECT_EQ(node.execState(), kStateIdle);
+  node.injectMavrosState(false, false);
+  EXPECT_EQ(node.execState(), kStateIdle);
+
+  // 不重启程序：再次 arm+OFFBOARD 边沿 -> 再次进入 TAKEOFF
+  node.injectMavrosState(true, true);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+}
+
 TEST(EgoStateMachine, IdlePublishesHoverSetpointAndRefreshesPerSecond)
 {
   FakeClock clock;
@@ -61,7 +183,8 @@ TEST(EgoStateMachine, IdlePublishesHoverSetpointAndRefreshesPerSecond)
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
 
-  node.injectLocalPose(makePose(1.0, 2.0, 15.0, 0.0));
+  ASSERT_TRUE(completeTakeoff(node, clock, 15.0));
+  EXPECT_EQ(node.execState(), kStateIdle);
 
   // 30Hz 发布：1 秒推进应约 30 条
   const size_t before = node.setpointCount();
@@ -73,11 +196,11 @@ TEST(EgoStateMachine, IdlePublishesHoverSetpointAndRefreshesPerSecond)
   EXPECT_GE(node.setpointCount(), before + 29);
   EXPECT_EQ(node.execState(), kStateIdle);
   ASSERT_TRUE(static_cast<bool>(node.idleHoverTarget()));
-  EXPECT_NEAR(node.idleHoverTarget()->x(), 1.0, 1e-6);
+  EXPECT_NEAR(node.idleHoverTarget()->x(), 0.0, 1e-6);
 
   // 每秒刷新：位姿移动到新位置后，setpoint 目标随之下一个周期更新
-  clock.set(2.0);
-  node.injectLocalPose(makePose(8.0, 9.0, 15.0, 2.0));
+  clock.set(node.idleHoverUpdatedAt().toSec() + 2.0);
+  node.injectLocalPose(makePose(8.0, 9.0, 15.0, clock.get()));
   node.publishSetpointTick();  // 进入刷新周期 -> 更新 idle_hover_target_
   ASSERT_TRUE(static_cast<bool>(node.idleHoverTarget()));
   EXPECT_NEAR(node.idleHoverTarget()->x(), 8.0, 1e-6);
@@ -93,13 +216,15 @@ TEST(EgoStateMachine, IdleStopsPublishingWithoutFreshPose)
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
 
-  node.injectLocalPose(makePose(0.0, 0.0, 15.0, 0.0));
+  ASSERT_TRUE(completeTakeoff(node, clock, 15.0));
+  EXPECT_EQ(node.execState(), kStateIdle);
+
   node.publishSetpointTick();
   const size_t count = node.setpointCount();
   EXPECT_GT(count, 0u);
 
   // 位姿过期（> pose_timeout=1s）：fail-safe，不再发布
-  clock.set(10.0);
+  clock.set(100.0);
   node.publishSetpointTick();
   EXPECT_EQ(node.setpointCount(), count);
 }
@@ -110,7 +235,9 @@ TEST(EgoStateMachine, CompletedFreezesThenRevertsToIdle)
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
-  node.injectLocalPose(makePose(0.0, 0.0, 15.0, 0.0));
+
+  ASSERT_TRUE(completeTakeoff(node, clock, 15.0));
+  EXPECT_EQ(node.execState(), kStateIdle);
 
   node.sendGoal(5.0, 0.0, 15.0);
   ASSERT_TRUE(node.replanOnce());
@@ -154,14 +281,16 @@ TEST(EgoStateMachine, HoldFreezesThenRevertsToIdle)
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
-  node.injectLocalPose(makePose(1.0, 1.0, 12.0, 0.0));
+
+  ASSERT_TRUE(completeTakeoff(node, clock, 12.0));
+  EXPECT_EQ(node.execState(), kStateIdle);
 
   node.sendHold();
   node.replanOnce();  // 处理 hold -> HOLD + 冻结当前位姿
   EXPECT_EQ(node.execState(), kStateHold);
   ASSERT_TRUE(static_cast<bool>(node.steadyTarget()));
-  EXPECT_NEAR(node.steadyTarget()->pos.x(), 1.0, 1e-6);
-  EXPECT_NEAR(node.steadyTarget()->pos.y(), 1.0, 1e-6);
+  EXPECT_NEAR(node.steadyTarget()->pos.x(), 0.0, 1e-6);
+  EXPECT_NEAR(node.steadyTarget()->pos.y(), 0.0, 1e-6);
 
   // HOLD 后 2 秒内持续发布冻结位姿
   const double step = 1.0 / 30.0;
@@ -169,7 +298,7 @@ TEST(EgoStateMachine, HoldFreezesThenRevertsToIdle)
   {
     clock.advance(step);
     node.publishSetpointTick();
-    EXPECT_NEAR(node.lastSetpoint().pose.position.x, 1.0, 1e-3);
+    EXPECT_NEAR(node.lastSetpoint().pose.position.x, 0.0, 1e-3);
   }
   EXPECT_EQ(node.execState(), kStateHold);
 
@@ -178,6 +307,32 @@ TEST(EgoStateMachine, HoldFreezesThenRevertsToIdle)
   node.publishSetpointTick();
   EXPECT_EQ(node.execState(), kStateIdle);
   EXPECT_FALSE(static_cast<bool>(node.steadyTarget()));
+}
+
+TEST(EgoStateMachine, TakeoffBlocksReplanUntilCompleted)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.injectLocalPose(makePose(0.0, 0.0, 2.0, 0.0));
+
+  // 触发 arm+OFFBOARD 边沿进入 TAKEOFF
+  node.injectMavrosState(true, true);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+
+  // TAKEOFF 未完成时，goal 不会触发 replan
+  node.sendGoal(10.0, 0.0, 7.0);
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+
+  // 完成 TAKEOFF 后，replan 可用；此时 prev_arm_offboard_=true，
+  // completeTakeoff 需先下降沿再上升沿以触发新的 TAKEOFF
+  node.injectMavrosState(true, false);
+  node.injectMavrosState(true, true);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+  ASSERT_TRUE(completeTakeoff(node, clock, 2.0));
+  EXPECT_EQ(node.execState(), kStateIdle);
 }
 }  // namespace
 

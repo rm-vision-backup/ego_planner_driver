@@ -8,6 +8,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   geometry_msgs
   swarm_uav_interfaces
+  mavros_msgs
 )
 
 find_package(Eigen3 REQUIRED)
@@ -15,7 +16,7 @@ find_package(Eigen3 REQUIRED)
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES ego_planner_driver
-  CATKIN_DEPENDS roscpp geometry_msgs swarm_uav_interfaces
+  CATKIN_DEPENDS roscpp geometry_msgs swarm_uav_interfaces mavros_msgs
 )
 
 include_directories(

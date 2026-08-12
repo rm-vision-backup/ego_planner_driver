@@ -9,6 +9,7 @@
 #include <std_msgs/Float64.h>
 #include <std_msgs/String.h>
 #include <swarm_uav_interfaces/UavTrajectoryIntent.h>
+#include <mavros_msgs/State.h>
 #include <boost/optional.hpp>
 #include <functional>
 #include <map>
@@ -36,6 +37,7 @@ static constexpr const char* kStateHold = "HOLD";
 static constexpr const char* kStatePoseStale = "POSE_STALE";
 static constexpr const char* kStatePlanFailed = "EGO_PLAN_FAILED";
 static constexpr const char* kStateExecTimeout = "EGO_EXEC_TIMEOUT";
+static constexpr const char* kStateTakeoff = "TAKEOFF";
 
 constexpr double kSetpointRateHz = 30.0;
 constexpr double kNeighborStaleS = 5.0;
@@ -61,6 +63,7 @@ public:
 
   // --- 测试/外部注入接口（线程安全） ---
   void injectLocalPose(const geometry_msgs::PoseStamped& pose);
+  void injectMavrosState(bool armed, bool offboard);
   void sendGoal(double x, double y, double z);
   void sendHold();
   bool replanOnce();
@@ -69,6 +72,7 @@ public:
   std::string execState() const;
   boost::optional<HoldTarget> steadyTarget() const;
   boost::optional<Eigen::Vector3d> idleHoverTarget() const;
+  ros::Time idleHoverUpdatedAt() const;
   geometry_msgs::PoseStamped lastSetpoint() const;
   size_t setpointCount() const;
 
@@ -79,6 +83,7 @@ private:
   void onLocalPose(const geometry_msgs::PoseStamped::ConstPtr& msg);
   void onNeighborIntent(const swarm_uav_interfaces::UavTrajectoryIntent::ConstPtr& msg);
   void onHold(const std_msgs::Empty::ConstPtr& msg);
+  void onMavrosState(const mavros_msgs::State::ConstPtr& msg);
 
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }
   void resetRun();
@@ -90,6 +95,7 @@ private:
   void scheduleTerminalToIdle(const std::string& terminal_state);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   void processHoldLocked();
+  void handleMavrosStateEdgeLocked();
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base);
   static void appendSample(swarm_uav_interfaces::UavTrajectoryIntent& msg,
                            const TimedTrajectory& traj, size_t i);
@@ -107,6 +113,16 @@ private:
   double terminal_to_idle_s_ = kTerminalToIdleS;
   double idle_hover_refresh_hz_ = kIdleHoverRefreshHz;
 
+  // --- TAKEOFF 状态相关 ---
+  bool armed_ = false;
+  bool offboard_ = false;
+  bool prev_arm_offboard_ = false;  // 上一次的 arm&&offboard 状态（边沿检测）
+  double takeoff_height_ = 5.0;        // 起飞高度（相对当前 Z 增量，m）
+  double takeoff_ascend_speed_ = 1.0;  // 上升速度（m/s）
+  bool takeoff_active_ = false;        // 是否已进入 arm+OFFBOARD 触发
+  double takeoff_start_z_ = 0.0;       // 起飞起始 Z
+  ros::Time takeoff_start_time_;
+
   ros::NodeHandle nh_;
   ros::NodeHandle pnh_;
   ros::Publisher setpoint_pub_;
@@ -118,6 +134,7 @@ private:
   ros::Subscriber pose_sub_;
   ros::Subscriber intent_sub_;
   ros::Subscriber hold_sub_;
+  ros::Subscriber mavros_state_sub_;
   ros::Timer timer_;
 
   mutable std::mutex mutex_;
