@@ -14,7 +14,8 @@
     <param name="ts" value="0.4"/>
     <param name="max_vel" value="1.0"/>
     <param name="max_acc" value="6.0"/>
-    <param name="swarm_clearance" value="2.0"/>
+    <!-- Per-aircraft clearance radius; reciprocal hard center spacing is 2x. -->
+    <param name="swarm_clearance" value="0.5"/>
     <param name="planning_range" value="30.0"/>
     <param name="lambda_smooth" value="1.0"/>
     <param name="lambda_swarm" value="1.0"/>
@@ -31,5 +32,6 @@
     <!-- TAKEOFF 软起飞参数 -->
     <param name="takeoff_height_m" value="5.0"/>
     <param name="takeoff_ascend_speed" value="1.0"/>
+    <param name="legacy_auto_takeoff" value="false"/>
   </node>
 </launch>

@@ -20,7 +20,10 @@ struct EgoPlannerConfig
   double ts = 0.4;              // B-spline knot span (s)
   double max_vel = 8.0;         // m/s
   double max_acc = 6.0;         // m/s^2
-  double swarm_clearance = 2.0; // required reciprocal spacing (m)
+  // Per-aircraft clearance radius. Reciprocal checks use twice this value;
+  // 0.5 m therefore enforces 1.0 m horizontal centre distance and, with the
+  // existing 2:1 ellipsoid, 2.0 m vertical centre distance.
+  double swarm_clearance = 0.5;
   double planning_range = 30.0; // neighbor trajectories beyond this are ignored
   double lambda_smooth = 1.0;
   double lambda_swarm = 1.0;

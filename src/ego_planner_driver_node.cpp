@@ -12,7 +12,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.ts = pnh_.param("ts", 0.4);
   config.max_vel = pnh_.param("max_vel", 1.0);
   config.max_acc = pnh_.param("max_acc", 6.0);
-  config.swarm_clearance = pnh_.param("swarm_clearance", 2.0);
+  config.swarm_clearance = pnh_.param("swarm_clearance", 0.5);
   config.planning_range = pnh_.param("planning_range", 30.0);
   config.lambda_smooth = pnh_.param("lambda_smooth", 1.0);
   config.lambda_swarm = pnh_.param("lambda_swarm", 1.0);
@@ -36,6 +36,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   idle_hover_refresh_hz_ = pnh_.param("idle_hover_refresh_hz", kIdleHoverRefreshHz);
   takeoff_height_ = pnh_.param("takeoff_height_m", 5.0);
   takeoff_ascend_speed_ = pnh_.param("takeoff_ascend_speed", 1.0);
+  legacy_auto_takeoff_ = pnh_.param("legacy_auto_takeoff", false);
 
   // Interface topics live under the public namespace (/UAV1/*) so the
   // Python EgoSwarmDriver and topology bridge can reach them without
@@ -50,6 +51,8 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   intent_sub_ = nh_.subscribe("neighbor_intent", 10, &EgoPlannerDriverNode::onNeighborIntent, this);
   hold_sub_ = nh_.subscribe("hold", 1, &EgoPlannerDriverNode::onHold, this);
   mavros_state_sub_ = nh_.subscribe("/mavros/state", 1, &EgoPlannerDriverNode::onMavrosState, this);
+  direct_control_sub_ = nh_.subscribe("direct_control_active", 1,
+                                      &EgoPlannerDriverNode::onDirectControl, this);
   setState(kStateIdle);
   timer_ = nh_.createTimer(ros::Duration(1.0 / setpoint_rate_),
                            &EgoPlannerDriverNode::publishSetpoint, this);
@@ -117,6 +120,8 @@ bool EgoPlannerDriverNode::replanOnce()
       processHoldLocked();
       return true;
     }
+    if (direct_control_active_)
+      return false;
     if (exec_state_ == kStateTakeoff)
       return false;  // TAKEOFF 未完成前不规划
     if (!planning_requested_ || !pending_goal_ || steady_target_)
@@ -309,6 +314,21 @@ void EgoPlannerDriverNode::onMavrosState(const mavros_msgs::State::ConstPtr& msg
   handleMavrosStateEdgeLocked();
 }
 
+void EgoPlannerDriverNode::onDirectControl(const std_msgs::Bool::ConstPtr& msg)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  direct_control_active_ = msg->data;
+  if (direct_control_active_)
+  {
+    planning_requested_ = false;
+    current_.reset();
+    steady_target_.reset();
+    scheduled_revert_state_.clear();
+    arrival_since_.reset();
+    setState(kStateIdle);
+  }
+}
+
 void EgoPlannerDriverNode::handleMavrosStateEdgeLocked()
 {
   const bool cur = armed_ && offboard_;
@@ -317,7 +337,7 @@ void EgoPlannerDriverNode::handleMavrosStateEdgeLocked()
     // 上升沿：arm+OFFBOARD 就绪。若处于 IDLE，自动切入 TAKEOFF 执行软起飞。
     // 初始上电与手控落地后再次 arm+切 OFFBOARD 都会触发，无需重启程序即可再次程控起飞。
     prev_arm_offboard_ = true;
-    if (exec_state_ == kStateIdle)
+    if (legacy_auto_takeoff_ && exec_state_ == kStateIdle)
     {
       takeoff_active_ = false;  // 重新开始软起飞计时
       ROS_INFO("[%s] arm+OFFBOARD detected, entering TAKEOFF (soft takeoff)",
@@ -387,6 +407,9 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
 {
   std::lock_guard<std::mutex> lock(mutex_);
   const ros::Time now = nowFunc();
+
+  if (direct_control_active_)
+    return;
 
   // ---- TAKEOFF 状态：等待 arm+OFFBOARD 后自动软起飞 ----
   if (exec_state_ == kStateTakeoff)

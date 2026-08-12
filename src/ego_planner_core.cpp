@@ -360,6 +360,8 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     out.pts.front() = start.position;
     out.pts.back() = point_set.back();
   }
+  if (!checkClearance(out, neighbors_, config_.swarm_clearance * 2.0))
+    return false;
   return true;
 }
 

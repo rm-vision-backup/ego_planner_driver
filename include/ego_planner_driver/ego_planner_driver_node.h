@@ -7,6 +7,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <std_msgs/Empty.h>
 #include <std_msgs/Float64.h>
+#include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
 #include <swarm_uav_interfaces/UavTrajectoryIntent.h>
 #include <mavros_msgs/State.h>
@@ -84,6 +85,7 @@ private:
   void onNeighborIntent(const swarm_uav_interfaces::UavTrajectoryIntent::ConstPtr& msg);
   void onHold(const std_msgs::Empty::ConstPtr& msg);
   void onMavrosState(const mavros_msgs::State::ConstPtr& msg);
+  void onDirectControl(const std_msgs::Bool::ConstPtr& msg);
 
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }
   void resetRun();
@@ -112,6 +114,8 @@ private:
   double timeout_margin_ = 5.0;
   double terminal_to_idle_s_ = kTerminalToIdleS;
   double idle_hover_refresh_hz_ = kIdleHoverRefreshHz;
+  bool legacy_auto_takeoff_ = false;
+  bool direct_control_active_ = false;
 
   // --- TAKEOFF 状态相关 ---
   bool armed_ = false;
@@ -135,6 +139,7 @@ private:
   ros::Subscriber intent_sub_;
   ros::Subscriber hold_sub_;
   ros::Subscriber mavros_state_sub_;
+  ros::Subscriber direct_control_sub_;
   ros::Timer timer_;
 
   mutable std::mutex mutex_;

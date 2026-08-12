@@ -17,17 +17,20 @@
 | `setpoint` | `geometry_msgs/PoseStamped` | 出：30 Hz OFFBOARD 兼容位置 setpoint |
 | `trajectory_intent` | `swarm_uav_interfaces/UavTrajectoryIntent` | 出：本机带时轨迹 |
 | `goal` | `geometry_msgs/PointStamped` | 入：单点目标 |
+| `goal_yaw` | `std_msgs/Float64` | 入：冻结的集群参考航向 |
 | `waypoints` | `geometry_msgs/PolygonStamped` | 入：航线（P1 leader FOLLOW_ROUTE） |
 | `local_pose` | `geometry_msgs/PoseStamped` | 入：本机位姿 |
 | `neighbor_intent` | `swarm_uav_interfaces/UavTrajectoryIntent` | 入：邻机轨迹 |
 | `hold` | `std_msgs/Empty` | 入：HOLD |
+| `direct_control_active` | `std_msgs/Bool` | 入：垂直轨迹/PI 直接控制仲裁 |
 
 身份参数（`uav_id`/`exec_target`）位于公开命名空间 `<namespace>/`；规划调参位于私有 `<node_name>/`。
 
 ## 安全与验证
 
-- 默认不 arm、不切 OFFBOARD；HOLD 始终在最新 fresh local pose 处保持，无 fresh pose 时停止发布 setpoint（fail-safe）。
-- 自动化：`catkin_test_results --all build` 全工作空间 74 tests 全绿（含本包 10 个 gtest）。
+- C++ 节点不 arm、不切 OFFBOARD；旧 arm+OFFBOARD 自动 TAKEOFF 默认关闭。Python executor driver 在直接垂直/PI 控制期间通过仲裁暂停 EGO setpoint。
+- `swarm_clearance=0.5` 表示每机安全半径：互惠检查使用两倍值，对应 1.0 m 水平中心距；原有 2:1 椭球对应 2.0 m 垂直中心距。规划结果在发布前执行硬 clearance 校验。
+- 自动化：2026-08-13 全工作空间 133 tests 全绿（含本包 30 个 gtest 计数）。
 - 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS，详见 `tcp_to_ros/docs/tcp_to_ros_测试记录.md`。
 
 ## 环境变量（ROS 日志重定向）

@@ -19,7 +19,7 @@ EgoPlannerConfig makeConfig()
   config.ts = 0.4;
   config.max_vel = 8.0;
   config.max_acc = 6.0;
-  config.swarm_clearance = 2.0;
+  config.swarm_clearance = 0.5;
   config.planning_range = 30.0;
   config.max_iterations = 200;
   return config;
