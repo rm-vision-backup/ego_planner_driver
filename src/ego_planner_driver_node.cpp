@@ -363,10 +363,16 @@ void EgoPlannerDriverNode::setState(const std::string& state)
 
 bool EgoPlannerDriverNode::captureHoldTargetLocked(const ros::Time& now)
 {
+  // fresh 豁免：悬停目标建立后不再因 pose 过期丢弃目标，relay 抖动/
+  // 短暂丢帧不会把无人机打出稳定悬停进入 POSE_STALE 停发 setpoint。
+  if (steady_target_)
+  {
+    setState(kStateHold);
+    return true;
+  }
   if (!local_pose_ || !local_pose_stamp_ ||
       (now - *local_pose_stamp_).toSec() > pose_timeout_)
   {
-    steady_target_.reset();
     setState(kStatePoseStale);
     return false;
   }
