@@ -14,10 +14,9 @@
 #include "ego_planner_driver/ego_planner_driver_node.h"
 
 using ego_planner_driver::EgoPlannerDriverNode;
-using ego_planner_driver::kStateCompleted;
 using ego_planner_driver::kStateExecuting;
+using ego_planner_driver::kStateTakeoff;
 using ego_planner_driver::kStateHold;
-using ego_planner_driver::kStateIdle;
 
 namespace
 {
@@ -54,66 +53,45 @@ void echoSetpoint(EgoPlannerDriverNode& node, FakeClock& clock)
                                 sp.pose.position.z, clock.get()));
 }
 
-// executor/Python 驱动负责起飞；C++ 节点只需处于可规划的 IDLE。
-bool setupIdle(EgoPlannerDriverNode& node, FakeClock& clock, double start_z)
+// executor/Python 驱动负责起飞；C++ 节点只需处于可规划的 HOLD。
+bool setupHold(EgoPlannerDriverNode& node, FakeClock& clock, double start_z)
 {
   node.injectLocalPose(makePose(0.0, 0.0, start_z, clock.get()));
-  node.injectMavrosState(true, true);  // armed + OFFBOARD
-  return node.execState() == kStateIdle;
-}
-
-TEST(EgoStateMachine, InitialStateIsIdle)
-{
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-  EXPECT_EQ(node.execState(), kStateIdle);
-}
-
-TEST(EgoStateMachine, IdleHoldsBeforeArmOffboard)
-{
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-  node.injectLocalPose(makePose(1.0, 2.0, 15.0, 0.0));
-
-  // 未 arm+OFFBOARD：IDLE 状态以当前位姿发布 hover setpoint
-  for (int i = 0; i < 30; ++i)
-  {
-    clock.advance(1.0 / 30.0);
-    node.publishSetpointTick();
-  }
-  EXPECT_EQ(node.execState(), kStateIdle);
-  ASSERT_TRUE(static_cast<bool>(node.idleHoverTarget()));
-  EXPECT_NEAR(node.idleHoverTarget()->x(), 1.0, 1e-6);
-  EXPECT_NEAR(node.idleHoverTarget()->y(), 2.0, 1e-6);
-  EXPECT_NEAR(node.idleHoverTarget()->z(), 15.0, 1e-6);
-}
-
-TEST(EgoStateMachine, ArmOffboardEdgeDoesNotTriggerLegacyTakeoff)
-{
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-  node.injectLocalPose(makePose(0.0, 0.0, 2.0, 0.0));
-
-  // 未 arm+OFFBOARD 时保持 IDLE
   node.injectMavrosState(false, false);
-  EXPECT_EQ(node.execState(), kStateIdle);
-
-  // 默认关闭旧 TAKEOFF 状态机；arm/OFFBOARD 所有权在 executor。
-  node.injectMavrosState(true, true);
-  EXPECT_EQ(node.execState(), kStateIdle);
-
-  // 下降沿（如手控接管丢失 OFFBOARD）：回 IDLE
-  node.injectMavrosState(true, false);
-  EXPECT_EQ(node.execState(), kStateIdle);
+  return node.execState() == kStateHold;
 }
 
-TEST(EgoStateMachine, ArmOffboardKeepsCurrentIdleSetpoint)
+TEST(EgoStateMachine, InitialStateIsHold)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  EXPECT_EQ(node.execState(), kStateHold);
+}
+
+TEST(EgoStateMachine, ArmOffboardEdgeStartsTakeoff)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.injectLocalPose(makePose(0.0, 0.0, 2.0, 0.0));
+
+  // 未 arm+OFFBOARD 时保持 HOLD
+  node.injectMavrosState(false, false);
+  EXPECT_EQ(node.execState(), kStateHold);
+
+  // arm/OFFBOARD 上升沿进入 TAKEOFF。
+  node.injectMavrosState(true, true);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+
+  // 下降沿（如手控接管丢失 OFFBOARD）：保持 HOLD
+  node.injectMavrosState(true, false);
+  EXPECT_EQ(node.execState(), kStateHold);
+}
+
+TEST(EgoStateMachine, TakeoffPublishesHoldSetpoint)
 {
   FakeClock clock;
   clock.set(0.0);
@@ -122,97 +100,45 @@ TEST(EgoStateMachine, ArmOffboardKeepsCurrentIdleSetpoint)
   node.injectLocalPose(makePose(0.0, 0.0, 2.0, 0.0));
 
   node.injectMavrosState(true, true);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
   clock.advance(1.0 / 30.0);
   node.publishSetpointTick();
-  EXPECT_EQ(node.execState(), kStateIdle);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
   EXPECT_NEAR(node.lastSetpoint().pose.position.z, 2.0, 1e-6);
 }
 
-TEST(EgoStateMachine, RepeatedArmEdgesRemainIdle)
+TEST(EgoStateMachine, RepeatedArmEdgesRemainHold)
 {
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
 
-  ASSERT_TRUE(setupIdle(node, clock, 2.0));
-  EXPECT_EQ(node.execState(), kStateIdle);
+  ASSERT_TRUE(setupHold(node, clock, 2.0));
+  EXPECT_EQ(node.execState(), kStateHold);
 
-  // 手控落地：arm/OFFBOARD 丢失 -> 回 IDLE（已处于 IDLE，维持不变）
+  // 手控落地：arm/OFFBOARD 丢失 -> 保持 HOLD
   node.injectMavrosState(true, false);
-  EXPECT_EQ(node.execState(), kStateIdle);
+  EXPECT_EQ(node.execState(), kStateHold);
   node.injectMavrosState(false, false);
-  EXPECT_EQ(node.execState(), kStateIdle);
+  EXPECT_EQ(node.execState(), kStateHold);
 
   // 再次 arm+OFFBOARD 也不会触发旧软起飞。
   node.injectMavrosState(true, true);
-  EXPECT_EQ(node.execState(), kStateIdle);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
 }
 
-TEST(EgoStateMachine, IdlePublishesHoverSetpointAndRefreshesPerSecond)
+TEST(EgoStateMachine, CompletedFreezesInHold)
 {
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
 
-  ASSERT_TRUE(setupIdle(node, clock, 15.0));
-  EXPECT_EQ(node.execState(), kStateIdle);
+  ASSERT_TRUE(setupHold(node, clock, 15.0));
+  EXPECT_EQ(node.execState(), kStateHold);
 
-  // 30Hz 发布：1 秒推进应约 30 条
-  const size_t before = node.setpointCount();
-  for (int i = 0; i < 30; ++i)
-  {
-    clock.advance(1.0 / 30.0);
-    node.publishSetpointTick();
-  }
-  EXPECT_GE(node.setpointCount(), before + 29);
-  EXPECT_EQ(node.execState(), kStateIdle);
-  ASSERT_TRUE(static_cast<bool>(node.idleHoverTarget()));
-  EXPECT_NEAR(node.idleHoverTarget()->x(), 0.0, 1e-6);
-
-  // 每秒刷新：位姿移动到新位置后，setpoint 目标随之下一个周期更新
-  clock.set(node.idleHoverUpdatedAt().toSec() + 2.0);
-  node.injectLocalPose(makePose(8.0, 9.0, 15.0, clock.get()));
-  node.publishSetpointTick();  // 进入刷新周期 -> 更新 idle_hover_target_
-  ASSERT_TRUE(static_cast<bool>(node.idleHoverTarget()));
-  EXPECT_NEAR(node.idleHoverTarget()->x(), 8.0, 1e-6);
-  const geometry_msgs::PoseStamped sp = node.lastSetpoint();
-  EXPECT_NEAR(sp.pose.position.x, 8.0, 1e-6);
-  EXPECT_NEAR(sp.pose.position.y, 9.0, 1e-6);
-}
-
-TEST(EgoStateMachine, IdleStopsPublishingWithoutFreshPose)
-{
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-
-  ASSERT_TRUE(setupIdle(node, clock, 15.0));
-  EXPECT_EQ(node.execState(), kStateIdle);
-
-  node.publishSetpointTick();
-  const size_t count = node.setpointCount();
-  EXPECT_GT(count, 0u);
-
-  // 位姿过期（> pose_timeout=1s）：fail-safe，不再发布
-  clock.set(100.0);
-  node.publishSetpointTick();
-  EXPECT_EQ(node.setpointCount(), count);
-}
-
-TEST(EgoStateMachine, CompletedFreezesThenRevertsToIdle)
-{
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-
-  ASSERT_TRUE(setupIdle(node, clock, 15.0));
-  EXPECT_EQ(node.execState(), kStateIdle);
-
-  node.sendGoal(5.0, 0.0, 15.0);
+  node.sendGoal(0.0, 0.0, 15.0);
   ASSERT_TRUE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateExecuting);
 
@@ -223,12 +149,12 @@ TEST(EgoStateMachine, CompletedFreezesThenRevertsToIdle)
     clock.advance(step);
     node.publishSetpointTick();
     echoSetpoint(node, clock);
-    if (node.execState() == kStateCompleted)
+    if (node.execState() == kStateHold && node.steadyTarget())
       break;
   }
-  EXPECT_EQ(node.execState(), kStateCompleted);
-  ASSERT_TRUE(static_cast<bool>(node.steadyTarget()));
-  EXPECT_NEAR(node.steadyTarget()->pos.x(), 5.0, 0.5);
+  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
+  EXPECT_NEAR(node.steadyTarget()->pos.x(), 0.0, 0.5);
 
   // COMPLETED 后 2 秒内：继续发布冻结位姿（setpoint 流不断）
   const double frozen_x = node.lastSetpoint().pose.position.x;
@@ -238,25 +164,25 @@ TEST(EgoStateMachine, CompletedFreezesThenRevertsToIdle)
     node.publishSetpointTick();
     EXPECT_NEAR(node.lastSetpoint().pose.position.x, frozen_x, 1e-3);
   }
-  EXPECT_EQ(node.execState(), kStateCompleted);
+  EXPECT_EQ(node.execState(), kStateHold);
 
-  // > 2 秒：自动回 IDLE，继续发布当前位姿
-  clock.advance(2.0);
+  // 超过原有终端窗口后仍保持锁定
+  clock.advance(20.0);
   node.publishSetpointTick();
-  EXPECT_EQ(node.execState(), kStateIdle);
-  EXPECT_FALSE(static_cast<bool>(node.steadyTarget()));
+  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
   EXPECT_GT(node.setpointCount(), 0u);
 }
 
-TEST(EgoStateMachine, HoldFreezesThenRevertsToIdle)
+TEST(EgoStateMachine, HoldRemainsFixed)
 {
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
 
-  ASSERT_TRUE(setupIdle(node, clock, 12.0));
-  EXPECT_EQ(node.execState(), kStateIdle);
+  ASSERT_TRUE(setupHold(node, clock, 12.0));
+  EXPECT_EQ(node.execState(), kStateHold);
 
   node.sendHold();
   node.replanOnce();  // 处理 hold -> HOLD + 冻结当前位姿
@@ -276,10 +202,10 @@ TEST(EgoStateMachine, HoldFreezesThenRevertsToIdle)
   EXPECT_EQ(node.execState(), kStateHold);
 
   // > 2 秒：自动回 IDLE
-  clock.advance(2.0);
+  clock.advance(20.0);
   node.publishSetpointTick();
-  EXPECT_EQ(node.execState(), kStateIdle);
-  EXPECT_FALSE(static_cast<bool>(node.steadyTarget()));
+  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
 }
 
 TEST(EgoStateMachine, ArmOffboardDoesNotBlockReplan)
@@ -289,13 +215,16 @@ TEST(EgoStateMachine, ArmOffboardDoesNotBlockReplan)
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
   node.injectLocalPose(makePose(0.0, 0.0, 2.0, 0.0));
-
   node.injectMavrosState(true, true);
-  EXPECT_EQ(node.execState(), kStateIdle);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+  node.sendGoal(10.0, 0.0, 7.0);
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
 
   node.sendGoal(10.0, 0.0, 7.0);
-  EXPECT_TRUE(node.replanOnce());
-  EXPECT_EQ(node.execState(), kStateExecuting);
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateTakeoff);
 }
 }  // namespace
 

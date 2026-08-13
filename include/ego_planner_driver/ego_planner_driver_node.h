@@ -38,12 +38,11 @@ static constexpr const char* kStateHold = "HOLD";
 static constexpr const char* kStatePoseStale = "POSE_STALE";
 static constexpr const char* kStatePlanFailed = "EGO_PLAN_FAILED";
 static constexpr const char* kStateExecTimeout = "EGO_EXEC_TIMEOUT";
+static constexpr const char* kStateTakeoff = "TAKEOFF";
 
 constexpr double kSetpointRateHz = 30.0;
 constexpr double kNeighborStaleS = 5.0;
 constexpr double kReplanPeriodS = 0.5;
-constexpr double kIdleHoverRefreshHz = 1.0;   // IDLE hover 目标每秒刷新一次
-constexpr double kTerminalToIdleS = 2.0;      // terminal(COMPLETED/HOLD) → IDLE 自动转换窗口
 
 struct HoldTarget
 {
@@ -71,8 +70,6 @@ public:
   void publishSetpointTick();
   std::string execState() const;
   boost::optional<HoldTarget> steadyTarget() const;
-  boost::optional<Eigen::Vector3d> idleHoverTarget() const;
-  ros::Time idleHoverUpdatedAt() const;
   geometry_msgs::PoseStamped lastSetpoint() const;
   size_t setpointCount() const;
 
@@ -89,13 +86,13 @@ private:
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }
   void resetRun();
   void setState(const std::string& state);
+  bool captureHoldTargetLocked(const ros::Time& now);
   void publishPose(double x, double y, double z, double yaw);
   static double yawFromQuat(const geometry_msgs::Quaternion& q);
   void publishSetpoint(const ros::TimerEvent& event);
-  void refreshIdleHoverTarget(const ros::Time& now);
-  void scheduleTerminalToIdle(const std::string& terminal_state);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   void processHoldLocked();
+  void handleMavrosStateEdgeLocked();
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base);
   static void appendSample(swarm_uav_interfaces::UavTrajectoryIntent& msg,
                            const TimedTrajectory& traj, size_t i);
@@ -110,9 +107,16 @@ private:
   double pos_tol_ = 0.2;
   double stable_s_ = 1.0;
   double timeout_margin_ = 5.0;
-  double terminal_to_idle_s_ = kTerminalToIdleS;
-  double idle_hover_refresh_hz_ = kIdleHoverRefreshHz;
   bool direct_control_active_ = false;
+
+  bool armed_ = false;
+  bool offboard_ = false;
+  bool prev_arm_offboard_ = false;
+  double takeoff_height_ = 5.0;
+  double takeoff_ascend_speed_ = 1.0;
+  bool takeoff_active_ = false;
+  double takeoff_start_z_ = 0.0;
+  ros::Time takeoff_start_time_;
 
   ros::NodeHandle nh_;
   ros::NodeHandle pnh_;
@@ -147,14 +151,6 @@ private:
   std::string exec_state_;
   boost::optional<HoldTarget> steady_target_;
   boost::optional<ros::Time> arrival_since_;
-
-  // IDLE hover 目标（每秒更新为当前位姿，避免切 OFFBOARD 时 setpoint 跳变）
-  boost::optional<Eigen::Vector3d> idle_hover_target_;
-  ros::Time idle_hover_updated_at_;
-
-  // terminal(COMPLETED/HOLD) → IDLE 自动转换窗口；"" 表示不调度
-  std::string scheduled_revert_state_;
-  ros::Time terminal_entered_at_;
 
   size_t setpoint_count_ = 0;
   boost::optional<geometry_msgs::PoseStamped> last_setpoint_;

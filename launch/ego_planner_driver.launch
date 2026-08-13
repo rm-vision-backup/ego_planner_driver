@@ -25,9 +25,7 @@
     <param name="position_tolerance_m" value="0.2"/>
     <param name="arrival_stable_s" value="1.0"/>
     <param name="exec_timeout_margin_s" value="5.0"/>
-    <!-- terminal(COMPLETED/HOLD) → IDLE 自动转换窗口（秒） -->
-    <param name="terminal_to_idle_s" value="2.0"/>
-    <!-- IDLE hover 目标每秒刷新频率（Hz） -->
-    <param name="idle_hover_refresh_hz" value="1.0"/>
+    <param name="takeoff_height_m" value="5.0"/>
+    <param name="takeoff_ascend_speed" value="1.0"/>
   </node>
 </launch>

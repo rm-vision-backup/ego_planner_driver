@@ -32,8 +32,8 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   pos_tol_ = pnh_.param("position_tolerance_m", 0.2);
   stable_s_ = pnh_.param("arrival_stable_s", 1.0);
   timeout_margin_ = pnh_.param("exec_timeout_margin_s", 5.0);
-  terminal_to_idle_s_ = pnh_.param("terminal_to_idle_s", kTerminalToIdleS);
-  idle_hover_refresh_hz_ = pnh_.param("idle_hover_refresh_hz", kIdleHoverRefreshHz);
+  takeoff_height_ = pnh_.param("takeoff_height_m", 5.0);
+  takeoff_ascend_speed_ = pnh_.param("takeoff_ascend_speed", 1.0);
 
   // Interface topics live under the public namespace (/UAV1/*) so the
   // Python EgoSwarmDriver and topology bridge can reach them without
@@ -50,7 +50,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   mavros_state_sub_ = nh_.subscribe("/mavros/state", 1, &EgoPlannerDriverNode::onMavrosState, this);
   direct_control_sub_ = nh_.subscribe("direct_control_active", 1,
                                       &EgoPlannerDriverNode::onDirectControl, this);
-  setState(kStateIdle);
+  setState(kStateHold);
   timer_ = nh_.createTimer(ros::Duration(1.0 / setpoint_rate_),
                            &EgoPlannerDriverNode::publishSetpoint, this);
   replan_thread_ = std::thread(&EgoPlannerDriverNode::replanLoop, this);
@@ -74,12 +74,16 @@ void EgoPlannerDriverNode::injectLocalPose(const geometry_msgs::PoseStamped& pos
   std::lock_guard<std::mutex> lock(mutex_);
   local_pose_ = pose;
   local_pose_stamp_ = pose.header.stamp;
+  if (exec_state_ == kStateHold && !steady_target_ && !direct_control_active_)
+    captureHoldTargetLocked(nowFunc());
 }
 
 void EgoPlannerDriverNode::injectMavrosState(bool armed, bool offboard)
 {
-  (void)armed;
-  (void)offboard;
+  std::lock_guard<std::mutex> lock(mutex_);
+  armed_ = armed;
+  offboard_ = offboard;
+  handleMavrosStateEdgeLocked();
 }
 
 void EgoPlannerDriverNode::sendGoal(double x, double y, double z)
@@ -117,6 +121,8 @@ bool EgoPlannerDriverNode::replanOnce()
     }
     if (direct_control_active_)
       return false;
+    if (exec_state_ == kStateTakeoff)
+      return false;
     if (!planning_requested_ || !pending_goal_ || steady_target_)
       return false;
     planning_requested_ = false;
@@ -151,6 +157,7 @@ bool EgoPlannerDriverNode::replanOnce()
   if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost))
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    captureHoldTargetLocked(nowFunc());
     setState(kStatePlanFailed);
     return false;
   }
@@ -198,18 +205,6 @@ boost::optional<HoldTarget> EgoPlannerDriverNode::steadyTarget() const
 {
   std::lock_guard<std::mutex> lock(mutex_);
   return steady_target_;
-}
-
-boost::optional<Eigen::Vector3d> EgoPlannerDriverNode::idleHoverTarget() const
-{
-  std::lock_guard<std::mutex> lock(mutex_);
-  return idle_hover_target_;
-}
-
-ros::Time EgoPlannerDriverNode::idleHoverUpdatedAt() const
-{
-  std::lock_guard<std::mutex> lock(mutex_);
-  return idle_hover_updated_at_;
 }
 
 geometry_msgs::PoseStamped EgoPlannerDriverNode::lastSetpoint() const
@@ -301,7 +296,10 @@ void EgoPlannerDriverNode::onHold(const std_msgs::Empty::ConstPtr&)
 
 void EgoPlannerDriverNode::onMavrosState(const mavros_msgs::State::ConstPtr& msg)
 {
-  (void)msg;
+  std::lock_guard<std::mutex> lock(mutex_);
+  armed_ = msg->armed;
+  offboard_ = (msg->mode == "OFFBOARD");
+  handleMavrosStateEdgeLocked();
 }
 
 void EgoPlannerDriverNode::onDirectControl(const std_msgs::Bool::ConstPtr& msg)
@@ -313,9 +311,36 @@ void EgoPlannerDriverNode::onDirectControl(const std_msgs::Bool::ConstPtr& msg)
     planning_requested_ = false;
     current_.reset();
     steady_target_.reset();
-    scheduled_revert_state_.clear();
     arrival_since_.reset();
-    setState(kStateIdle);
+    setState(kStateHold);
+  }
+}
+
+void EgoPlannerDriverNode::handleMavrosStateEdgeLocked()
+{
+  const bool current = armed_ && offboard_;
+  if (current && !prev_arm_offboard_)
+  {
+    prev_arm_offboard_ = true;
+    if (exec_state_ == kStateHold || exec_state_ == kStateIdle)
+    {
+      takeoff_active_ = false;
+      ROS_INFO("[%s] arm+OFFBOARD detected, entering TAKEOFF (soft takeoff)",
+               uav_id_.c_str());
+      setState(kStateTakeoff);
+    }
+    return;
+  }
+  if (!current && prev_arm_offboard_)
+  {
+    prev_arm_offboard_ = false;
+    if (exec_state_ == kStateTakeoff)
+    {
+      takeoff_active_ = false;
+      ROS_WARN("[%s] arm/OFFBOARD lost during TAKEOFF, reverting to HOLD",
+               uav_id_.c_str());
+      captureHoldTargetLocked(nowFunc());
+    }
   }
 }
 
@@ -324,7 +349,6 @@ void EgoPlannerDriverNode::resetRun()
   steady_target_.reset();
   arrival_since_.reset();
   hold_requested_ = false;
-  scheduled_revert_state_.clear();
 }
 
 void EgoPlannerDriverNode::setState(const std::string& state)
@@ -335,6 +359,28 @@ void EgoPlannerDriverNode::setState(const std::string& state)
   std_msgs::String msg;
   msg.data = state;
   state_pub_.publish(msg);
+}
+
+bool EgoPlannerDriverNode::captureHoldTargetLocked(const ros::Time& now)
+{
+  if (!local_pose_ || !local_pose_stamp_ ||
+      (now - *local_pose_stamp_).toSec() > pose_timeout_)
+  {
+    steady_target_.reset();
+    setState(kStatePoseStale);
+    return false;
+  }
+
+  steady_target_ = HoldTarget{
+      Eigen::Vector3d(local_pose_->pose.position.x,
+                      local_pose_->pose.position.y,
+                      local_pose_->pose.position.z),
+      yawFromQuat(local_pose_->pose.orientation)};
+  current_.reset();
+  arrival_since_.reset();
+  plan_start_ = ros::Time(0);
+  setState(kStateHold);
+  return true;
 }
 
 void EgoPlannerDriverNode::publishPose(double x, double y, double z, double yaw)
@@ -368,18 +414,38 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
   if (direct_control_active_)
     return;
 
-  // terminal(COMPLETED/HOLD) → IDLE 自动转换窗口：先冻结发布到窗口结束，回 IDLE 后
-  // 继续以当前位姿发布。所有状态下都不停止 setpoint 流，避免 OFFBOARD 掉线。
-  if (!scheduled_revert_state_.empty() &&
-      (now - terminal_entered_at_).toSec() >= terminal_to_idle_s_)
+  if (exec_state_ == kStateTakeoff)
   {
-    scheduled_revert_state_.clear();
-    terminal_entered_at_ = ros::Time(0);
-    steady_target_.reset();
-    current_.reset();
-    arrival_since_.reset();
-    plan_start_ = ros::Time(0);
-    setState(kStateIdle);
+    if (!armed_ || !offboard_)
+    {
+      captureHoldTargetLocked(now);
+      return;
+    }
+    if (!takeoff_active_)
+    {
+      takeoff_active_ = true;
+      takeoff_start_z_ = local_pose_ ? local_pose_->pose.position.z : 0.0;
+      takeoff_start_time_ = now;
+      ROS_INFO("[%s] TAKEOFF started from z=%.2f, target z=%.2f",
+               uav_id_.c_str(), takeoff_start_z_, takeoff_start_z_ + takeoff_height_);
+    }
+    const double elapsed = (now - takeoff_start_time_).toSec();
+    const double target_z = takeoff_start_z_ + takeoff_height_;
+    const double current_z = takeoff_start_z_ +
+                             std::min(elapsed * takeoff_ascend_speed_, takeoff_height_);
+    const double yaw = local_pose_ ? yawFromQuat(local_pose_->pose.orientation) : 0.0;
+    const double x = local_pose_ ? local_pose_->pose.position.x : 0.0;
+    const double y = local_pose_ ? local_pose_->pose.position.y : 0.0;
+    publishPose(x, y, current_z, yaw);
+    if (current_z >= target_z - 0.1)
+    {
+      ROS_INFO("[%s] TAKEOFF complete at z=%.2f, switching to HOLD",
+               uav_id_.c_str(), target_z);
+      steady_target_ = HoldTarget{Eigen::Vector3d(x, y, target_z), yaw};
+      takeoff_active_ = false;
+      setState(kStateHold);
+    }
+    return;
   }
 
   if (steady_target_)
@@ -390,9 +456,9 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
   }
   if (!current_ || current_->pts.empty())
   {
-    // IDLE：持续发布 hover 目标（每秒刷新为当前位姿）；无 fresh pose 时 fail-safe 不发布。
-    if (exec_state_ == kStateIdle)
-      refreshIdleHoverTarget(now);
+    // HOLD：steady_target_ 为空时等待 fresh pose，避免发布无效 setpoint。
+    if (exec_state_ == kStateHold)
+      captureHoldTargetLocked(now);
     return;
   }
   const double elapsed = (now - plan_start_).toSec();
@@ -416,31 +482,6 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
     checkArrival(current_->pts.back(), current_->yaw.back(), now);
 }
 
-void EgoPlannerDriverNode::refreshIdleHoverTarget(const ros::Time& now)
-{
-  // 无 fresh pose 时 fail-safe：不发布 setpoint
-  if (!local_pose_ || !local_pose_stamp_ ||
-      (now - *local_pose_stamp_).toSec() > pose_timeout_)
-    return;
-  const double period = 1.0 / std::max(idle_hover_refresh_hz_, 0.01);
-  if (!idle_hover_target_ || (now - idle_hover_updated_at_).toSec() >= period)
-  {
-    idle_hover_target_ = Eigen::Vector3d(local_pose_->pose.position.x,
-                                         local_pose_->pose.position.y,
-                                         local_pose_->pose.position.z);
-    idle_hover_updated_at_ = now;
-  }
-  publishPose(idle_hover_target_->x(), idle_hover_target_->y(),
-              idle_hover_target_->z(),
-              yawFromQuat(local_pose_->pose.orientation));
-}
-
-void EgoPlannerDriverNode::scheduleTerminalToIdle(const std::string& terminal_state)
-{
-  scheduled_revert_state_ = terminal_state;
-  terminal_entered_at_ = nowFunc();
-}
-
 void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double yaw,
                                         const ros::Time& now)
 {
@@ -459,12 +500,11 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
       arrival_since_ = now;
     if ((now - *arrival_since_).toSec() >= stable_s_)
     {
-      setState(kStateCompleted);
       steady_target_ = HoldTarget{target, yaw};
       current_.reset();
       arrival_since_.reset();
       plan_start_ = ros::Time(0);
-      scheduleTerminalToIdle(kStateCompleted);
+      setState(kStateHold);
     }
     return;
   }
@@ -472,10 +512,8 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
   const double elapsed = (now - plan_start_).toSec();
   if (elapsed >= current_->duration + timeout_margin_)
   {
-    setState(kStateExecTimeout);
-    steady_target_ = HoldTarget{target, yaw};
-    current_.reset();
-    plan_start_ = ros::Time(0);
+    captureHoldTargetLocked(now);
+    setState(kStateHold);
   }
 }
 
@@ -483,20 +521,7 @@ void EgoPlannerDriverNode::processHoldLocked()
 {
   hold_requested_ = false;
   const ros::Time now = nowFunc();
-  if (local_pose_ && local_pose_stamp_ &&
-      (now - *local_pose_stamp_).toSec() <= pose_timeout_)
-    steady_target_ = HoldTarget{
-        Eigen::Vector3d(local_pose_->pose.position.x,
-                        local_pose_->pose.position.y,
-                        local_pose_->pose.position.z),
-        yawFromQuat(local_pose_->pose.orientation)};
-  else
-    steady_target_.reset();  // fail-safe: no fresh pose, stop publishing setpoints
-  current_.reset();
-  arrival_since_.reset();
-  plan_start_ = ros::Time(0);
-  setState(kStateHold);
-  scheduleTerminalToIdle(kStateHold);
+  captureHoldTargetLocked(now);
 }
 
 void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros::Time& base)
@@ -551,6 +576,8 @@ void EgoPlannerDriverNode::replanLoop()
         processHoldLocked();
         continue;
       }
+      if (exec_state_ == kStateTakeoff)
+        continue;
       if (!planning_requested_ || !pending_goal_ || steady_target_)
         continue;
       planning_requested_ = false;
