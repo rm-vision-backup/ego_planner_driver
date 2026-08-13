@@ -462,8 +462,9 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
   }
   if (!current_ || current_->pts.empty())
   {
-    // HOLD：steady_target_ 为空时等待 fresh pose，避免发布无效 setpoint。
-    if (exec_state_ == kStateHold)
+    // HOLD/POSE_STALE：steady_target_ 为空时等待 fresh pose，避免发布无效
+    // setpoint；POSE_STALE 也在 pose 恢复后自愈回 HOLD（启动时序问题）。
+    if (exec_state_ == kStateHold || exec_state_ == kStatePoseStale)
       captureHoldTargetLocked(now);
     return;
   }
