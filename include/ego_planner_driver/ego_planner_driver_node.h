@@ -38,7 +38,6 @@ static constexpr const char* kStateHold = "HOLD";
 static constexpr const char* kStatePoseStale = "POSE_STALE";
 static constexpr const char* kStatePlanFailed = "EGO_PLAN_FAILED";
 static constexpr const char* kStateExecTimeout = "EGO_EXEC_TIMEOUT";
-static constexpr const char* kStateTakeoff = "TAKEOFF";
 
 constexpr double kSetpointRateHz = 30.0;
 constexpr double kNeighborStaleS = 5.0;
@@ -97,7 +96,6 @@ private:
   void scheduleTerminalToIdle(const std::string& terminal_state);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   void processHoldLocked();
-  void handleMavrosStateEdgeLocked();
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base);
   static void appendSample(swarm_uav_interfaces::UavTrajectoryIntent& msg,
                            const TimedTrajectory& traj, size_t i);
@@ -114,18 +112,7 @@ private:
   double timeout_margin_ = 5.0;
   double terminal_to_idle_s_ = kTerminalToIdleS;
   double idle_hover_refresh_hz_ = kIdleHoverRefreshHz;
-  bool legacy_auto_takeoff_ = false;
   bool direct_control_active_ = false;
-
-  // --- TAKEOFF 状态相关 ---
-  bool armed_ = false;
-  bool offboard_ = false;
-  bool prev_arm_offboard_ = false;  // 上一次的 arm&&offboard 状态（边沿检测）
-  double takeoff_height_ = 5.0;        // 起飞高度（相对当前 Z 增量，m）
-  double takeoff_ascend_speed_ = 1.0;  // 上升速度（m/s）
-  bool takeoff_active_ = false;        // 是否已进入 arm+OFFBOARD 触发
-  double takeoff_start_z_ = 0.0;       // 起飞起始 Z
-  ros::Time takeoff_start_time_;
 
   ros::NodeHandle nh_;
   ros::NodeHandle pnh_;

@@ -28,7 +28,7 @@
 
 ## 安全与验证
 
-- C++ 节点不 arm、不切 OFFBOARD；旧 arm+OFFBOARD 自动 TAKEOFF 默认关闭。Python executor driver 在直接垂直/PI 控制期间通过仲裁暂停 EGO setpoint。
+- C++ 节点不 arm、不切 OFFBOARD，也不因 arm+OFFBOARD 自动起飞。除 FOLLOW_ROUTE follower 的 PI 位置跟随外，轨迹均由 Ego 规划；PI 直接控制期间通过仲裁暂停 EGO setpoint。
 - `swarm_clearance=0.5` 表示每机安全半径：互惠检查使用两倍值，对应 1.0 m 水平中心距；原有 2:1 椭球对应 2.0 m 垂直中心距。规划结果在发布前执行硬 clearance 校验。
 - 自动化：2026-08-13 全工作空间 133 tests 全绿（含本包 30 个 gtest 计数）。
 - 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS，详见 `tcp_to_ros/docs/tcp_to_ros_测试记录.md`。

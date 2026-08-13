@@ -29,9 +29,5 @@
     <param name="terminal_to_idle_s" value="2.0"/>
     <!-- IDLE hover 目标每秒刷新频率（Hz） -->
     <param name="idle_hover_refresh_hz" value="1.0"/>
-    <!-- TAKEOFF 软起飞参数 -->
-    <param name="takeoff_height_m" value="5.0"/>
-    <param name="takeoff_ascend_speed" value="1.0"/>
-    <param name="legacy_auto_takeoff" value="false"/>
   </node>
 </launch>
