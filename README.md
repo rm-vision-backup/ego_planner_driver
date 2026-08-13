@@ -13,7 +13,7 @@
 
 | Topic | 类型 | 方向 |
 |---|---|---|
-| `exec_state` | `std_msgs/String`（latched） | 出：`IDLE/EXECUTING/COMPLETED/HOLD/POSE_STALE/EGO_PLAN_FAILED/EGO_EXEC_TIMEOUT` |
+| `exec_state` | `std_msgs/String`（latched） | 出：`HOLD`（初始）/`TAKEOFF`/`EXECUTING`/`COMPLETED`/`POSE_STALE`/`EGO_PLAN_FAILED`/`EGO_EXEC_TIMEOUT`（`IDLE` 常量保留但不再作为初始态） |
 | `setpoint` | `geometry_msgs/PoseStamped` | 出：30 Hz OFFBOARD 兼容位置 setpoint |
 | `trajectory_intent` | `swarm_uav_interfaces/UavTrajectoryIntent` | 出：本机带时轨迹 |
 | `goal` | `geometry_msgs/PointStamped` | 入：单点目标 |
@@ -31,7 +31,7 @@
 - C++ 节点不 arm、不切 OFFBOARD，也不因 arm+OFFBOARD 自动起飞。除 FOLLOW_ROUTE follower 的 PI 位置跟随外，轨迹均由 Ego 规划；PI 直接控制期间通过仲裁暂停 EGO setpoint。
 - `swarm_clearance=0.5` 表示每机安全半径：互惠检查使用两倍值，对应 1.0 m 水平中心距；原有 2:1 椭球对应 2.0 m 垂直中心距。规划结果在发布前执行硬 clearance 校验。
 - 自动化：2026-08-13 全工作空间 133 tests 全绿（含本包 30 个 gtest 计数）。
-- 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS，详见 `tcp_to_ros/docs/tcp_to_ros_测试记录.md`。
+- 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS；2026-08-12 起初始态改为 `HOLD`，arm+OFFBOARD 后进入 `TAKEOFF` 软起飞。详见 `tcp_to_ros/docs/test_record_26081402.md`。
 
 ## 环境变量（ROS 日志重定向）
 
