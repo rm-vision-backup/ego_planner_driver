@@ -128,6 +128,31 @@ TEST(EgoStateMachine, RepeatedArmEdgesRemainHold)
   EXPECT_EQ(node.execState(), kStateTakeoff);
 }
 
+TEST(EgoStateMachine, PublishSetpointDoesNotReclaimWhileGoalPending)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
+
+  // 收到新目标：onGoal 的 resetRun 清除 steady_target_ 并请求规划。
+  node.sendGoal(10.0, 0.0, 7.0);
+  EXPECT_FALSE(static_cast<bool>(node.steadyTarget()));
+
+  // 30Hz publishSetpoint 不得在 replan 前重新捕获 steady_target_，
+  // 否则 replanLoop 会因 steady_target_ 非空而永远跳过规划（真实竞态：
+  // 空闲 HOLD 捕获 -> onGoal 清除 -> publishSetpoint 重新捕获 -> 永不规划）。
+  node.publishSetpointTick();
+  EXPECT_FALSE(static_cast<bool>(node.steadyTarget()));
+
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+}
+
 TEST(EgoStateMachine, CompletedFreezesInHold)
 {
   FakeClock clock;

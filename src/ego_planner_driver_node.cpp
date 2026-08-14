@@ -464,7 +464,10 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
   {
     // HOLD/POSE_STALE：steady_target_ 为空时等待 fresh pose，避免发布无效
     // setpoint；POSE_STALE 也在 pose 恢复后自愈回 HOLD（启动时序问题）。
-    if (exec_state_ == kStateHold || exec_state_ == kStatePoseStale)
+    // 有待处理 goal（planning_requested_）时禁止重新捕获 steady_target_，
+    // 否则会与 replanLoop 的 steady_target_ 检查竞争，导致新目标永不规划。
+    if ((exec_state_ == kStateHold || exec_state_ == kStatePoseStale) &&
+        !planning_requested_)
       captureHoldTargetLocked(now);
     return;
   }
