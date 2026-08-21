@@ -12,6 +12,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.ts = pnh_.param("ts", 0.4);
   config.max_vel = pnh_.param("max_vel", 1.0);
   config.max_acc = pnh_.param("max_acc", 6.0);
+  config.waypoint_max_spacing = pnh_.param("waypoint_max_spacing_m", 2.0);
   config.swarm_clearance = pnh_.param("swarm_clearance", 0.5);
   config.planning_range = pnh_.param("planning_range", 30.0);
   config.lambda_smooth = pnh_.param("lambda_smooth", 1.0);

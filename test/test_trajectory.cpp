@@ -107,6 +107,36 @@ TEST(EgoPlannerCore, CheckClearanceCatchesViolation)
   EXPECT_TRUE(core.checkClearance(trajectory, {}, 0.5));
 }
 
+TEST(EgoPlannerCore, LongMoveDensifiedKeepsFeasibleDuration)
+{
+  EgoPlannerConfig config = makeConfig();
+  config.waypoint_max_spacing = 2.0;
+  EgoPlannerCore core(config);
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 5.0), 0.0};
+  std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(48.0, 0.0, 12.0), 0.0}};
+  TimedTrajectory trajectory;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, trajectory, cost));
+  // 48 m at max_vel=8 m/s needs at least ~6 s; densification keeps the
+  // trajectory near that bound instead of compressing it into ~1.6 s.
+  EXPECT_GT(trajectory.duration, 5.0);
+  EXPECT_NEAR(trajectory.pts.front().x(), 0.0, 1e-2);
+  EXPECT_NEAR(trajectory.pts.back().x(), 48.0, 1e-2);
+}
+
+TEST(EgoPlannerCore, SparseLongMoveCompressedWithoutDensification)
+{
+  EgoPlannerConfig config = makeConfig();
+  config.waypoint_max_spacing = 0.0;  // disable densification
+  EgoPlannerCore core(config);
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 5.0), 0.0};
+  std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(48.0, 0.0, 12.0), 0.0}};
+  TimedTrajectory trajectory;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, trajectory, cost));
+  EXPECT_LT(trajectory.duration, 3.0);
+}
+
 int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);
