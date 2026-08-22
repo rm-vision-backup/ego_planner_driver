@@ -255,6 +255,61 @@ TEST(EgoStateMachine, ArmOffboardDoesNotBlockReplan)
 
 // 启动隔离 roscore，保证节点 advertise/subscribe/timer 可用
 // （catkin_add_gtest 不自动启动 roscore）
+TEST(EgoStateMachine, HorizonTruncatesAndRollsWaypoints)
+{
+  // 让 replan 线程先进入 sleep 窗口，避免在下方快速 wall-clock 步骤中
+  // 抢占 planning_requested_（FakeClock 推进不影响线程的 0.5s wall sleep）。
+  usleep(600 * 1000);
+
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setPlanningHorizon(5.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 1; i <= 10; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = i * 2.0; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  // 推进到第一段末端：段末点应落在 horizon 内（首个航点 2m 起步，约 6m），
+  // 远小于最终目标 20m —— 验证 receding-horizon 截取生效。
+  double seg1_x = -1.0;
+  for (int step = 0; step < 300; ++step)
+  {
+    node.publishSetpointTick();
+    seg1_x = node.lastSetpoint().pose.position.x;
+    if (node.execState() == kStateHold)
+      break;
+    clock.advance(0.1);
+    echoSetpoint(node, clock);
+  }
+  EXPECT_LT(seg1_x, 8.0);
+  EXPECT_GT(seg1_x, 3.0);
+
+  // 到达段末后 checkArrival 置 planning_requested_（还有后续航点），
+  // 手动 replanOnce 规划下一段并继续推进 —— 验证滚动重规划。
+  double max_x = seg1_x;
+  for (int step = 0; step < 300; ++step)
+  {
+    node.replanOnce();
+    node.publishSetpointTick();
+    max_x = std::max(max_x, node.lastSetpoint().pose.position.x);
+    if (node.execState() == kStateHold)
+      break;
+    clock.advance(0.1);
+    echoSetpoint(node, clock);
+  }
+  EXPECT_GT(max_x, seg1_x + 2.0);
+}
+
 int main(int argc, char** argv)
 {
   setenv("ROS_MASTER_URI", "http://localhost:11411", 1);

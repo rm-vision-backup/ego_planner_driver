@@ -14,9 +14,9 @@
     <param name="ts" value="0.4"/>
     <param name="max_vel" value="1.0"/>
     <param name="max_acc" value="6.0"/>
-    <!-- 稀疏关键航点按最大 2m 间距均匀插值后再参数化 B-spline，避免单目标
-         远距离时固定 knot span 把整条航线压缩进少量控制点导致速度远超限速。 -->
-    <param name="waypoint_max_spacing_m" value="2.0"/>
+    <!-- 滚动局部规划范围：waypoints 每次只取当前位置前方 horizon 内的点，
+         对齐原版 ego-planner-swarm receding-horizon；0 表示全局规划（退化）。 -->
+    <param name="planning_horizon" value="5.0"/>
     <!-- Per-aircraft clearance radius; reciprocal hard center spacing is 2x. -->
     <param name="swarm_clearance" value="0.5"/>
     <param name="planning_range" value="30.0"/>

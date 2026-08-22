@@ -12,7 +12,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.ts = pnh_.param("ts", 0.4);
   config.max_vel = pnh_.param("max_vel", 1.0);
   config.max_acc = pnh_.param("max_acc", 6.0);
-  config.waypoint_max_spacing = pnh_.param("waypoint_max_spacing_m", 2.0);
+  config.planning_horizon = pnh_.param("planning_horizon", 0.0);
   config.swarm_clearance = pnh_.param("swarm_clearance", 0.5);
   config.planning_range = pnh_.param("planning_range", 30.0);
   config.lambda_smooth = pnh_.param("lambda_smooth", 1.0);
@@ -22,6 +22,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.mem_size = pnh_.param("mem_size", 16);
   config.g_epsilon = pnh_.param("g_epsilon", 0.01);
   core_.reset(new EgoPlannerCore(config));
+  planning_horizon_ = config.planning_horizon;
   frame_id_ = pnh_.param("frame_id", std::string("map"));
   // Identity parameters live in the public namespace (/UAV1/*) so the
   // Python driver and topology can discover them; planner tuning stays
@@ -70,6 +71,12 @@ void EgoPlannerDriverNode::setClockSource(ClockFn fn)
   clock_source_ = std::move(fn);
 }
 
+void EgoPlannerDriverNode::setPlanningHorizon(double horizon)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  planning_horizon_ = horizon;
+}
+
 void EgoPlannerDriverNode::injectLocalPose(const geometry_msgs::PoseStamped& pose)
 {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -102,6 +109,15 @@ void EgoPlannerDriverNode::sendHold()
   onHold(boost::make_shared<std_msgs::Empty>());
 }
 
+void EgoPlannerDriverNode::sendWaypoints(
+    const std::vector<geometry_msgs::Point32>& points)
+{
+  geometry_msgs::PolygonStamped msg;
+  msg.header.stamp = nowFunc();
+  msg.polygon.points = points;
+  onWaypoints(boost::make_shared<geometry_msgs::PolygonStamped>(msg));
+}
+
 bool EgoPlannerDriverNode::replanOnce()
 {
   struct Snapshot
@@ -110,6 +126,7 @@ bool EgoPlannerDriverNode::replanOnce()
     std::vector<WayPoint> waypoints;
     std::vector<NeighborTrajectory> neighbors;
     ros::Time now;
+    size_t planned_waypoint_count = 0;  // 本次规划覆盖的 waypoints 数（滚动簿记）
   };
   boost::optional<Snapshot> snap;
   ros::Time completed_at;
@@ -141,6 +158,14 @@ bool EgoPlannerDriverNode::replanOnce()
                                           local_pose_->pose.position.z);
     data.start.yaw = goal_yaw_;
     data.waypoints = waypoints_;
+    // 滚动局部规划：waypoints 只取当前位置前方 planning_horizon 内的点
+    // （对齐原版 ego-planner-swarm receding-horizon）。
+    if (planning_horizon_ > 0.0 && !remaining_waypoints_.empty())
+    {
+      data.waypoints = truncateToHorizon(
+          remaining_waypoints_, planning_horizon_, data.start.position);
+      data.planned_waypoint_count = data.waypoints.size();
+    }
     for (const auto& item : inbox_)
     {
       if ((now - item.second.second).toSec() > kNeighborStaleS)
@@ -180,8 +205,35 @@ bool EgoPlannerDriverNode::replanOnce()
     steady_target_.reset();
     setState(kStateExecuting);
     publishIntent(traj, completed_at);
+    // 滚动簿记：移除本段已覆盖的 waypoints，下一段从剩余部分取 horizon。
+    if (planning_horizon_ > 0.0 && snap->planned_waypoint_count > 0 &&
+        !remaining_waypoints_.empty())
+    {
+      const size_t n = std::min(snap->planned_waypoint_count, remaining_waypoints_.size());
+      remaining_waypoints_.erase(remaining_waypoints_.begin(),
+                                 remaining_waypoints_.begin() + n);
+    }
   }
   return true;
+}
+
+std::vector<WayPoint> EgoPlannerDriverNode::truncateToHorizon(
+    const std::vector<WayPoint>& remaining, double horizon,
+    const Eigen::Vector3d& start) const
+{
+  if (horizon <= 0.0 || remaining.size() < 2)
+    return remaining;
+  std::vector<WayPoint> out;
+  out.push_back(remaining.front());
+  double accumulated = (remaining.front().position - start).norm();
+  for (size_t i = 1; i < remaining.size(); ++i)
+  {
+    accumulated += (remaining[i].position - remaining[i - 1].position).norm();
+    out.push_back(remaining[i]);
+    if (accumulated >= horizon)
+      break;
+  }
+  return out;
 }
 
 void EgoPlannerDriverNode::advanceHoldHandling()
@@ -225,6 +277,7 @@ void EgoPlannerDriverNode::onGoal(const geometry_msgs::PointStamped::ConstPtr& m
   std::lock_guard<std::mutex> lock(mutex_);
   pending_goal_ = GoalPoint{Eigen::Vector3d(msg->point.x, msg->point.y, msg->point.z), goal_yaw_};
   waypoints_.assign(1, WayPoint{pending_goal_->position, goal_yaw_});
+  remaining_waypoints_ = waypoints_;
   resetRun();
   planning_requested_ = true;
 }
@@ -247,6 +300,7 @@ void EgoPlannerDriverNode::onWaypoints(const geometry_msgs::PolygonStamped::Cons
     return;
   pending_goal_ = GoalPoint{wp.back().position, goal_yaw_};
   waypoints_ = wp;
+  remaining_waypoints_ = waypoints_;
   resetRun();
   planning_requested_ = true;
 }
@@ -511,11 +565,24 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
       arrival_since_ = now;
     if ((now - *arrival_since_).toSec() >= stable_s_)
     {
-      steady_target_ = HoldTarget{target, yaw};
-      current_.reset();
-      arrival_since_.reset();
-      plan_start_ = ros::Time(0);
-      setState(kStateHold);
+      if (planning_horizon_ <= 0.0 || remaining_waypoints_.empty())
+      {
+        // 全局规划模式（horizon<=0），或滚动模式已无后续航点：到达最终目标，
+        // 完成并转入 HOLD（冻结目标位姿）。
+        steady_target_ = HoldTarget{target, yaw};
+        current_.reset();
+        arrival_since_.reset();
+        plan_start_ = ros::Time(0);
+        setState(kStateHold);
+      }
+      else
+      {
+        // 还有后续航点：滚动规划下一段（receding-horizon）。
+        current_.reset();
+        arrival_since_.reset();
+        plan_start_ = ros::Time(0);
+        planning_requested_ = true;
+      }
     }
     return;
   }

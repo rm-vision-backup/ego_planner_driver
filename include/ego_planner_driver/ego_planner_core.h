@@ -20,12 +20,11 @@ struct EgoPlannerConfig
   double ts = 0.4;              // B-spline knot span (s)
   double max_vel = 8.0;         // m/s
   double max_acc = 6.0;         // m/s^2
-  // Maximum distance between adjacent densified points [m]. The sparse key
-  // points (e.g. a single MOVE_TO goal 50 m away) are interpolated uniformly
-  // before B-spline parameterization so the fixed knot span ts cannot
-  // compress the whole route into a few control points and blow through
-  // max_vel. <= 0 disables densification.
-  double waypoint_max_spacing = 2.0;
+  // Receding-horizon planning range [m]: only the waypoints ahead of the
+  // current pose within planning_horizon are parameterized per plan, aligned
+  // with upstream ego-planner-swarm. <= 0 plans the full route at once
+  // (global-planning regression mode).
+  double planning_horizon = 0.0;
   // Per-aircraft clearance radius. Reciprocal checks use twice this value;
   // 0.5 m therefore enforces 1.0 m horizontal centre distance and, with the
   // existing 2:1 ellipsoid, 2.0 m vertical centre distance.

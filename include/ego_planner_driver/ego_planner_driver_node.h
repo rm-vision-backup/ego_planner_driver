@@ -3,6 +3,7 @@
 
 #include <ros/ros.h>
 #include <geometry_msgs/PointStamped.h>
+#include <geometry_msgs/Point32.h>
 #include <geometry_msgs/PolygonStamped.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <std_msgs/Empty.h>
@@ -59,11 +60,14 @@ public:
   // 可编程时钟注入（单测用）；默认 ros::Time::now()。
   using ClockFn = std::function<ros::Time()>;
   void setClockSource(ClockFn fn);
+  // 测试注入：设置滚动局部规划范围（等价 launch 的 ~planning_horizon）。
+  void setPlanningHorizon(double horizon);
 
   // --- 测试/外部注入接口（线程安全） ---
   void injectLocalPose(const geometry_msgs::PoseStamped& pose);
   void injectMavrosState(bool armed, bool offboard);
   void sendGoal(double x, double y, double z);
+  void sendWaypoints(const std::vector<geometry_msgs::Point32>& points);
   void sendHold();
   bool replanOnce();
   void advanceHoldHandling();
@@ -82,6 +86,10 @@ private:
   void onHold(const std_msgs::Empty::ConstPtr& msg);
   void onMavrosState(const mavros_msgs::State::ConstPtr& msg);
   void onDirectControl(const std_msgs::Bool::ConstPtr& msg);
+  // Receding-horizon: keep only the waypoints ahead of start within horizon.
+  std::vector<WayPoint> truncateToHorizon(
+      const std::vector<WayPoint>& remaining, double horizon,
+      const Eigen::Vector3d& start) const;
 
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }
   void resetRun();
@@ -107,6 +115,7 @@ private:
   double pos_tol_ = 0.2;
   double stable_s_ = 1.0;
   double timeout_margin_ = 5.0;
+  double planning_horizon_ = 0.0;
   bool direct_control_active_ = false;
 
   bool armed_ = false;
@@ -140,6 +149,9 @@ private:
   double goal_yaw_ = 0.0;
   boost::optional<GoalPoint> pending_goal_;
   std::vector<WayPoint> waypoints_;
+  // Remaining waypoints not yet covered by the current planning segment
+  // (receding-horizon bookkeeping; shrinks as segments are consumed).
+  std::vector<WayPoint> remaining_waypoints_;
   boost::optional<geometry_msgs::PoseStamped> local_pose_;
   boost::optional<ros::Time> local_pose_stamp_;
   bool planning_requested_ = false;

@@ -35,27 +35,10 @@ Eigen::Vector3d sampleNeighbor(const NeighborTrajectory& traj, double t_rel)
   return traj.pts.back();
 }
 
-// Uniform densification so every adjacent pair is at most max_spacing apart.
-// Ported from verification/plot_ego_bspline_waypoints.py::densify_waypoints.
-std::vector<Eigen::Vector3d> densifyPoints(
-    const std::vector<Eigen::Vector3d>& points, double max_spacing)
-{
-  if (max_spacing <= 0.0 || points.size() < 2)
-    return points;
-  std::vector<Eigen::Vector3d> dense;
-  dense.reserve(points.size() * 3 + 4);
-  dense.push_back(points.front());
-  for (size_t i = 0; i + 1 < points.size(); ++i)
-  {
-    const Eigen::Vector3d delta = points[i + 1] - points[i];
-    const double distance = delta.norm();
-    const int segments = std::max(
-        1, static_cast<int>(std::ceil(distance / max_spacing)));
-    for (int s = 1; s <= segments; ++s)
-      dense.push_back(points[i] + delta * (static_cast<double>(s) / segments));
-  }
-  return dense;
-}
+// Uniform densification moved to the Python EgoSwarmDriver layer (plan B):
+// the driver builds command-specific layered keypoints and densifies them to
+// 2 m before publishing waypoints.  This core only parameterizes whatever
+// waypoints it receives (node truncates them to planning_horizon).
 } // namespace
 
 EgoPlannerCore::EgoPlannerCore(const EgoPlannerConfig& config)
@@ -278,11 +261,9 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   for (const auto& waypoint : sparse_waypoints)
     point_set.push_back(waypoint.position);
 
-  // Densify so every adjacent pair is at most waypoint_max_spacing apart.
-  // Without this a single far MOVE_TO goal leaves only two key points, the
-  // fixed knot span ts compresses the whole route into a handful of control
-  // points, and the B-spline trajectory far exceeds max_vel (see 7.b).
-  point_set = densifyPoints(point_set, config_.waypoint_max_spacing);
+  // Plan B: densification now happens on the Python driver layer; the node
+  // already truncated sparse_waypoints to planning_horizon when configured.
+  // Keep this core agnostic: parameterize exactly the waypoints it receives.
 
   // The parameterization yields (K+2) control points and the optimizer pins
   // the first and last order_ (=3) columns, so K must be at least 5 to keep
