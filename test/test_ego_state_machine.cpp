@@ -49,9 +49,9 @@ geometry_msgs::PoseStamped makePose(double x, double y, double z, double t)
 // 模拟理想位置控制器：把当前 setpoint 回灌为 local_pose
 void echoSetpoint(EgoPlannerDriverNode& node, FakeClock& clock)
 {
-  const geometry_msgs::PoseStamped sp = node.lastSetpoint();
-  node.injectLocalPose(makePose(sp.pose.position.x, sp.pose.position.y,
-                                sp.pose.position.z, clock.get()));
+  const mavros_msgs::PositionTarget sp = node.lastSetpoint();
+  node.injectLocalPose(makePose(sp.position.x, sp.position.y,
+                                sp.position.z, clock.get()));
 }
 
 // executor/Python 驱动负责起飞；C++ 节点只需处于可规划的 HOLD。
@@ -105,7 +105,7 @@ TEST(EgoStateMachine, TakeoffPublishesHoldSetpoint)
   clock.advance(1.0 / 30.0);
   node.publishSetpointTick();
   EXPECT_EQ(node.execState(), kStateTakeoff);
-  EXPECT_NEAR(node.lastSetpoint().pose.position.z, 2.0, 1e-6);
+  EXPECT_NEAR(node.lastSetpoint().position.z, 2.0, 1e-6);
 }
 
 TEST(EgoStateMachine, RepeatedArmEdgesRemainHold)
@@ -183,12 +183,12 @@ TEST(EgoStateMachine, CompletedFreezesInHold)
   EXPECT_NEAR(node.steadyTarget()->pos.x(), 0.0, 0.5);
 
   // COMPLETED 后 2 秒内：继续发布冻结位姿（setpoint 流不断）
-  const double frozen_x = node.lastSetpoint().pose.position.x;
+  const double frozen_x = node.lastSetpoint().position.x;
   for (int i = 0; i < 30; ++i)
   {
     clock.advance(step);
     node.publishSetpointTick();
-    EXPECT_NEAR(node.lastSetpoint().pose.position.x, frozen_x, 1e-3);
+    EXPECT_NEAR(node.lastSetpoint().position.x, frozen_x, 1e-3);
   }
   EXPECT_EQ(node.execState(), kStateCompleted);
 
@@ -223,7 +223,7 @@ TEST(EgoStateMachine, HoldRemainsFixed)
   {
     clock.advance(step);
     node.publishSetpointTick();
-    EXPECT_NEAR(node.lastSetpoint().pose.position.x, 0.0, 1e-3);
+    EXPECT_NEAR(node.lastSetpoint().position.x, 0.0, 1e-3);
   }
   EXPECT_EQ(node.execState(), kStateHold);
 
@@ -279,7 +279,7 @@ TEST(EgoStateMachine, RollingWindowAdvancesWithActualPosition)
   node.sendWaypoints(wps);
   ASSERT_TRUE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateExecuting);
-  const double seg1_x = node.lastSetpoint().pose.position.x;  // 第一段窗口起点
+  const double seg1_x = node.lastSetpoint().position.x;  // 第一段窗口起点
 
   // 连续滚动：每次把 UAV 推进到段末触发 checkArrival 置 planning_requested_，
   // 再 replan；修复后窗口首点必须随实际位置前进，轨迹持续推进。
@@ -298,13 +298,71 @@ TEST(EgoStateMachine, RollingWindowAdvancesWithActualPosition)
     if (node.execState() == kStateCompleted)
       break;
     ASSERT_TRUE(node.replanOnce());
-    const double cur = node.lastSetpoint().pose.position.x;
+    const double cur = node.lastSetpoint().position.x;
     if (cur > seg1_x + 3.0)
       progressed = true;
   }
   // 修复前窗口被提前消耗，第二次 replan 起终点≈当前位置，无法推进 3m 以上。
   EXPECT_TRUE(progressed);
 }
+// 回归：periodic replan 在当前段执行完后快照时，currentDerivatives 必须
+// clamp 到轨迹末端速度（旧实现返回全零 vel -> 新段从 0 起步 -> 速度 0~max 震荡）。
+TEST(EgoStateMachine, ReplanSnapshotsKeepSegmentVelocity)
+{
+  usleep(600 * 1000);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  node.setPlanningHorizon(5.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  // 短航线：单段 horizon 内只有 4 个点 -> 轨迹 duration 短（< replan_period 4s）
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 1; i <= 4; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = 0.4 * i; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  // 推进到轨迹执行完（elapsed 远超 duration）：old currentDerivatives 会返回
+  // vel=0；修复后 clamp 到末端速度，replanOnce 规划出的新段起点速度保持非零。
+  for (int step = 0; step < 60; ++step)
+  {
+    node.publishSetpointTick();
+    echoSetpoint(node, clock);
+    clock.advance(0.1);
+    if (node.planningRequested())
+      break;
+  }
+  // periodic replan 应触发（仍有后续航点 + 达到触发时间）。
+  EXPECT_TRUE(node.planningRequested());
+  // 新段规划成功，且起点速度接近段末速度（>0.3），不是从 0 重新加速。
+  ASSERT_TRUE(node.replanOnce());
+  const mavros_msgs::PositionTarget sp = node.lastSetpoint();
+  // 现在可以直接读规划器速度前馈：新段起点速度应为非零（rolling continuity）。
+  EXPECT_TRUE(std::isfinite(sp.velocity.x) && std::isfinite(sp.velocity.y));
+  // 验证 exec_state 仍 EXECUTING 且 setpoint 持续推进。
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  // 第二次推进一段，setpoint 应越过首段终点（4*0.4=1.6m）。
+  double max_x = sp.position.x;
+  for (int step = 0; step < 100; ++step)
+  {
+    node.publishSetpointTick();
+    echoSetpoint(node, clock);
+    max_x = std::max(max_x, node.lastSetpoint().position.x);
+    clock.advance(0.1);
+    if (node.execState() == kStateCompleted)
+      break;
+  }
+  EXPECT_GT(max_x, 1.6);
+}
+
 }  // namespace
 
 // 启动隔离 roscore，保证节点 advertise/subscribe/timer 可用
@@ -339,7 +397,7 @@ TEST(EgoStateMachine, HorizonTruncatesAndRollsWaypoints)
   for (int step = 0; step < 300; ++step)
   {
     node.publishSetpointTick();
-    seg1_x = node.lastSetpoint().pose.position.x;
+    seg1_x = node.lastSetpoint().position.x;
     if (node.execState() == kStateCompleted)
       break;
     clock.advance(0.1);
@@ -355,7 +413,7 @@ TEST(EgoStateMachine, HorizonTruncatesAndRollsWaypoints)
   {
     node.replanOnce();
     node.publishSetpointTick();
-    max_x = std::max(max_x, node.lastSetpoint().pose.position.x);
+    max_x = std::max(max_x, node.lastSetpoint().position.x);
     if (node.execState() == kStateCompleted)
       break;
     clock.advance(0.1);
@@ -399,6 +457,106 @@ TEST(EgoStateMachine, PeriodicReplanTriggersDuringSegmentExecution)
   }
   EXPECT_TRUE(node.planningRequested());
   EXPECT_EQ(node.execState(), kStateExecuting);
+}
+
+TEST(EgoStateMachine, TrajectorySetpointPublishesPvaMask)
+{
+  usleep(600 * 1000);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 1; i <= 8; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = i * 1.0; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  // 段中采样：EGO 执行帧 + P/V/A/yaw 掩码 + 所有启用字段有限 + 速度非零。
+  clock.advance(2.0);
+  node.publishSetpointTick();
+  const mavros_msgs::PositionTarget sp = node.lastSetpoint();
+  EXPECT_EQ(sp.coordinate_frame, mavros_msgs::PositionTarget::FRAME_LOCAL_NED);
+  EXPECT_EQ(sp.type_mask, ego_planner_driver::kMaskEgoTrajectory);
+  EXPECT_TRUE(std::isfinite(sp.position.x) && std::isfinite(sp.position.y) &&
+              std::isfinite(sp.position.z));
+  EXPECT_TRUE(std::isfinite(sp.velocity.x) && std::isfinite(sp.velocity.y) &&
+              std::isfinite(sp.velocity.z));
+  EXPECT_TRUE(std::isfinite(sp.acceleration_or_force.x) &&
+              std::isfinite(sp.acceleration_or_force.y) &&
+              std::isfinite(sp.acceleration_or_force.z));
+  EXPECT_TRUE(std::isfinite(sp.yaw));
+  const double speed = std::sqrt(sp.velocity.x * sp.velocity.x +
+                                 sp.velocity.y * sp.velocity.y +
+                                 sp.velocity.z * sp.velocity.z);
+  EXPECT_GT(speed, 0.05);
+
+  // 轨迹耗尽后切固定 position/yaw HOLD，不得携带末段非零导数。
+  clock.advance(50.0);
+  node.publishSetpointTick();
+  const mavros_msgs::PositionTarget hold = node.lastSetpoint();
+  EXPECT_EQ(hold.type_mask, ego_planner_driver::kMaskHold);
+  EXPECT_EQ(hold.velocity.x, 0.0);
+  EXPECT_EQ(hold.velocity.y, 0.0);
+  EXPECT_EQ(hold.velocity.z, 0.0);
+  EXPECT_EQ(hold.acceleration_or_force.x, 0.0);
+  EXPECT_EQ(hold.acceleration_or_force.y, 0.0);
+  EXPECT_EQ(hold.acceleration_or_force.z, 0.0);
+}
+
+TEST(EgoStateMachine, HoldAndTakeoffUseHoldMask)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.publishSetpointTick();
+  const mavros_msgs::PositionTarget hold = node.lastSetpoint();
+  EXPECT_EQ(hold.coordinate_frame, mavros_msgs::PositionTarget::FRAME_LOCAL_NED);
+  EXPECT_EQ(hold.type_mask, ego_planner_driver::kMaskHold);
+  EXPECT_EQ(hold.velocity.x, 0.0);
+  EXPECT_EQ(hold.velocity.y, 0.0);
+  EXPECT_EQ(hold.velocity.z, 0.0);
+  EXPECT_NEAR(hold.position.z, 5.0, 1e-6);
+
+  // arm+OFFBOARD 进入 TAKEOFF：仍为 position/yaw HOLD mask。
+  node.injectMavrosState(true, true);
+  EXPECT_EQ(node.execState(), kStateTakeoff);
+  clock.advance(1.0 / 30.0);
+  node.publishSetpointTick();
+  EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
+}
+
+TEST(EgoStateMachine, DirectControlSuppressesEgoCandidates)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  const size_t before = node.setpointCount();
+  node.setDirectControlActive(true);
+  node.publishSetpointTick();
+  EXPECT_EQ(node.setpointCount(), before);
+
+  node.setDirectControlActive(false);
+  node.publishSetpointTick();
+  node.publishSetpointTick();
+  EXPECT_GT(node.setpointCount(), before);
+  EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
 }
 
 int main(int argc, char** argv)

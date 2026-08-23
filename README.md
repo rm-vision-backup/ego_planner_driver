@@ -14,7 +14,7 @@
 | Topic | 类型 | 方向 |
 |---|---|---|
 | `exec_state` | `std_msgs/String`（latched） | 出：`HOLD`（初始）/`TAKEOFF`/`EXECUTING`/`COMPLETED`/`POSE_STALE`/`EGO_PLAN_FAILED`/`EGO_EXEC_TIMEOUT`（`IDLE` 常量保留但不再作为初始态） |
-| `setpoint` | `geometry_msgs/PoseStamped` | 出：30 Hz OFFBOARD 兼容位置 setpoint |
+| `setpoint/ego` | `mavros_msgs/PositionTarget` | 出：30 Hz 候选命令（`FRAME_LOCAL_NED`，业务字段 ROS ENU；`setpoint_relay` 独占转发 `/mavros/setpoint_raw/local`） |
 | `trajectory_intent` | `swarm_uav_interfaces/UavTrajectoryIntent` | 出：本机带时轨迹 |
 | `goal` | `geometry_msgs/PointStamped` | 入：单点目标 |
 | `goal_yaw` | `std_msgs/Float64` | 入：冻结的集群参考航向 |
@@ -22,7 +22,23 @@
 | `local_pose` | `geometry_msgs/PoseStamped` | 入：本机位姿 |
 | `neighbor_intent` | `swarm_uav_interfaces/UavTrajectoryIntent` | 入：邻机轨迹 |
 | `hold` | `std_msgs/Empty` | 入：HOLD |
-| `direct_control_active` | `std_msgs/Bool` | 入：垂直轨迹/PI 直接控制仲裁 |
+| `direct_control_active` | `std_msgs/Bool` | 入：follower PI 直接控制仲裁（true 时本节点不发布候选） |
+
+## PositionTarget 契约
+
+所有候选统一为 `mavros_msgs/PositionTarget`：
+
+| 模式 | `coordinate_frame` | 启用字段 | `type_mask` |
+|---|---|---|---:|
+| EGO 轨迹 | `FRAME_LOCAL_NED` | position、velocity、acceleration、yaw | `IGNORE_YAW_RATE` = **2048** |
+| HOLD/TAKEOFF/steady/COMPLETED | `FRAME_LOCAL_NED` | position、yaw | `IGNORE_VX..Z\|IGNORE_AFX..Z\|IGNORE_YAW_RATE` = **2552** |
+
+- P/V/A/yaw 来自同一轨迹同一采样时刻（`TimedTrajectory::samplePVA`），不跨帧差分；
+- 业务字段按 ROS ENU 填写，MAVROS setpoint_raw 插件完成 ENU→NED，禁止业务层重复换轴；
+- 轨迹耗尽后先切固定 position/yaw HOLD 再做 arrival 状态转换，末段非零导数不泄漏；
+- `direct_control_active=true` 时本节点停止发布候选，MAVROS 所有权由 relay 保证；
+- `replan_period_s` 默认 1.0 s（常规滚动重规划阈值，等价于降低轨迹陈旧风险；**不等价**原版
+  20 Hz 独立安全检查、碰撞预测或紧急停止，本实现不包含这些机制）。
 
 身份参数（`uav_id`/`exec_target`）位于公开命名空间 `<namespace>/`；规划调参位于私有 `<node_name>/`。
 

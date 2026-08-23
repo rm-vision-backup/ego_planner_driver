@@ -26,6 +26,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   core_.reset(new EgoPlannerCore(config));
   planning_horizon_ = config.planning_horizon;
   replan_period_s_ = pnh_.param("replan_period_s", 1.0);
+  setpoint_topic_ = pnh_.param("setpoint_out_topic", std::string("setpoint/ego"));
   frame_id_ = pnh_.param("frame_id", std::string("map"));
   // Identity parameters live in the public namespace (/UAV1/*) so the
   // Python driver and topology can discover them; planner tuning stays
@@ -43,7 +44,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   // Interface topics live under the public namespace (/UAV1/*) so the
   // Python EgoSwarmDriver and topology bridge can reach them without
   // knowing the private roslaunch node name. Parameters stay private.
-  setpoint_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("setpoint", 10);
+  setpoint_pub_ = nh_.advertise<mavros_msgs::PositionTarget>(setpoint_topic_, 10);
   intent_pub_ = nh_.advertise<swarm_uav_interfaces::UavTrajectoryIntent>("trajectory_intent", 10);
   state_pub_ = nh_.advertise<std_msgs::String>("exec_state", 10, true);
   goal_sub_ = nh_.subscribe("goal", 1, &EgoPlannerDriverNode::onGoal, this);
@@ -162,8 +163,10 @@ bool EgoPlannerDriverNode::replanOnce()
                                           local_pose_->pose.position.z);
     data.start.yaw = goal_yaw_;
     // 滚动段间速度/加速度连续：从当前轨迹取 vel/acc 作为新段起始导数
-    // （首次规划 current_ 为空 -> 全零）。
+    // （首次规划 current_ 为空 -> 全零）。数值微分可能产出病态大导数，
+    // 先 clamp 到规划界限的 1.5 倍，避免锚定控制点发散造成 setpoint 过冲。
     currentDerivatives(data.start_vel, data.start_acc);
+    clampStartDerivatives(data.start_vel, data.start_acc);
     data.waypoints = waypoints_;
     // 滚动局部规划：窗口从 UAV 实际位置前方尚未消费的 waypoints 截取
     // horizon 内的点（窗口随实际弧长滑动，不随上次规划段 erase 提前消耗）。
@@ -284,34 +287,50 @@ void EgoPlannerDriverNode::currentDerivatives(Eigen::Vector3d& vel,
   const std::vector<Eigen::Vector3d>& pts = current_->pts;
   // Prefer the exact B-spline derivative sampled at publish time; fall back
   // to a central difference when vel is unavailable (older trajectories).
+  // 段间衔接：periodic replan 可能在当前段执行完（elapsed>duration，UAV 在
+  // 段末悬停或滑行）后才快照。此时若返回全零 vel，新段从 0 起步重新加速，
+  // 速度 0~max 震荡。改为 clamp 到轨迹末端速度，保持速度连续。
+  const double t_end = t.empty() ? 0.0 : t.back();
+  const double t_clamp = std::min(elapsed, std::max(0.0, t_end - 1e-4));
   if (current_->vel.size() == pts.size())
   {
-    for (size_t i = 0; i + 1 < pts.size(); ++i)
+    if (t_clamp <= t.front())
     {
-      if (elapsed > t[i + 1])
-        continue;
-      const double dt = t[i + 1] - t[i];
-      const double a = dt > 1e-6 ? (elapsed - t[i]) / dt : 0.0;
-      vel = current_->vel[i] * (1.0 - a) + current_->vel[i + 1] * a;
-      break;
+      vel = current_->vel.front();
+    }
+    else
+    {
+      for (size_t i = 0; i + 1 < pts.size(); ++i)
+      {
+        if (t_clamp > t[i + 1])
+          continue;
+        const double dt = t[i + 1] - t[i];
+        const double a = dt > 1e-6 ? (t_clamp - t[i]) / dt : 0.0;
+        vel = current_->vel[i] * (1.0 - a) + current_->vel[i + 1] * a;
+        break;
+      }
+      if (t_clamp >= t.back())
+        vel = current_->vel.back();
     }
   }
   else
   {
     for (size_t i = 1; i + 1 < pts.size(); ++i)
     {
-      if (t[i + 1] < elapsed)
+      if (t[i + 1] < t_clamp)
         continue;
       const double dt_p = t[i + 1] - t[i - 1];
       if (dt_p > 1e-6)
         vel = (pts[i + 1] - pts[i - 1]) / dt_p;
       break;
     }
+    if (t_clamp >= t.back() && pts.size() >= 2)
+      vel = (pts.back() - pts[pts.size() - 2]) / std::max(t.back() - t[t.size() - 2], 1e-6);
   }
   // Acceleration via position differences around the current sample.
   for (size_t i = 1; i + 1 < pts.size(); ++i)
   {
-    if (t[i + 1] < elapsed)
+    if (t[i + 1] < t_clamp)
       continue;
     const double dt = t[i + 1] - t[i];
     const double dt_prev = t[i] - t[i - 1];
@@ -322,6 +341,19 @@ void EgoPlannerDriverNode::currentDerivatives(Eigen::Vector3d& vel,
       acc = (v1 - v0) / ((dt + dt_prev) * 0.5);
       break;
     }
+  }
+}
+
+void EgoPlannerDriverNode::clampStartDerivatives(Eigen::Vector3d& vel,
+                                                 Eigen::Vector3d& acc) const
+{
+  const EgoPlannerConfig cfg = core_->config();
+  const double v_lim = cfg.max_vel * 1.5;
+  const double a_lim = cfg.max_acc * 1.5;
+  for (int k = 0; k < 3; ++k)
+  {
+    vel[k] = std::max(-v_lim, std::min(v_lim, vel[k]));
+    acc[k] = std::max(-a_lim, std::min(a_lim, acc[k]));
   }
 }
 
@@ -349,10 +381,10 @@ boost::optional<HoldTarget> EgoPlannerDriverNode::steadyTarget() const
   return steady_target_;
 }
 
-geometry_msgs::PoseStamped EgoPlannerDriverNode::lastSetpoint() const
+mavros_msgs::PositionTarget EgoPlannerDriverNode::lastSetpoint() const
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  return last_setpoint_ ? *last_setpoint_ : geometry_msgs::PoseStamped();
+  return last_setpoint_ ? *last_setpoint_ : mavros_msgs::PositionTarget();
 }
 
 size_t EgoPlannerDriverNode::setpointCount() const
@@ -446,10 +478,10 @@ void EgoPlannerDriverNode::onMavrosState(const mavros_msgs::State::ConstPtr& msg
   handleMavrosStateEdgeLocked();
 }
 
-void EgoPlannerDriverNode::onDirectControl(const std_msgs::Bool::ConstPtr& msg)
+void EgoPlannerDriverNode::setDirectControlActive(bool active)
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  direct_control_active_ = msg->data;
+  direct_control_active_ = active;
   if (direct_control_active_)
   {
     planning_requested_ = false;
@@ -458,6 +490,11 @@ void EgoPlannerDriverNode::onDirectControl(const std_msgs::Bool::ConstPtr& msg)
     arrival_since_.reset();
     setState(kStateHold);
   }
+}
+
+void EgoPlannerDriverNode::onDirectControl(const std_msgs::Bool::ConstPtr& msg)
+{
+  setDirectControlActive(msg->data);
 }
 
 void EgoPlannerDriverNode::handleMavrosStateEdgeLocked()
@@ -533,18 +570,29 @@ bool EgoPlannerDriverNode::captureHoldTargetLocked(const ros::Time& now)
   return true;
 }
 
-void EgoPlannerDriverNode::publishPose(double x, double y, double z, double yaw)
+void EgoPlannerDriverNode::publishPositionTarget(double x, double y, double z,
+                                                 double yaw, uint16_t type_mask,
+                                                 const Eigen::Vector3d& vel,
+                                                 const Eigen::Vector3d& acc)
 {
-  geometry_msgs::PoseStamped m;
+  mavros_msgs::PositionTarget m;
   m.header.stamp = nowFunc();
   m.header.frame_id = frame_id_;
-  m.pose.position.x = x;
-  m.pose.position.y = y;
-  m.pose.position.z = z;
-  m.pose.orientation.x = 0.0;
-  m.pose.orientation.y = 0.0;
-  m.pose.orientation.z = std::sin(yaw * 0.5);
-  m.pose.orientation.w = std::cos(yaw * 0.5);
+  // MAVROS setpoint_raw converts the business ENU fields to NED before sending
+  // the SET_POSITION_TARGET_LOCAL_NED to PX4; never re-transform here.
+  m.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+  m.type_mask = type_mask;
+  m.position.x = x;
+  m.position.y = y;
+  m.position.z = z;
+  m.velocity.x = vel.x();
+  m.velocity.y = vel.y();
+  m.velocity.z = vel.z();
+  m.acceleration_or_force.x = acc.x();
+  m.acceleration_or_force.y = acc.y();
+  m.acceleration_or_force.z = acc.z();
+  m.yaw = yaw;
+  m.yaw_rate = 0.0;
   setpoint_pub_.publish(m);
   ++setpoint_count_;
   last_setpoint_ = m;
@@ -586,7 +634,7 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
     const double yaw = local_pose_ ? yawFromQuat(local_pose_->pose.orientation) : 0.0;
     const double x = local_pose_ ? local_pose_->pose.position.x : 0.0;
     const double y = local_pose_ ? local_pose_->pose.position.y : 0.0;
-    publishPose(x, y, current_z, yaw);
+    publishPositionTarget(x, y, current_z, yaw, kMaskHold);
     if (current_z >= target_z - 0.1)
     {
       ROS_INFO("[%s] TAKEOFF complete at z=%.2f, switching to HOLD",
@@ -600,8 +648,8 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
 
   if (steady_target_)
   {
-    publishPose(steady_target_->pos.x(), steady_target_->pos.y(),
-                steady_target_->pos.z(), steady_target_->yaw);
+    publishPositionTarget(steady_target_->pos.x(), steady_target_->pos.y(),
+                          steady_target_->pos.z(), steady_target_->yaw, kMaskHold);
     return;
   }
   if (!current_ || current_->pts.empty())
@@ -616,31 +664,45 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
     return;
   }
   const double elapsed = (now - plan_start_).toSec();
-  Eigen::Vector3d sample = current_->pts.back();
-  double yaw = current_->yaw.back();
   if (elapsed < current_->duration)
   {
-    for (size_t i = 0; i + 1 < current_->pts.size(); ++i)
+    // Trajectory segment: publish position + velocity + acceleration + yaw from
+    // the same sample tick so PX4 receives the planning derivatives directly
+    // (no position-only reset at rolling replan boundaries).
+    TrajectorySample sample;
+    if (current_->samplePVA(elapsed, sample))
     {
-      if (elapsed < current_->t[i + 1])
-      {
-        const double a = (elapsed - current_->t[i]) / (current_->t[i + 1] - current_->t[i]);
-        sample = current_->pts[i] * (1.0 - a) + current_->pts[i + 1] * a;
-        yaw = current_->yaw[i] * (1.0 - a) + current_->yaw[i + 1] * a;
-        break;
-      }
+      publishPositionTarget(sample.pos.x(), sample.pos.y(), sample.pos.z(),
+                            sample.yaw, kMaskEgoTrajectory, sample.vel, sample.acc);
+    }
+    else
+    {
+      // Defensive: sampling failed -> freeze the trajectory end as a HOLD.
+      publishPositionTarget(current_->pts.back().x(), current_->pts.back().y(),
+                            current_->pts.back().z(), current_->yaw.back(), kMaskHold);
     }
   }
-  publishPose(sample.x(), sample.y(), sample.z(), yaw);
+  else
+  {
+    // Trajectory exhausted: switch to a fixed position/yaw HOLD with zero
+    // velocity/acceleration before the arrival state transition, so the last
+    // segment's nonzero derivatives never leak into the hold.
+    publishPositionTarget(current_->pts.back().x(), current_->pts.back().y(),
+                          current_->pts.back().z(), current_->yaw.back(), kMaskHold);
+  }
   // Periodic replan (time-triggered): once the current segment has executed
-  // for replan_period_s and there are still waypoints ahead, request a replan
-  // so replanLoop re-plans from the latest pose with fresh neighbor intents
-  // (upstream fsm/thresh_replan_time semantics).  Arrival still triggers the
-  // next segment; the final segment publishes COMPLETED via checkArrival.
-  if (planning_horizon_ > 0.0 && elapsed >= replan_period_s_ &&
-      waypoint_consumed_ + 1 < waypoints_.size() && !planning_requested_ &&
-      !hold_requested_)
-    planning_requested_ = true;
+  // for replan_period_s (bounded by 85% of the trajectory duration so the
+  // replanLoop snapshot still samples valid velocity for segment continuity)
+  // and there are still waypoints ahead, request a replan.  Arrival still
+  // triggers the next segment; the final segment publishes COMPLETED.
+  if (planning_horizon_ > 0.0 && !planning_requested_ && !hold_requested_ &&
+      waypoint_consumed_ + 1 < waypoints_.size())
+  {
+    const double replan_trigger = std::min(replan_period_s_,
+                                           current_ ? current_->duration * 0.85 : replan_period_s_);
+    if (elapsed >= replan_trigger)
+      planning_requested_ = true;
+  }
   if (elapsed >= current_->duration)
     checkArrival(current_->pts.back(), current_->yaw.back(), now);
 }
@@ -788,6 +850,7 @@ void EgoPlannerDriverNode::replanLoop()
                                             local_pose_->pose.position.z);
       data.start.yaw = goal_yaw_;
       currentDerivatives(data.start_vel, data.start_acc);
+      clampStartDerivatives(data.start_vel, data.start_acc);
       data.waypoints = waypoints_;
       // 滚动局部规划：窗口从 UAV 实际位置前方尚未消费的 waypoints 截取
       // horizon 内的点。一次规划完整航线（120+ 点）会让 B-spline 参数化把

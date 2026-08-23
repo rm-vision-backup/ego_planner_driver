@@ -11,6 +11,7 @@
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
 #include <swarm_uav_interfaces/UavTrajectoryIntent.h>
+#include <mavros_msgs/PositionTarget.h>
 #include <mavros_msgs/State.h>
 #include <boost/optional.hpp>
 #include <functional>
@@ -45,6 +46,20 @@ constexpr double kSetpointRateHz = 30.0;
 constexpr double kNeighborStaleS = 5.0;
 constexpr double kReplanPeriodS = 0.5;
 
+// PositionTarget type masks (mavros_msgs constants):
+//   EGO trajectory: position + velocity + acceleration + yaw, yaw rate ignored.
+//   HOLD/TAKEOFF/steady: position + yaw only, velocity/acceleration ignored.
+constexpr uint16_t kMaskEgoTrajectory =
+    mavros_msgs::PositionTarget::IGNORE_YAW_RATE;  // 2048
+constexpr uint16_t kMaskHold =
+    mavros_msgs::PositionTarget::IGNORE_VX |
+    mavros_msgs::PositionTarget::IGNORE_VY |
+    mavros_msgs::PositionTarget::IGNORE_VZ |
+    mavros_msgs::PositionTarget::IGNORE_AFX |
+    mavros_msgs::PositionTarget::IGNORE_AFY |
+    mavros_msgs::PositionTarget::IGNORE_AFZ |
+    mavros_msgs::PositionTarget::IGNORE_YAW_RATE;  // 2552
+
 struct HoldTarget
 {
   Eigen::Vector3d pos;
@@ -62,6 +77,8 @@ public:
   void setClockSource(ClockFn fn);
   // 测试注入：设置滚动局部规划范围（等价 launch 的 ~planning_horizon）。
   void setPlanningHorizon(double horizon);
+  // 测试注入：直接控制（follower PI）激活门控（等价 ~direct_control_active 消息）。
+  void setDirectControlActive(bool active);
 
   // --- 测试/外部注入接口（线程安全） ---
   void injectLocalPose(const geometry_msgs::PoseStamped& pose);
@@ -74,7 +91,7 @@ public:
   void publishSetpointTick();
   std::string execState() const;
   boost::optional<HoldTarget> steadyTarget() const;
-  geometry_msgs::PoseStamped lastSetpoint() const;
+  mavros_msgs::PositionTarget lastSetpoint() const;
   size_t setpointCount() const;
   // 测试断言：时间触发重规划是否已请求。
   bool planningRequested() const;
@@ -104,12 +121,22 @@ private:
   // Current trajectory velocity/acceleration at plan time (rolling continuity,
   // numeric differentiation over the sampled current_ trajectory).
   void currentDerivatives(Eigen::Vector3d& vel, Eigen::Vector3d& acc) const;
+  // Caps the rolling segment's start derivatives to 1.5x planner bounds so a
+  // pathological sampled derivative cannot spread the pinned control points and
+  // amplify into a large setpoint overshoot.
+  void clampStartDerivatives(Eigen::Vector3d& vel, Eigen::Vector3d& acc) const;
 
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }
   void resetRun();
   void setState(const std::string& state);
   bool captureHoldTargetLocked(const ros::Time& now);
-  void publishPose(double x, double y, double z, double yaw);
+  // Unified command construction/publish: business fields stay ROS ENU, MAVROS
+  // converts them to NED for the PX4 raw local setpoint.  velocity/acceleration
+  // are only meaningful for kMaskEgoTrajectory (ignored by HOLD masks).
+  void publishPositionTarget(double x, double y, double z, double yaw,
+                             uint16_t type_mask,
+                             const Eigen::Vector3d& vel = Eigen::Vector3d::Zero(),
+                             const Eigen::Vector3d& acc = Eigen::Vector3d::Zero());
   static double yawFromQuat(const geometry_msgs::Quaternion& q);
   void publishSetpoint(const ros::TimerEvent& event);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
@@ -145,6 +172,7 @@ private:
 
   ros::NodeHandle nh_;
   ros::NodeHandle pnh_;
+  std::string setpoint_topic_;
   ros::Publisher setpoint_pub_;
   ros::Publisher intent_pub_;
   ros::Publisher state_pub_;
@@ -183,7 +211,7 @@ private:
   boost::optional<ros::Time> arrival_since_;
 
   size_t setpoint_count_ = 0;
-  boost::optional<geometry_msgs::PoseStamped> last_setpoint_;
+  boost::optional<mavros_msgs::PositionTarget> last_setpoint_;
 
   ClockFn clock_source_;
   std::map<std::string, int32_t> latest_traj_id_;

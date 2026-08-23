@@ -67,12 +67,23 @@ struct NeighborTrajectory
   std::vector<Eigen::Vector3d> pts;
 };
 
+// One-tick trajectory sample: position/velocity/acceleration/yaw read from the
+// same trajectory at the same relative time (PX4 raw local setpoint contract).
+struct TrajectorySample
+{
+  Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+  Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+  Eigen::Vector3d acc = Eigen::Vector3d::Zero();
+  double yaw = 0.0;
+};
+
 struct TimedTrajectory
 {
   double duration = 0.0;
   std::vector<double> t;                 // relative seconds, dense samples
   std::vector<Eigen::Vector3d> pts;      // global ENU, same length as t
   std::vector<Eigen::Vector3d> vel;      // B-spline first derivative, same length
+  std::vector<Eigen::Vector3d> acc;      // B-spline second derivative, same length
   std::vector<double> yaw;               // same length as t
 
   bool sample(double t_rel, Eigen::Vector3d& out) const
@@ -99,6 +110,45 @@ struct TimedTrajectory
       }
     }
     return false;
+  }
+
+  // Samples position/velocity/acceleration/yaw from the same trajectory at the
+  // same relative time so the published PositionTarget carries internally
+  // consistent derivatives (no cross-frame numeric differentiation).
+  bool samplePVA(double t_rel, TrajectorySample& out) const
+  {
+    if (pts.empty() || vel.empty() || acc.empty() || yaw.empty())
+      return false;
+    if (t.size() == 1)
+    {
+      out.pos = pts.front();
+      out.vel = vel.front();
+      out.acc = acc.front();
+      out.yaw = yaw.front();
+      return true;
+    }
+    size_t lo = 0;
+    if (t_rel >= t.back())
+      lo = t.size() - 2;
+    else if (t_rel > t.front())
+    {
+      for (size_t i = 0; i + 1 < t.size(); ++i)
+      {
+        if (t_rel < t[i + 1])
+        {
+          lo = i;
+          break;
+        }
+      }
+    }
+    const size_t hi = lo + 1;
+    const double span = t[hi] - t[lo];
+    const double a = (span > 1e-12) ? (t_rel - t[lo]) / span : 0.0;
+    out.pos = pts[lo] * (1.0 - a) + pts[hi] * a;
+    out.vel = vel[lo] * (1.0 - a) + vel[hi] * a;
+    out.acc = acc[lo] * (1.0 - a) + acc[hi] * a;
+    out.yaw = yaw[lo] * (1.0 - a) + yaw[hi] * a;
+    return true;
   }
 };
 

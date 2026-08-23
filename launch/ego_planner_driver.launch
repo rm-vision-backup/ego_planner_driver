@@ -17,7 +17,9 @@
     <!-- 滚动局部规划范围：waypoints 每次只取当前位置前方 horizon 内的点，
          对齐原版 ego-planner-swarm receding-horizon；0 表示全局规划（退化）。 -->
     <param name="planning_horizon" value="5.0"/>
-    <param name="replan_period_s" value="4.0"/>
+    <param name="replan_period_s" value="1.0"/>
+    <!-- 候选 setpoint 话题（PositionTarget，relay 唯一出口，业务层不改 MAVROS 话题） -->
+    <param name="setpoint_out_topic" value="/setpoint/ego"/>
     <!-- Per-aircraft clearance radius; reciprocal hard center spacing is 2x. -->
     <param name="swarm_clearance" value="0.5"/>
     <param name="planning_range" value="30.0"/>
@@ -27,7 +29,7 @@
          neighbor's clearance are pushed out along the waypoint-normal
          direction (waypoints act as the safe-path reference). -->
     <param name="swarm_rebound" value="true"/>
-    <param name="lambda_feasibility" value="1.0"/>
+    <param name="lambda_feasibility" value="0.5"/>
     <param name="setpoint_rate_hz" value="30.0"/>
     <param name="local_pose_timeout_s" value="1.0"/>
     <param name="position_tolerance_m" value="0.6"/>

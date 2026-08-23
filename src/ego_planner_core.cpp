@@ -114,45 +114,100 @@ void EgoPlannerCore::calcFeasibilityCost(const Eigen::MatrixXd& q,
   cost = 0.0;
   const double ts = bspline_interval_;
   const double ts_inv2 = 1.0 / (ts * ts);
+  const double ts_inv3 = 1.0 / (ts * ts * ts);
+  // 对齐原版 ego-planner-swarm calcFeasibilityCost：三次方惩罚 + demarcation
+  // 平滑区。原版二次方惩罚在 max_vel 边界导数不连续，L-BFGS 在边界附近振荡
+  // 导致速度抖动（实测 0-1.2 m/s 波动）；三次方惩罚在 max_vel 处一阶导为 0、
+  // 二阶衔接，优化器平滑收敛，速度贴住 max_vel 不超。
+  const double demarcation = 1.0;  // m/s, m/s^2
+  const double ar = 3.0 * demarcation;
+  const double br = -3.0 * demarcation * demarcation;
+  const double cr = demarcation * demarcation * demarcation;
+  const double al = ar, bl = -br, cl = cr;
 
+  /* velocity feasibility */
   for (int i = 0; i < q.cols() - 1; ++i)
   {
     const Eigen::Vector3d vi = (q.col(i + 1) - q.col(i)) / ts;
     for (int j = 0; j < 3; ++j)
     {
-      if (vi(j) > config_.max_vel)
+      if (vi(j) > config_.max_vel + demarcation)
       {
-        cost += std::pow(vi(j) - config_.max_vel, 2) * ts_inv2;
-        gradient(j, i + 0) += -2 * (vi(j) - config_.max_vel) / ts * ts_inv2;
-        gradient(j, i + 1) += 2 * (vi(j) - config_.max_vel) / ts * ts_inv2;
+        const double diff = vi(j) - config_.max_vel;
+        cost += (ar * diff * diff + br * diff + cr) * ts_inv3;
+        const double grad = (2.0 * ar * diff + br) / ts * ts_inv3;
+        gradient(j, i + 0) += -grad;
+        gradient(j, i + 1) += grad;
+      }
+      else if (vi(j) > config_.max_vel)
+      {
+        const double diff = vi(j) - config_.max_vel;
+        cost += std::pow(diff, 3) * ts_inv3;
+        const double grad = 3.0 * diff * diff / ts * ts_inv3;
+        gradient(j, i + 0) += -grad;
+        gradient(j, i + 1) += grad;
+      }
+      else if (vi(j) < -(config_.max_vel + demarcation))
+      {
+        const double diff = vi(j) + config_.max_vel;
+        cost += (al * diff * diff + bl * diff + cl) * ts_inv3;
+        const double grad = (2.0 * al * diff + bl) / ts * ts_inv3;
+        gradient(j, i + 0) += -grad;
+        gradient(j, i + 1) += grad;
       }
       else if (vi(j) < -config_.max_vel)
       {
-        cost += std::pow(vi(j) + config_.max_vel, 2) * ts_inv2;
-        gradient(j, i + 0) += -2 * (vi(j) + config_.max_vel) / ts * ts_inv2;
-        gradient(j, i + 1) += 2 * (vi(j) + config_.max_vel) / ts * ts_inv2;
+        const double diff = vi(j) + config_.max_vel;
+        cost += -std::pow(diff, 3) * ts_inv3;
+        const double grad = -3.0 * diff * diff / ts * ts_inv3;
+        gradient(j, i + 0) += -grad;
+        gradient(j, i + 1) += grad;
       }
     }
   }
 
+  /* acceleration feasibility */
   for (int i = 0; i < q.cols() - 2; ++i)
   {
-    const Eigen::Vector3d ai = (q.col(i + 2) - 2 * q.col(i + 1) + q.col(i)) * ts_inv2;
+    const Eigen::Vector3d ai =
+        (q.col(i + 2) - 2 * q.col(i + 1) + q.col(i)) * ts_inv2;
     for (int j = 0; j < 3; ++j)
     {
-      if (ai(j) > config_.max_acc)
+      if (ai(j) > config_.max_acc + demarcation)
       {
-        cost += std::pow(ai(j) - config_.max_acc, 2);
-        gradient(j, i + 0) += 2 * (ai(j) - config_.max_acc) * ts_inv2;
-        gradient(j, i + 1) += -4 * (ai(j) - config_.max_acc) * ts_inv2;
-        gradient(j, i + 2) += 2 * (ai(j) - config_.max_acc) * ts_inv2;
+        const double diff = ai(j) - config_.max_acc;
+        cost += ar * diff * diff + br * diff + cr;
+        const double grad = (2.0 * ar * diff + br) * ts_inv2;
+        gradient(j, i + 0) += grad;
+        gradient(j, i + 1) += -2 * grad;
+        gradient(j, i + 2) += grad;
+      }
+      else if (ai(j) > config_.max_acc)
+      {
+        const double diff = ai(j) - config_.max_acc;
+        cost += std::pow(diff, 3);
+        const double grad = 3.0 * diff * diff * ts_inv2;
+        gradient(j, i + 0) += grad;
+        gradient(j, i + 1) += -2 * grad;
+        gradient(j, i + 2) += grad;
+      }
+      else if (ai(j) < -(config_.max_acc + demarcation))
+      {
+        const double diff = ai(j) + config_.max_acc;
+        cost += al * diff * diff + bl * diff + cl;
+        const double grad = (2.0 * al * diff + bl) * ts_inv2;
+        gradient(j, i + 0) += grad;
+        gradient(j, i + 1) += -2 * grad;
+        gradient(j, i + 2) += grad;
       }
       else if (ai(j) < -config_.max_acc)
       {
-        cost += std::pow(ai(j) + config_.max_acc, 2);
-        gradient(j, i + 0) += 2 * (ai(j) + config_.max_acc) * ts_inv2;
-        gradient(j, i + 1) += -4 * (ai(j) + config_.max_acc) * ts_inv2;
-        gradient(j, i + 2) += 2 * (ai(j) + config_.max_acc) * ts_inv2;
+        const double diff = ai(j) + config_.max_acc;
+        cost += -std::pow(diff, 3);
+        const double grad = -3.0 * diff * diff * ts_inv2;
+        gradient(j, i + 0) += grad;
+        gradient(j, i + 1) += -2 * grad;
+        gradient(j, i + 2) += grad;
       }
     }
   }
@@ -472,14 +527,19 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   const double duration = std::max(0.0, tmp - tm);
   out.duration = duration;
   ego_planner::UniformBspline dtraj = traj.getDerivative();
+  ego_planner::UniformBspline ddtraj = dtraj.getDerivative();
   double du0 = 0.0, dup = 0.0;
-  // The derivative B-spline drops the first/last knot, so its time span is
-  // shorter than the position trajectory; clamp derivative samples to it.
+  // The derivative B-splines drop one knot per order, so their time spans are
+  // shorter than the position trajectory; clamp derivative samples to them.
   const double t_der_max =
       (dtraj.getTimeSpan(du0, dup)) ? std::max(0.0, dup - du0 - 1e-3) : duration;
+  double duu0 = 0.0, duup = 0.0;
+  const double t_acc_max =
+      (ddtraj.getTimeSpan(duu0, duup)) ? std::max(0.0, duup - duu0 - 1e-3) : t_der_max;
   out.t.clear();
   out.pts.clear();
   out.vel.clear();
+  out.acc.clear();
   out.yaw.clear();
 
   const double step = std::max(kSampleStepS, bspline_interval_ * 0.25);
@@ -487,6 +547,7 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   out.t.reserve(samples);
   out.pts.reserve(samples);
   out.vel.reserve(samples);
+  out.acc.reserve(samples);
   out.yaw.reserve(samples);
 
   for (int i = 0; i < samples; ++i)
@@ -495,6 +556,7 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     out.t.push_back(t_rel);
     out.pts.push_back(traj.evaluateDeBoorT(t_rel));
     out.vel.push_back(Eigen::Vector3d(dtraj.evaluateDeBoorT(std::min(t_rel, t_der_max))));
+    out.acc.push_back(Eigen::Vector3d(ddtraj.evaluateDeBoorT(std::min(t_rel, t_acc_max))));
     out.yaw.push_back(start.yaw);
   }
   if (out.t.empty())
@@ -502,6 +564,7 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     out.t.push_back(0.0);
     out.pts.push_back(start.position);
     out.vel.push_back(Eigen::Vector3d::Zero());
+    out.acc.push_back(Eigen::Vector3d::Zero());
     out.yaw.push_back(start.yaw);
   }
   // Anchor the sampled endpoints to the exact start position and the final

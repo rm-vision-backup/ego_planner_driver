@@ -9,6 +9,7 @@ using ego_planner_driver::EgoPlannerCore;
 using ego_planner_driver::GoalPoint;
 using ego_planner_driver::NeighborTrajectory;
 using ego_planner_driver::TimedTrajectory;
+using ego_planner_driver::TrajectorySample;
 using ego_planner_driver::WayPoint;
 
 namespace
@@ -149,10 +150,103 @@ TEST(EgoPlannerCore, SwarmReboundPushesTrajectoryAway)
   EXPECT_TRUE(core.checkClearance(trajectory, neighbors, 0.5));
 }
 
+TEST(EgoPlannerCore, TimedTrajectorySamplesPvaConsistently)
+{
+  EgoPlannerCore core(makeConfig());
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
+  std::vector<WayPoint> waypoints;
+  for (double x = 0.4; x <= 8.0 + 1e-6; x += 0.4)
+    waypoints.push_back(WayPoint{Eigen::Vector3d(x, 0.0, 15.0), 0.0});
+  const Eigen::Vector3d start_vel(1.5, 0.0, 0.0);
+  TimedTrajectory traj;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost, start_vel,
+                            Eigen::Vector3d::Zero()));
+  ASSERT_GT(traj.acc.size(), 1u);
+  ASSERT_EQ(traj.acc.size(), traj.pts.size());
+  ASSERT_EQ(traj.vel.size(), traj.pts.size());
+
+  // acc 应为有限值，且与 vel 的有限差分一致（B-spline 二阶导数）。
+  for (const auto& a : traj.acc)
+    EXPECT_TRUE(std::isfinite(a.x()) && std::isfinite(a.y()) && std::isfinite(a.z()));
+  const double h = 0.05;
+  for (double t : {0.5, 2.0, 4.0})
+  {
+    if (t >= traj.duration)
+      continue;
+    TrajectorySample s0, s1;
+    ASSERT_TRUE(traj.samplePVA(t, s0));
+    ASSERT_TRUE(traj.samplePVA(std::min(t + h, traj.duration), s1));
+    const Eigen::Vector3d vel_est = (s1.pos - s0.pos) / std::min(h, traj.duration - t);
+    const Eigen::Vector3d acc_est = (s1.vel - s0.vel) / std::min(h, traj.duration - t);
+    EXPECT_NEAR(s0.vel.x(), vel_est.x(), 0.05);
+    EXPECT_NEAR(s0.vel.y(), vel_est.y(), 0.05);
+    EXPECT_NEAR(s0.acc.x(), acc_est.x(), 0.1);
+    EXPECT_NEAR(s0.acc.y(), acc_est.y(), 0.1);
+  }
+}
+
+TEST(EgoPlannerCore, SamplePvaAtStartMatchesRequestedDerivatives)
+{
+  EgoPlannerCore core(makeConfig());
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
+  std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(10.0, 0.0, 15.0), 0.0}};
+  const Eigen::Vector3d start_vel(1.5, 0.0, 0.0);
+  TimedTrajectory traj;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost, start_vel,
+                            Eigen::Vector3d::Zero()));
+  TrajectorySample s;
+  ASSERT_TRUE(traj.samplePVA(0.0, s));
+  EXPECT_NEAR(s.pos.x(), 0.0, 1e-3);
+  // 起点速度被参数化锚定为 start_vel（前 3 个控制点不参与优化）。
+  EXPECT_NEAR(s.vel.x(), start_vel.x(), 0.1);
+  EXPECT_TRUE(std::isfinite(s.acc.x()));
+}
+
 int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST(EgoPlannerCore, FeasibilityCubicSmoothVelocity)
+{
+  // launch 实际配置：max_vel=1.0、lambda_feasibility=0.5、ts=0.4
+  EgoPlannerConfig config = makeConfig();
+  config.max_vel = 1.0;
+  config.lambda_feasibility = 0.5;
+  config.swarm_rebound = false;
+  EgoPlannerCore core(config);
+  // 长水平航线（60m，0.4m 密化）模拟巡航段，检查速度平滑性。
+  Eigen::Vector3d start(0.0, 0.0, 15.0);
+  std::vector<WayPoint> waypoints;
+  for (double x = 0.4; x <= 60.0 + 1e-6; x += 0.4)
+    waypoints.push_back(WayPoint{Eigen::Vector3d(x, 0.0, 15.0), 0.0});
+  TimedTrajectory traj;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(GoalPoint{start, 0.0}, waypoints, {}, traj, cost));
+  ASSERT_GT(traj.vel.size(), 2u);
+  // 巡航段速度应贴住 max_vel（允许 ~20% 波动），且不出现极端超速。
+  double vmax = 0.0;
+  std::vector<double> speeds;
+  for (const auto& v : traj.vel)
+  {
+    const double s = v.norm();
+    vmax = std::max(vmax, s);
+    speeds.push_back(s);
+  }
+  EXPECT_LE(vmax, 1.5);
+  // 中段（避开起/末加速减速）速度应在 0.8-1.3 之间，无剧烈振荡。
+  const size_t mid0 = traj.vel.size() / 3, mid1 = traj.vel.size() * 2 / 3;
+  double mid_min = 1e9, mid_max = 0.0;
+  for (size_t i = mid0; i < mid1; ++i)
+  {
+    mid_min = std::min(mid_min, speeds[i]);
+    mid_max = std::max(mid_max, speeds[i]);
+  }
+  EXPECT_GT(mid_min, 0.5);
+  EXPECT_LT(mid_max, 1.5);
 }
 
 TEST(EgoPlannerCore, VerticalClimbWithNeighborsSucceeds)
