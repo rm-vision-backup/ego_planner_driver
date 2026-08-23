@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 namespace ego_planner_driver
 {
@@ -245,9 +246,6 @@ size_t EgoPlannerDriverNode::advanceConsumed(
     const std::vector<WayPoint>& waypoints, const Eigen::Vector3d& start,
     size_t consumed) const
 {
-  // 把 UAV 已经过（位于 start 前方弧长投影之前）的 waypoints 从窗口起点剔除。
-  // start 通常恰在 waypoints 上（上层首点=start 且航点密化），用「到 start 的
-  // 距离不超过已消费点间距量级」判断；垂直段 start 与前方点严格共线。
   if (consumed >= waypoints.size())
     return consumed;
   while (consumed + 1 < waypoints.size())
@@ -261,9 +259,7 @@ size_t EgoPlannerDriverNode::advanceConsumed(
       ++consumed;
       continue;
     }
-    // start 到线段起点的向量在 seg 方向上的投影。
     const double t = (start - a).dot(seg) / seg_len;
-    // t < 0：start 在线段起点后方，未越过 a；t >= seg_len：越过 b。
     if (t < 0.0)
       break;
     if (t >= seg_len)
@@ -273,7 +269,6 @@ size_t EgoPlannerDriverNode::advanceConsumed(
     }
     break;
   }
-  // 处理 start 已越过最后一个 waypoint 的情况（收敛判据由 checkArrival 兜底）。
   return consumed;
 }
 
@@ -794,6 +789,25 @@ void EgoPlannerDriverNode::replanLoop()
       data.start.yaw = goal_yaw_;
       currentDerivatives(data.start_vel, data.start_acc);
       data.waypoints = waypoints_;
+      // 滚动局部规划：窗口从 UAV 实际位置前方尚未消费的 waypoints 截取
+      // horizon 内的点。一次规划完整航线（120+ 点）会让 B-spline 参数化把
+      // 长水平段压缩在起点附近（实测 max horizontal travel ~0.1m），必须
+      // 滚动窗口逐段推进。
+      if (planning_horizon_ > 0.0)
+      {
+        waypoint_consumed_ = advanceConsumed(
+            waypoints_, data.start.position, waypoint_consumed_);
+        data.waypoints = truncateToHorizon(
+            waypoints_, planning_horizon_, data.start.position, waypoint_consumed_);
+        if (data.waypoints.size() < 2)
+        {
+          // 窗口内不足两点（已接近最终目标）：退化一次规划完整剩余航点。
+          data.waypoints = std::vector<WayPoint>(
+              waypoints_.begin() + static_cast<std::ptrdiff_t>(
+                  std::min(waypoint_consumed_, waypoints_.size())),
+              waypoints_.end());
+        }
+      }
       for (const auto& item : inbox_)
       {
         if ((now - item.second.second).toSec() > kNeighborStaleS)

@@ -154,3 +154,40 @@ int main(int argc, char** argv)
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+TEST(EgoPlannerCore, VerticalClimbWithNeighborsSucceeds)
+{
+  EgoPlannerConfig config = makeConfig();
+  config.swarm_rebound = true;
+  EgoPlannerCore core(config);
+  // 起飞 HOLD z=5，waypoints 垂直密化爬升到 15m 层（0.4m 间距）。
+  GoalPoint start{Eigen::Vector3d(-2.35, 5.08, 5.0), 0.0};
+  std::vector<WayPoint> waypoints;
+  for (double z = 5.4; z <= 10.0 + 1e-6; z += 0.4)
+    waypoints.push_back(WayPoint{Eigen::Vector3d(-2.35, 5.08, z), 0.0});
+  // 14 邻居：都在起飞层 z=5 附近，各向分布（模拟编队起飞后同层悬停）。
+  std::vector<NeighborTrajectory> neighbors;
+  double pts[14][2] = {{0.2,5.0},{0.0,0.0},{5.1,10.0},{5.0,5.0},{5.0,0.0},
+                       {10.1,9.9},{10.0,4.9},{10.1,0.0},{15.1,10.0},{15.1,5.0},
+                       {15.1,0.0},{20.1,10.0},{20.2,5.1},{20.2,0.1}};
+  for (auto& p : pts)
+  {
+    NeighborTrajectory n;
+    n.clearance = 2.0;
+    n.start_time = -1.0;
+    n.duration = 10.0;
+    for (int i = 0; i <= 50; ++i)
+    {
+      n.t.push_back(i / 50.0 * 10.0);
+      n.pts.emplace_back(p[0], p[1], 5.0);
+    }
+    neighbors.push_back(n);
+  }
+  TimedTrajectory traj;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(start, waypoints, neighbors, traj, cost));
+  EXPECT_GT(traj.duration, 0.0);
+  // 轨迹应爬升（终点 z 显著高于起点）。
+  const double z_end = traj.pts.back().z();
+  EXPECT_GT(z_end, start.position.z() + 2.0);
+}
