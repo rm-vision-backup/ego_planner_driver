@@ -204,6 +204,26 @@ TEST(EgoPlannerCore, SamplePvaAtStartMatchesRequestedDerivatives)
   EXPECT_TRUE(std::isfinite(s.acc.x()));
 }
 
+TEST(EgoPlannerCore, ClampVectorNormLimitsMagnitudeAndHandlesZero)
+{
+  using ego_planner_driver::clampVectorNorm;
+  // 范数超限：方向保留，模长压到 limit（逐轴限幅做不到这一点）。
+  Eigen::Vector3d v(3.0, 4.0, 0.0);  // norm = 5
+  clampVectorNorm(v, 2.0);
+  EXPECT_NEAR(v.norm(), 2.0, 1e-9);
+  EXPECT_NEAR(v.x(), 3.0 * 2.0 / 5.0, 1e-9);
+  EXPECT_NEAR(v.y(), 4.0 * 2.0 / 5.0, 1e-9);
+  // 未超限：原样保留。
+  Eigen::Vector3d w(0.5, 0.0, 0.0);
+  clampVectorNorm(w, 1.0);
+  EXPECT_NEAR(w.norm(), 0.5, 1e-9);
+  // 零向量：保持零，不产生 NaN（v.normalized() 会除零）。
+  Eigen::Vector3d z = Eigen::Vector3d::Zero();
+  clampVectorNorm(z, 1.0);
+  EXPECT_TRUE(z.isZero());
+  EXPECT_TRUE(z.allFinite());
+}
+
 int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);

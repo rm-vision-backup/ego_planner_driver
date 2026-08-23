@@ -10,6 +10,15 @@
 namespace ego_planner_driver
 {
 
+// Limits a 3-vector's Euclidean norm to `limit` without touching its direction.
+// Zero vectors stay zero (never NaN, unlike v.normalized()).
+inline void clampVectorNorm(Eigen::Vector3d& v, double limit)
+{
+  const double n = v.norm();
+  if (n > limit && n > 1e-9)
+    v *= limit / n;
+}
+
 // Extracted, no-ROS numerical core of the ego-planner-swarm kernel.
 // Keeps three cost terms only: jerk smoothness, dynamic feasibility and
 // reciprocal swarm avoidance.  Static obstacle / moving object / fitness

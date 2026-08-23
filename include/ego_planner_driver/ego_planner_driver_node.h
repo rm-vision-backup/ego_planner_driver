@@ -118,12 +118,16 @@ private:
   size_t advanceConsumed(const std::vector<WayPoint>& waypoints,
                          const Eigen::Vector3d& start,
                          size_t consumed) const;
-  // Current trajectory velocity/acceleration at plan time (rolling continuity,
-  // numeric differentiation over the sampled current_ trajectory).
-  void currentDerivatives(Eigen::Vector3d& vel, Eigen::Vector3d& acc) const;
-  // Caps the rolling segment's start derivatives to 1.5x planner bounds so a
-  // pathological sampled derivative cannot spread the pinned control points and
-  // amplify into a large setpoint overshoot.
+  // Samples the full position/velocity/acceleration/yaw of the current
+  // trajectory at replan time (clamped to its end) so a rolling segment starts
+  // from the same trajectory state it replaces (upstream FSM semantics)
+  // instead of mixing live position with stale derivatives.  Returns false
+  // when no usable trajectory exists (first plan / new task).
+  bool sampleCurrentState(Eigen::Vector3d& pos, Eigen::Vector3d& vel,
+                          Eigen::Vector3d& acc, double& yaw) const;
+  // Caps the rolling segment's start derivatives to the planner bounds by
+  // Euclidean norm so a pathological sampled derivative cannot spread the
+  // pinned control points and amplify into a large setpoint overshoot.
   void clampStartDerivatives(Eigen::Vector3d& vel, Eigen::Vector3d& acc) const;
 
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }

@@ -158,24 +158,48 @@ bool EgoPlannerDriverNode::replanOnce()
     }
     Snapshot data;
     data.now = now;
-    data.start.position = Eigen::Vector3d(local_pose_->pose.position.x,
-                                          local_pose_->pose.position.y,
-                                          local_pose_->pose.position.z);
     data.start.yaw = goal_yaw_;
-    // 滚动段间速度/加速度连续：从当前轨迹取 vel/acc 作为新段起始导数
-    // （首次规划 current_ 为空 -> 全零）。数值微分可能产出病态大导数，
-    // 先 clamp 到规划界限的 1.5 倍，避免锚定控制点发散造成 setpoint 过冲。
-    currentDerivatives(data.start_vel, data.start_acc);
+    // 滚动重规划：从旧轨迹同一时刻取完整 P/V/A/yaw 作为新段起点（原版 FSM
+    // 语义），避免"实际位置 + 旧导数"组合在切段时产生位置跳变与速度纹波。
+    // 首次规划/新任务（current_ 被 resetRun 清空）才用实际位置 + 零导数。
+    if (!sampleCurrentState(data.start.position, data.start_vel, data.start_acc,
+                            data.start.yaw))
+    {
+      data.start.position = Eigen::Vector3d(local_pose_->pose.position.x,
+                                            local_pose_->pose.position.y,
+                                            local_pose_->pose.position.z);
+      data.start.yaw = goal_yaw_;
+      data.start_vel = Eigen::Vector3d::Zero();
+      data.start_acc = Eigen::Vector3d::Zero();
+    }
     clampStartDerivatives(data.start_vel, data.start_acc);
     data.waypoints = waypoints_;
-    // 滚动局部规划：窗口从 UAV 实际位置前方尚未消费的 waypoints 截取
-    // horizon 内的点（窗口随实际弧长滑动，不随上次规划段 erase 提前消耗）。
+    // 滚动窗口推进用"实际位置"（真实进度感知），规划起点用旧轨迹状态
+    // （连续性）——两者职责分离。若窗口也用旧轨迹期望位置推进，每 1s 换段
+    // 时期望位置总在下降段中段，waypoint_consumed_ 会卡住，checkArrival 永不
+    // 触发。飞机进入最终目标容差后直接退化规划完整剩余航点，保证最后一段
+    // 的轨迹终点=目标，轨迹执行完即触发 COMPLETED。
     if (planning_horizon_ > 0.0)
     {
-      waypoint_consumed_ = advanceConsumed(
-          waypoints_, data.start.position, waypoint_consumed_);
-      data.waypoints = truncateToHorizon(
-          waypoints_, planning_horizon_, data.start.position, waypoint_consumed_);
+      const Eigen::Vector3d live_pos(local_pose_->pose.position.x,
+                                     local_pose_->pose.position.y,
+                                     local_pose_->pose.position.z);
+      const bool near_final = !waypoints_.empty() &&
+          (live_pos - waypoints_.back().position).norm() <= pos_tol_;
+      if (near_final)
+      {
+        data.waypoints = std::vector<WayPoint>(
+            waypoints_.begin() + static_cast<std::ptrdiff_t>(
+                std::min(waypoint_consumed_, waypoints_.size())),
+            waypoints_.end());
+      }
+      else
+      {
+        waypoint_consumed_ = advanceConsumed(
+            waypoints_, live_pos, waypoint_consumed_);
+        data.waypoints = truncateToHorizon(
+            waypoints_, planning_horizon_, live_pos, waypoint_consumed_);
+      }
     }
     for (const auto& item : inbox_)
     {
@@ -275,86 +299,37 @@ size_t EgoPlannerDriverNode::advanceConsumed(
   return consumed;
 }
 
-void EgoPlannerDriverNode::currentDerivatives(Eigen::Vector3d& vel,
-                                              Eigen::Vector3d& acc) const
+bool EgoPlannerDriverNode::sampleCurrentState(Eigen::Vector3d& pos,
+                                              Eigen::Vector3d& vel,
+                                              Eigen::Vector3d& acc,
+                                              double& yaw) const
 {
-  vel = Eigen::Vector3d::Zero();
-  acc = Eigen::Vector3d::Zero();
   if (!current_ || current_->pts.size() < 3)
-    return;
+    return false;
   const double elapsed = (nowFunc() - plan_start_).toSec();
-  const std::vector<double>& t = current_->t;
-  const std::vector<Eigen::Vector3d>& pts = current_->pts;
-  // Prefer the exact B-spline derivative sampled at publish time; fall back
-  // to a central difference when vel is unavailable (older trajectories).
+  const double t_end = current_->t.empty() ? 0.0 : current_->t.back();
   // 段间衔接：periodic replan 可能在当前段执行完（elapsed>duration，UAV 在
   // 段末悬停或滑行）后才快照。此时若返回全零 vel，新段从 0 起步重新加速，
-  // 速度 0~max 震荡。改为 clamp 到轨迹末端速度，保持速度连续。
-  const double t_end = t.empty() ? 0.0 : t.back();
+  // 速度 0~max 震荡。clamp 到轨迹末端采样，保持速度/位置连续。
   const double t_clamp = std::min(elapsed, std::max(0.0, t_end - 1e-4));
-  if (current_->vel.size() == pts.size())
-  {
-    if (t_clamp <= t.front())
-    {
-      vel = current_->vel.front();
-    }
-    else
-    {
-      for (size_t i = 0; i + 1 < pts.size(); ++i)
-      {
-        if (t_clamp > t[i + 1])
-          continue;
-        const double dt = t[i + 1] - t[i];
-        const double a = dt > 1e-6 ? (t_clamp - t[i]) / dt : 0.0;
-        vel = current_->vel[i] * (1.0 - a) + current_->vel[i + 1] * a;
-        break;
-      }
-      if (t_clamp >= t.back())
-        vel = current_->vel.back();
-    }
-  }
-  else
-  {
-    for (size_t i = 1; i + 1 < pts.size(); ++i)
-    {
-      if (t[i + 1] < t_clamp)
-        continue;
-      const double dt_p = t[i + 1] - t[i - 1];
-      if (dt_p > 1e-6)
-        vel = (pts[i + 1] - pts[i - 1]) / dt_p;
-      break;
-    }
-    if (t_clamp >= t.back() && pts.size() >= 2)
-      vel = (pts.back() - pts[pts.size() - 2]) / std::max(t.back() - t[t.size() - 2], 1e-6);
-  }
-  // Acceleration via position differences around the current sample.
-  for (size_t i = 1; i + 1 < pts.size(); ++i)
-  {
-    if (t[i + 1] < t_clamp)
-      continue;
-    const double dt = t[i + 1] - t[i];
-    const double dt_prev = t[i] - t[i - 1];
-    if (dt > 1e-6 && dt_prev > 1e-6)
-    {
-      const Eigen::Vector3d v1 = (pts[i + 1] - pts[i]) / dt;
-      const Eigen::Vector3d v0 = (pts[i] - pts[i - 1]) / dt_prev;
-      acc = (v1 - v0) / ((dt + dt_prev) * 0.5);
-      break;
-    }
-  }
+  TrajectorySample s;
+  if (!current_->samplePVA(t_clamp, s))
+    return false;
+  pos = s.pos;
+  vel = s.vel;
+  acc = s.acc;
+  yaw = s.yaw;
+  return true;
 }
 
 void EgoPlannerDriverNode::clampStartDerivatives(Eigen::Vector3d& vel,
                                                  Eigen::Vector3d& acc) const
 {
   const EgoPlannerConfig cfg = core_->config();
-  const double v_lim = cfg.max_vel * 1.5;
-  const double a_lim = cfg.max_acc * 1.5;
-  for (int k = 0; k < 3; ++k)
-  {
-    vel[k] = std::max(-v_lim, std::min(v_lim, vel[k]));
-    acc[k] = std::max(-a_lim, std::min(a_lim, acc[k]));
-  }
+  // Euclidean-norm caps: max_vel/max_acc bound the magnitude, so a per-axis cap
+  // (which can grow the magnitude up to sqrt(3)x) is the wrong metric here.
+  clampVectorNorm(vel, cfg.max_vel);
+  clampVectorNorm(acc, cfg.max_acc);
 }
 
 void EgoPlannerDriverNode::advanceHoldHandling()
@@ -530,6 +505,11 @@ void EgoPlannerDriverNode::resetRun()
   steady_target_.reset();
   arrival_since_.reset();
   hold_requested_ = false;
+  // A new goal/waypoint/hold abandons the previous trajectory: the next plan
+  // must start from the live pose with zero derivatives, never from the old
+  // trajectory state (sampleCurrentState guards on current_).
+  current_.reset();
+  plan_start_ = ros::Time(0);
 }
 
 void EgoPlannerDriverNode::setState(const std::string& state)
@@ -695,8 +675,15 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
   // replanLoop snapshot still samples valid velocity for segment continuity)
   // and there are still waypoints ahead, request a replan.  Arrival still
   // triggers the next segment; the final segment publishes COMPLETED.
+  // Once the UAV is inside the final target tolerance, time-triggered replan
+  // stops so the final (degraded full-remaining) segment can run to its end
+  // and trigger checkArrival -> COMPLETED.
+  const bool near_final = !waypoints_.empty() && local_pose_ &&
+      (Eigen::Vector3d(local_pose_->pose.position.x, local_pose_->pose.position.y,
+                       local_pose_->pose.position.z) -
+       waypoints_.back().position).norm() <= pos_tol_;
   if (planning_horizon_ > 0.0 && !planning_requested_ && !hold_requested_ &&
-      waypoint_consumed_ + 1 < waypoints_.size())
+      waypoint_consumed_ + 1 < waypoints_.size() && !near_final)
   {
     const double replan_trigger = std::min(replan_period_s_,
                                            current_ ? current_->duration * 0.85 : replan_period_s_);
@@ -719,13 +706,21 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
   const Eigen::Vector3d cur(local_pose_->pose.position.x,
                             local_pose_->pose.position.y,
                             local_pose_->pose.position.z);
-  if ((cur - target).norm() <= pos_tol_)
+  const double dist = (cur - target).norm();
+  if (dist <= pos_tol_)
   {
     if (!arrival_since_)
       arrival_since_ = now;
     if ((now - *arrival_since_).toSec() >= stable_s_)
     {
-      if (planning_horizon_ <= 0.0 || waypoint_consumed_ + 1 >= waypoints_.size())
+      // COMPLETED 判定不依赖 waypoint_consumed_：飞机进入最终目标容差
+      // （near_final）即视为到达最终目标。否则滚动窗口的 consumed 会因
+      // 密化末段的投影阈值（t<seg_len）卡在 size-2，导致永远滚动、永不
+      // COMPLETED（见 implementation_plan 26082322 复测）。
+      const bool near_final = !waypoints_.empty() &&
+          (cur - waypoints_.back().position).norm() <= pos_tol_;
+      if (planning_horizon_ <= 0.0 || near_final ||
+          waypoint_consumed_ + 1 >= waypoints_.size())
       {
         // 最终目标已到达：冻结目标位姿并发布 COMPLETED 终态（executor 判定成功）。
         // steady_target_ 非空时持续发布目标 setpoint 悬停；不再单独切 HOLD，
@@ -845,30 +840,56 @@ void EgoPlannerDriverNode::replanLoop()
       }
       Snapshot data;
       data.now = now;
-      data.start.position = Eigen::Vector3d(local_pose_->pose.position.x,
-                                            local_pose_->pose.position.y,
-                                            local_pose_->pose.position.z);
       data.start.yaw = goal_yaw_;
-      currentDerivatives(data.start_vel, data.start_acc);
+      // 滚动重规划：从旧轨迹同一时刻取完整 P/V/A/yaw（原版 FSM 语义）；
+      // 首次规划/新任务才用实际位置 + 零导数（见 replanOnce 同款逻辑）。
+      if (!sampleCurrentState(data.start.position, data.start_vel, data.start_acc,
+                              data.start.yaw))
+      {
+        data.start.position = Eigen::Vector3d(local_pose_->pose.position.x,
+                                              local_pose_->pose.position.y,
+                                              local_pose_->pose.position.z);
+        data.start.yaw = goal_yaw_;
+        data.start_vel = Eigen::Vector3d::Zero();
+        data.start_acc = Eigen::Vector3d::Zero();
+      }
       clampStartDerivatives(data.start_vel, data.start_acc);
       data.waypoints = waypoints_;
-      // 滚动局部规划：窗口从 UAV 实际位置前方尚未消费的 waypoints 截取
-      // horizon 内的点。一次规划完整航线（120+ 点）会让 B-spline 参数化把
-      // 长水平段压缩在起点附近（实测 max horizontal travel ~0.1m），必须
+      // 滚动窗口推进用"实际位置"（真实进度感知），规划起点用旧轨迹状态
+      // （连续性）——两者职责分离（见 replanOnce 同款说明）。一次规划完整
+      // 航线（120+ 点）会让 B-spline 参数化把长水平段压缩在起点附近，必须
       // 滚动窗口逐段推进。
       if (planning_horizon_ > 0.0)
       {
-        waypoint_consumed_ = advanceConsumed(
-            waypoints_, data.start.position, waypoint_consumed_);
-        data.waypoints = truncateToHorizon(
-            waypoints_, planning_horizon_, data.start.position, waypoint_consumed_);
-        if (data.waypoints.size() < 2)
+        const Eigen::Vector3d live_pos(local_pose_->pose.position.x,
+                                       local_pose_->pose.position.y,
+                                       local_pose_->pose.position.z);
+        const bool near_final = !waypoints_.empty() &&
+            (live_pos - waypoints_.back().position).norm() <= pos_tol_;
+        if (near_final)
         {
-          // 窗口内不足两点（已接近最终目标）：退化一次规划完整剩余航点。
+          // 飞机已进入最终目标容差：退化规划完整剩余航点（含目标），并让
+          // 重规划停止（publishSetpoint 侧同样用 near_final 关闭时间触发），
+          // 保证最后一段轨迹执行完触发 COMPLETED。
           data.waypoints = std::vector<WayPoint>(
               waypoints_.begin() + static_cast<std::ptrdiff_t>(
                   std::min(waypoint_consumed_, waypoints_.size())),
               waypoints_.end());
+        }
+        else
+        {
+          waypoint_consumed_ = advanceConsumed(
+              waypoints_, live_pos, waypoint_consumed_);
+          data.waypoints = truncateToHorizon(
+              waypoints_, planning_horizon_, live_pos, waypoint_consumed_);
+          if (data.waypoints.size() < 2)
+          {
+            // 窗口内不足两点（已接近最终目标）：退化一次规划完整剩余航点。
+            data.waypoints = std::vector<WayPoint>(
+                waypoints_.begin() + static_cast<std::ptrdiff_t>(
+                    std::min(waypoint_consumed_, waypoints_.size())),
+                waypoints_.end());
+          }
         }
       }
       for (const auto& item : inbox_)

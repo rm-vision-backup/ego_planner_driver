@@ -559,6 +559,144 @@ TEST(EgoStateMachine, DirectControlSuppressesEgoCandidates)
   EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
 }
 
+TEST(EgoStateMachine, ReplanUsesTrajectoryStateNotLivePose)
+{
+  // 建议 2：滚动重规划起点必须来自旧轨迹同一时刻的完整状态，而不是
+  // "实际位置 + 旧导数"。注入一个明显偏离的 local_pose，新段起点应仍落在
+  // 旧轨迹附近，而非跟随注入位置跳变。
+  usleep(600 * 1000);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  node.setPlanningHorizon(5.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 1; i <= 10; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = i * 2.0; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  // 推进到时间触发重规划。
+  for (int step = 0; step < 20; ++step)
+  {
+    node.publishSetpointTick();
+    echoSetpoint(node, clock);
+    clock.advance(0.1);
+    if (node.planningRequested())
+      break;
+  }
+  EXPECT_TRUE(node.planningRequested());
+  const double old_x = node.lastSetpoint().position.x;
+
+  // 注入偏离 100m 的实际位姿。
+  const double dev_x = old_x + 100.0;
+  node.injectLocalPose(makePose(dev_x, node.lastSetpoint().position.y,
+                                node.lastSetpoint().position.z, clock.get()));
+
+  // 滚动 replan：新段起点应取旧轨迹状态（≈old_x），而非注入的 dev_x。
+  ASSERT_TRUE(node.replanOnce());
+  node.publishSetpointTick();
+  const mavros_msgs::PositionTarget sp = node.lastSetpoint();
+  EXPECT_LT(std::abs(sp.position.x - old_x), 1.0);
+  EXPECT_GT(std::abs(sp.position.x - dev_x), 50.0);
+  EXPECT_EQ(node.execState(), kStateExecuting);
+}
+
+TEST(EgoStateMachine, RollingSegmentsReachCompleted)
+{
+  // 滚动多段推进后最终必须 COMPLETED（prepare 场景的到达路径）。建议 2 把
+  // 起点换成旧轨迹状态后，此路径必须有测试覆盖。
+  usleep(600 * 1000);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  node.setPlanningHorizon(3.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 1; i <= 12; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = i * 0.5; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  bool completed = false;
+  for (int guard = 0; guard < 3000; ++guard)
+  {
+    node.publishSetpointTick();
+    echoSetpoint(node, clock);
+    clock.advance(0.1);
+    if (node.planningRequested())
+      ASSERT_TRUE(node.replanOnce());
+    if (node.execState() == kStateCompleted)
+    {
+      completed = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(completed);
+  if (completed)
+    EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
+}
+
+TEST(EgoStateMachine, RollingSegmentsReachCompletedWithTrackingLag)
+{
+  // 模拟 SITL 跟踪滞后：回灌 local_pose 时沿 x 落后 setpoint 0.15m（测试默认
+  // position_tolerance_m=0.2，需保持滞后 < 容差），验证窗口推进/到达判定仍
+  // 收敛到 COMPLETED。
+  usleep(600 * 1000);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  node.setPlanningHorizon(3.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 1; i <= 12; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = i * 0.5; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  bool completed = false;
+  for (int guard = 0; guard < 3000; ++guard)
+  {
+    node.publishSetpointTick();
+    const mavros_msgs::PositionTarget sp = node.lastSetpoint();
+    node.injectLocalPose(makePose(sp.position.x - 0.15, sp.position.y,
+                                  sp.position.z, clock.get()));
+    clock.advance(0.1);
+    if (node.planningRequested())
+      ASSERT_TRUE(node.replanOnce());
+    if (node.execState() == kStateCompleted)
+    {
+      completed = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(completed);
+}
+
 int main(int argc, char** argv)
 {
   setenv("ROS_MASTER_URI", "http://localhost:11411", 1);
