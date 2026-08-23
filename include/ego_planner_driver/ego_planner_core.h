@@ -34,6 +34,10 @@ struct EgoPlannerConfig
   double lambda_swarm = 1.0;
   double lambda_feasibility = 1.0;
   double lambda_terminal = 1.0;
+  // Rebound hard push: after L-BFGS, control points that intrude a neighbor's
+  // clearance are pushed out along the waypoint-normal direction (waypoints
+  // act as the safe-path reference, replacing the upstream A* path).
+  bool swarm_rebound = true;
   int max_iterations = 200;
   int mem_size = 16;
   double g_epsilon = 0.01;
@@ -141,6 +145,19 @@ private:
                      Eigen::MatrixXd& gradient);
   static double costFunction(void* data, const double* x, double* grad,
                              const int n);
+  // Rebound: push control points that intrude a neighbor's clearance out along
+  // the waypoint-normal direction. waypoints (densified keypoints) act as the
+  // safe-path reference in place of the upstream A* path.
+  bool reboundFromNeighbors(const std::vector<NeighborTrajectory>& neighbors,
+                            const std::vector<Eigen::Vector3d>& waypoints,
+                            double clearance);
+  static Eigen::Vector3d waypointTangent(
+      const std::vector<Eigen::Vector3d>& waypoints,
+      const Eigen::Vector3d& pos);
+  // Run one L-BFGS pass over the current control points (used both by planOnce
+  // and by the rebound re-optimization loop so the spline re-adheres to the
+  // rebound control points).
+  bool optimizeControls(double& final_cost);
 
   EgoPlannerConfig config_;
   double bspline_interval_ = 0.4;

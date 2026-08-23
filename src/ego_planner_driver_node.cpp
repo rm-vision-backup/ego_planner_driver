@@ -17,6 +17,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.planning_range = pnh_.param("planning_range", 30.0);
   config.lambda_smooth = pnh_.param("lambda_smooth", 1.0);
   config.lambda_swarm = pnh_.param("lambda_swarm", 1.0);
+  config.swarm_rebound = pnh_.param("swarm_rebound", true);
   config.lambda_feasibility = pnh_.param("lambda_feasibility", 1.0);
   config.max_iterations = pnh_.param("max_iterations", 200);
   config.mem_size = pnh_.param("mem_size", 16);
@@ -567,13 +568,15 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
     {
       if (planning_horizon_ <= 0.0 || remaining_waypoints_.empty())
       {
-        // 全局规划模式（horizon<=0），或滚动模式已无后续航点：到达最终目标，
-        // 完成并转入 HOLD（冻结目标位姿）。
+        // 最终目标已到达：冻结目标位姿并发布 COMPLETED 终态（executor 判定成功）。
+        // steady_target_ 非空时持续发布目标 setpoint 悬停；不再单独切 HOLD，
+        // 避免 executor 收到 HOLD 判 COMMAND_HELD 失败。后续 HOLD/新目标由
+        // onHold/onGoal 正常接管。
         steady_target_ = HoldTarget{target, yaw};
         current_.reset();
         arrival_since_.reset();
         plan_start_ = ros::Time(0);
-        setState(kStateHold);
+        setState(kStateCompleted);
       }
       else
       {

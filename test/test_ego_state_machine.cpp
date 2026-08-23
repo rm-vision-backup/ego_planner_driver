@@ -14,6 +14,7 @@
 #include "ego_planner_driver/ego_planner_driver_node.h"
 
 using ego_planner_driver::EgoPlannerDriverNode;
+using ego_planner_driver::kStateCompleted;
 using ego_planner_driver::kStateExecuting;
 using ego_planner_driver::kStateTakeoff;
 using ego_planner_driver::kStateHold;
@@ -174,10 +175,10 @@ TEST(EgoStateMachine, CompletedFreezesInHold)
     clock.advance(step);
     node.publishSetpointTick();
     echoSetpoint(node, clock);
-    if (node.execState() == kStateHold && node.steadyTarget())
+    if (node.execState() == kStateCompleted && node.steadyTarget())
       break;
   }
-  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_EQ(node.execState(), kStateCompleted);
   EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
   EXPECT_NEAR(node.steadyTarget()->pos.x(), 0.0, 0.5);
 
@@ -189,12 +190,12 @@ TEST(EgoStateMachine, CompletedFreezesInHold)
     node.publishSetpointTick();
     EXPECT_NEAR(node.lastSetpoint().pose.position.x, frozen_x, 1e-3);
   }
-  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_EQ(node.execState(), kStateCompleted);
 
   // 超过原有终端窗口后仍保持锁定
   clock.advance(20.0);
   node.publishSetpointTick();
-  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_EQ(node.execState(), kStateCompleted);
   EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
   EXPECT_GT(node.setpointCount(), 0u);
 }
@@ -286,7 +287,7 @@ TEST(EgoStateMachine, HorizonTruncatesAndRollsWaypoints)
   {
     node.publishSetpointTick();
     seg1_x = node.lastSetpoint().pose.position.x;
-    if (node.execState() == kStateHold)
+    if (node.execState() == kStateCompleted)
       break;
     clock.advance(0.1);
     echoSetpoint(node, clock);
@@ -302,7 +303,7 @@ TEST(EgoStateMachine, HorizonTruncatesAndRollsWaypoints)
     node.replanOnce();
     node.publishSetpointTick();
     max_x = std::max(max_x, node.lastSetpoint().pose.position.x);
-    if (node.execState() == kStateHold)
+    if (node.execState() == kStateCompleted)
       break;
     clock.advance(0.1);
     echoSetpoint(node, clock);

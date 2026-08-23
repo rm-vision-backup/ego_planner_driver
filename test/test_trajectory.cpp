@@ -95,7 +95,9 @@ TEST(EgoPlannerCore, FilterByRangeDropsFarNeighbors)
 
 TEST(EgoPlannerCore, CheckClearanceCatchesViolation)
 {
-  EgoPlannerCore core(makeConfig());
+  EgoPlannerConfig config = makeConfig();
+  config.swarm_rebound = false;  // 无 rebound 时软惩罚不足以避开正对邻居
+  EgoPlannerCore core(config);
   GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
   std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(0.0, 10.0, 15.0), 0.0}};
   TimedTrajectory trajectory;
@@ -105,6 +107,25 @@ TEST(EgoPlannerCore, CheckClearanceCatchesViolation)
   std::vector<NeighborTrajectory> neighbors{straightNeighbor(0.0, 5.0, 0.0, 5.0, 15.0)};
   EXPECT_FALSE(core.checkClearance(trajectory, neighbors, 0.5));
   EXPECT_TRUE(core.checkClearance(trajectory, {}, 0.5));
+}
+
+TEST(EgoPlannerCore, SwarmReboundPushesTrajectoryAway)
+{
+  EgoPlannerConfig config = makeConfig();
+  config.swarm_rebound = true;  // rebound 硬推：把侵入邻居 clearance 的控制点推开
+  EgoPlannerCore core(config);
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
+  // 模拟上层 0.4-0.5m 密化后的航线（真实运行 waypoints 已密化，控制点足够）
+  std::vector<WayPoint> waypoints;
+  for (double y = 0.5; y <= 10.0; y += 0.5)
+    waypoints.push_back(WayPoint{Eigen::Vector3d(0.0, y, 15.0), 0.0});
+  TimedTrajectory trajectory;
+  double cost = 0.0;
+  // 邻居正对轨迹路径（同一高度、同时段）
+  std::vector<NeighborTrajectory> neighbors{straightNeighbor(0.0, 5.0, 0.0, 5.0, 15.0)};
+  ASSERT_TRUE(core.planOnce(start, waypoints, neighbors, trajectory, cost));
+  // rebound 后 clearance 硬校验应通过（控制点被推开绕开正对邻居）
+  EXPECT_TRUE(core.checkClearance(trajectory, neighbors, 0.5));
 }
 
 int main(int argc, char** argv)

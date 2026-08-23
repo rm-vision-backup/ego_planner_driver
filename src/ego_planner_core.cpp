@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace ego_planner_driver
 {
@@ -242,6 +243,132 @@ std::vector<NeighborTrajectory> EgoPlannerCore::filterByRange(
   return kept;
 }
 
+Eigen::Vector3d EgoPlannerCore::waypointTangent(
+    const std::vector<Eigen::Vector3d>& waypoints,
+    const Eigen::Vector3d& pos)
+{
+  if (waypoints.empty())
+    return Eigen::Vector3d::Zero();
+  size_t best = 0;
+  double best_d = std::numeric_limits<double>::max();
+  for (size_t i = 0; i < waypoints.size(); ++i)
+  {
+    const double d = (waypoints[i] - pos).squaredNorm();
+    if (d < best_d)
+    {
+      best_d = d;
+      best = i;
+    }
+  }
+  const size_t prev = best > 0 ? best - 1 : best;
+  const size_t next = best + 1 < waypoints.size() ? best + 1 : best;
+  Eigen::Vector3d tangent = waypoints[next] - waypoints[prev];
+  if (tangent.norm() < 1e-9)
+    tangent = waypoints[best] - pos;
+  if (tangent.norm() < 1e-9)
+    return Eigen::Vector3d::Zero();
+  return tangent.normalized();
+}
+
+bool EgoPlannerCore::reboundFromNeighbors(
+    const std::vector<NeighborTrajectory>& neighbors,
+    const std::vector<Eigen::Vector3d>& waypoints, double clearance)
+{
+  if (neighbors.empty())
+    return false;
+  const double ts = bspline_interval_;
+  const int order = order_;
+  const int end_idx = static_cast<int>(cps_.size) - order_ -
+                      static_cast<int>(static_cast<double>(cps_.size - 2 * order_) / 3.0);
+  bool rebounded = false;
+  for (int i = order_; i < end_idx; ++i)
+  {
+    const double glb_time = (static_cast<double>(order_ - 1) / 2.0 +
+                             static_cast<double>(i - order_ + 1)) * ts;
+    const Eigen::Vector3d ctrl = cps_.points.col(i);
+    const Eigen::Vector3d tangent = waypointTangent(waypoints, ctrl);
+    Eigen::Vector3d moved = ctrl;
+    for (const auto& neighbor : neighbors)
+    {
+      if (neighbor.clearance <= 0.0 || neighbor.pts.size() < 2 ||
+          neighbor.t.size() != neighbor.pts.size())
+      {
+        continue;
+      }
+      const double t_abs = glb_time - neighbor.start_time;
+      if (t_abs < neighbor.t.front() || t_abs > neighbor.t.back())
+        continue;
+      const Eigen::Vector3d swarm_pt = sampleNeighbor(neighbor, t_abs);
+      const Eigen::Vector3d dist_vec = moved - swarm_pt;
+      const double ellip = std::sqrt(
+          dist_vec(2) * dist_vec(2) * kInvA2 +
+          (dist_vec(0) * dist_vec(0) + dist_vec(1) * dist_vec(1)) * kInvB2);
+      if (ellip >= clearance)
+        continue;
+      // Push direction: ellipsoid-normalized direction with the waypoint
+      // tangent component removed (deviate normal to the route, not along it).
+      Eigen::Vector3d dir(dist_vec(0) * kInvB2, dist_vec(1) * kInvB2,
+                          dist_vec(2) * kInvA2);
+      if (tangent.norm() > 1e-6)
+        dir = dir - tangent * dir.dot(tangent);
+      if (dir.norm() < 1e-6)
+      {
+        // Neighbor directly ahead along the route (normal component ~0):
+        // push sideways using the waypoint horizontal normal (tangent x z),
+        // otherwise the spline stays on the route line and cannot deviate.
+        dir = Eigen::Vector3d(-tangent.y(), tangent.x(), 0.0);
+        if (dir.norm() < 1e-6)
+          dir = Eigen::Vector3d(1.0, 0.0, 0.0);
+      }
+      dir.normalize();
+      // 推离到 clearance 外并留裕量（B-spline 曲线在控制点凸包内，
+      // 曲线到邻居距离会小于控制点推离量，裕量保证曲线也满足
+      // clearance 硬校验）。
+      moved = swarm_pt + dir * (clearance * 3.0);
+      rebounded = true;
+    }
+    if (rebounded)
+      cps_.points.col(i) = moved;
+  }
+  return rebounded;
+}
+
+bool EgoPlannerCore::optimizeControls(double& final_cost)
+{
+  const int start_id = order_;
+  const int n = variable_num_;
+  std::vector<double> q(n);
+  for (int k = 0; k < n; ++k)
+  {
+    const int col = start_id + k / 3;
+    const int row = k % 3;
+    q[k] = cps_.points(row, col);
+  }
+  lbfgs::lbfgs_parameter_t params;
+  lbfgs::lbfgs_load_default_parameters(&params);
+  params.mem_size = config_.mem_size;
+  params.max_iterations = config_.max_iterations;
+  params.g_epsilon = config_.g_epsilon;
+  const int result =
+      lbfgs::lbfgs_optimize(n, q.data(), &final_cost,
+                            EgoPlannerCore::costFunction, nullptr, nullptr,
+                            this, &params);
+  if (result != lbfgs::LBFGS_CONVERGENCE &&
+      result != lbfgs::LBFGSERR_MAXIMUMITERATION &&
+      result != lbfgs::LBFGS_ALREADY_MINIMIZED &&
+      result != lbfgs::LBFGS_STOP)
+  {
+    return false;
+  }
+  for (int k = 0; k < n; ++k)
+  {
+    const int col = start_id + k / 3;
+    const int row = k % 3;
+    cps_.points(row, col) = q[k];
+  }
+  return true;
+}
+
 bool EgoPlannerCore::planOnce(const GoalPoint& start,
                               const std::vector<WayPoint>& sparse_waypoints,
                               const std::vector<NeighborTrajectory>& neighbors,
@@ -300,38 +427,17 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   const int start_id = order_;
   const int end_id = cps_.size;
   variable_num_ = 3 * (end_id - start_id);
-  std::vector<double> q(variable_num_);
-  for (int k = 0; k < variable_num_; ++k)
-  {
-    const int col = start_id + k / 3;
-    const int row = k % 3;
-    q[k] = cps_.points(row, col);
-  }
-
-  lbfgs::lbfgs_parameter_t params;
-  lbfgs::lbfgs_load_default_parameters(&params);
-  params.mem_size = config_.mem_size;
-  params.max_iterations = config_.max_iterations;
-  params.g_epsilon = config_.g_epsilon;
-
-  const int result =
-      lbfgs::lbfgs_optimize(variable_num_, q.data(), &final_cost,
-                            EgoPlannerCore::costFunction, nullptr, nullptr,
-                            this, &params);
-  if (result != lbfgs::LBFGS_CONVERGENCE &&
-      result != lbfgs::LBFGSERR_MAXIMUMITERATION &&
-      result != lbfgs::LBFGS_ALREADY_MINIMIZED &&
-      result != lbfgs::LBFGS_STOP)
-  {
+  if (!optimizeControls(final_cost))
     return false;
-  }
 
-  for (int k = 0; k < variable_num_; ++k)
-  {
-    const int col = start_id + k / 3;
-    const int row = k % 3;
-    cps_.points(row, col) = q[k];
-  }
+  // Swarm rebound: hard-push control points that intrude a neighbor's
+  // clearance out along the waypoint-normal direction (waypoints act as the
+  // safe-path reference, replacing the upstream A* path).  No re-optimization
+  // afterwards: L-BFGS smoothness would pull the pushed control points back
+  // into the clearance; the pushed control points are sampled directly and
+  // checkClearance below is the hard gate.
+  if (config_.swarm_rebound)
+    reboundFromNeighbors(neighbors_, point_set, config_.swarm_clearance * 2.0);
 
   ego_planner::UniformBspline traj(cps_.points, order_, bspline_interval_);
   double tm, tmp;
