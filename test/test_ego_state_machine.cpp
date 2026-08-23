@@ -252,6 +252,59 @@ TEST(EgoStateMachine, ArmOffboardDoesNotBlockReplan)
   EXPECT_FALSE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateTakeoff);
 }
+// 回归：滚动窗口必须随 UAV 实际位置推进，而不是被上次规划段 erase 提前消耗。
+// 修复前 remaining_waypoints_ 按 planned_waypoint_count erase，periodic replan 时
+// 窗口首点已距 UAV 数米，truncateToHorizon 把该距离计入 horizon 预算 → 每段只取
+// 0-2 个点 → 轨迹终点≈当前位置 → UAV 停在半途。修复后 waypoint_consumed_ 基于
+// start 在 waypoints 上的弧长投影推进，连续 replan 终点必须持续前进。
+TEST(EgoStateMachine, RollingWindowAdvancesWithActualPosition)
+{
+  usleep(600 * 1000);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  node.setPlanningHorizon(5.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  // 密化航点：0.4m 间距，从 start(0,0,5) 沿 x 延伸至 40m（覆盖多层 horizon 窗口）。
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 0; i <= 100; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = 0.4 * i; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  const double seg1_x = node.lastSetpoint().pose.position.x;  // 第一段窗口起点
+
+  // 连续滚动：每次把 UAV 推进到段末触发 checkArrival 置 planning_requested_，
+  // 再 replan；修复后窗口首点必须随实际位置前进，轨迹持续推进。
+  bool progressed = false;
+  for (int iter = 0; iter < 12; ++iter)
+  {
+    for (int step = 0; step < 200; ++step)
+    {
+      node.publishSetpointTick();
+      // 模拟 UAV 实际执行：local_pose 跟随 setpoint，避免 checkArrival 判超时切 HOLD。
+      echoSetpoint(node, clock);
+      clock.advance(0.1);
+      if (node.planningRequested() || node.execState() == kStateCompleted)
+        break;
+    }
+    if (node.execState() == kStateCompleted)
+      break;
+    ASSERT_TRUE(node.replanOnce());
+    const double cur = node.lastSetpoint().pose.position.x;
+    if (cur > seg1_x + 3.0)
+      progressed = true;
+  }
+  // 修复前窗口被提前消耗，第二次 replan 起终点≈当前位置，无法推进 3m 以上。
+  EXPECT_TRUE(progressed);
+}
 }  // namespace
 
 // 启动隔离 roscore，保证节点 advertise/subscribe/timer 可用
@@ -309,6 +362,43 @@ TEST(EgoStateMachine, HorizonTruncatesAndRollsWaypoints)
     echoSetpoint(node, clock);
   }
   EXPECT_GT(max_x, seg1_x + 2.0);
+}
+
+TEST(EgoStateMachine, PeriodicReplanTriggersDuringSegmentExecution)
+{
+  // 禁用 replanLoop 线程，手动 replanOnce 驱动，保证时间触发断言确定性。
+  usleep(600 * 1000);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  node.setPlanningHorizon(5.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 1; i <= 6; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = i * 2.0; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  // 到达段末才会置 planning_requested_；此刻仍在段起点 -> 应为 false。
+  EXPECT_FALSE(node.planningRequested());
+
+  // 段内推进超过 replan_period_s（1.0s）且仍有后续 waypoints -> 时间触发重规划。
+  for (int step = 0; step < 20; ++step)
+  {
+    node.publishSetpointTick();
+    clock.advance(0.1);
+    if (node.execState() == kStateCompleted)
+      break;
+  }
+  EXPECT_TRUE(node.planningRequested());
+  EXPECT_EQ(node.execState(), kStateExecuting);
 }
 
 int main(int argc, char** argv)

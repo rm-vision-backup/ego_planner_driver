@@ -55,6 +55,27 @@ TEST(EgoPlannerCore, PlanOnceProducesTimedTrajectory)
   EXPECT_NEAR(trajectory.pts.back().x(), 10.0, 1e-3);
 }
 
+TEST(EgoPlannerCore, PlanOnceAppliesStartDerivativesForRollingContinuity)
+{
+  EgoPlannerCore core(makeConfig());
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
+  std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(10.0, 0.0, 15.0), 0.0}};
+  const Eigen::Vector3d start_vel(1.5, 0.0, 0.0);
+  const Eigen::Vector3d start_acc(0.0, 0.0, 0.0);
+  TimedTrajectory traj;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost, start_vel, start_acc));
+  ASSERT_GT(traj.vel.size(), 1u);
+  // 起点 B-spline 一阶导数被精确锚定为 start_vel（优化器/rebound 不动前 3 列）。
+  EXPECT_NEAR(traj.vel.front().x(), start_vel.x(), 0.1);
+  EXPECT_NEAR(traj.vel.front().y(), start_vel.y(), 0.1);
+  // 对照：默认全零起始导数 -> 起点静止，证明 vel 参数确实生效。
+  TimedTrajectory zero_traj;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, zero_traj, cost));
+  ASSERT_GT(zero_traj.vel.size(), 1u);
+  EXPECT_NEAR(zero_traj.vel.front().x(), 0.0, 0.1);
+}
+
 TEST(EgoPlannerCore, PlanOnceWithoutWaypointsHoldsPosition)
 {
   EgoPlannerCore core(makeConfig());

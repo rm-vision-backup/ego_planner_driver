@@ -76,6 +76,10 @@ public:
   boost::optional<HoldTarget> steadyTarget() const;
   geometry_msgs::PoseStamped lastSetpoint() const;
   size_t setpointCount() const;
+  // 测试断言：时间触发重规划是否已请求。
+  bool planningRequested() const;
+  // 测试用：禁用 replanLoop 线程（单测手动 replanOnce 驱动时避免线程抢占）。
+  void setReplanLoopEnabled(bool enabled);
 
 private:
   void onGoal(const geometry_msgs::PointStamped::ConstPtr& msg);
@@ -86,10 +90,20 @@ private:
   void onHold(const std_msgs::Empty::ConstPtr& msg);
   void onMavrosState(const mavros_msgs::State::ConstPtr& msg);
   void onDirectControl(const std_msgs::Bool::ConstPtr& msg);
-  // Receding-horizon: keep only the waypoints ahead of start within horizon.
+  // Receding-horizon: from `waypoints_[consumed_..]`, keep only the points
+  // ahead of start within horizon (window slides with the UAV's real arc
+  // progress, not with the previous planning segment).
   std::vector<WayPoint> truncateToHorizon(
-      const std::vector<WayPoint>& remaining, double horizon,
-      const Eigen::Vector3d& start) const;
+      const std::vector<WayPoint>& waypoints, double horizon,
+      const Eigen::Vector3d& start, size_t consumed) const;
+  // Advance `consumed` to the first waypoint whose arc-length projection is
+  // still ahead of start (drop points the UAV has already passed).
+  size_t advanceConsumed(const std::vector<WayPoint>& waypoints,
+                         const Eigen::Vector3d& start,
+                         size_t consumed) const;
+  // Current trajectory velocity/acceleration at plan time (rolling continuity,
+  // numeric differentiation over the sampled current_ trajectory).
+  void currentDerivatives(Eigen::Vector3d& vel, Eigen::Vector3d& acc) const;
 
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }
   void resetRun();
@@ -116,7 +130,9 @@ private:
   double stable_s_ = 1.0;
   double timeout_margin_ = 5.0;
   double planning_horizon_ = 0.0;
+  double replan_period_s_ = 1.0;
   bool direct_control_active_ = false;
+  volatile bool replan_loop_enabled_ = true;
 
   bool armed_ = false;
   bool offboard_ = false;
@@ -149,9 +165,11 @@ private:
   double goal_yaw_ = 0.0;
   boost::optional<GoalPoint> pending_goal_;
   std::vector<WayPoint> waypoints_;
-  // Remaining waypoints not yet covered by the current planning segment
-  // (receding-horizon bookkeeping; shrinks as segments are consumed).
-  std::vector<WayPoint> remaining_waypoints_;
+  // Index into waypoints_ of the first waypoint still ahead of the UAV
+  // (receding-horizon window start).  Advanced from the UAV's real position
+  // each replan, never by erasing previously planned segments, so the window
+  // cannot outrun the executed trajectory.
+  size_t waypoint_consumed_ = 0;
   boost::optional<geometry_msgs::PoseStamped> local_pose_;
   boost::optional<ros::Time> local_pose_stamp_;
   bool planning_requested_ = false;

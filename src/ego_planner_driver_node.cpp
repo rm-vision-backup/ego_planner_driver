@@ -24,6 +24,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.g_epsilon = pnh_.param("g_epsilon", 0.01);
   core_.reset(new EgoPlannerCore(config));
   planning_horizon_ = config.planning_horizon;
+  replan_period_s_ = pnh_.param("replan_period_s", 1.0);
   frame_id_ = pnh_.param("frame_id", std::string("map"));
   // Identity parameters live in the public namespace (/UAV1/*) so the
   // Python driver and topology can discover them; planner tuning stays
@@ -127,7 +128,8 @@ bool EgoPlannerDriverNode::replanOnce()
     std::vector<WayPoint> waypoints;
     std::vector<NeighborTrajectory> neighbors;
     ros::Time now;
-    size_t planned_waypoint_count = 0;  // 本次规划覆盖的 waypoints 数（滚动簿记）
+    Eigen::Vector3d start_vel = Eigen::Vector3d::Zero();
+    Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
   };
   boost::optional<Snapshot> snap;
   ros::Time completed_at;
@@ -158,14 +160,18 @@ bool EgoPlannerDriverNode::replanOnce()
                                           local_pose_->pose.position.y,
                                           local_pose_->pose.position.z);
     data.start.yaw = goal_yaw_;
+    // 滚动段间速度/加速度连续：从当前轨迹取 vel/acc 作为新段起始导数
+    // （首次规划 current_ 为空 -> 全零）。
+    currentDerivatives(data.start_vel, data.start_acc);
     data.waypoints = waypoints_;
-    // 滚动局部规划：waypoints 只取当前位置前方 planning_horizon 内的点
-    // （对齐原版 ego-planner-swarm receding-horizon）。
-    if (planning_horizon_ > 0.0 && !remaining_waypoints_.empty())
+    // 滚动局部规划：窗口从 UAV 实际位置前方尚未消费的 waypoints 截取
+    // horizon 内的点（窗口随实际弧长滑动，不随上次规划段 erase 提前消耗）。
+    if (planning_horizon_ > 0.0)
     {
+      waypoint_consumed_ = advanceConsumed(
+          waypoints_, data.start.position, waypoint_consumed_);
       data.waypoints = truncateToHorizon(
-          remaining_waypoints_, planning_horizon_, data.start.position);
-      data.planned_waypoint_count = data.waypoints.size();
+          waypoints_, planning_horizon_, data.start.position, waypoint_consumed_);
     }
     for (const auto& item : inbox_)
     {
@@ -181,7 +187,8 @@ bool EgoPlannerDriverNode::replanOnce()
     return false;
   TimedTrajectory traj;
   double cost = 0.0;
-  if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost))
+  if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost,
+                       snap->start_vel, snap->start_acc))
   {
     std::lock_guard<std::mutex> lock(mutex_);
     captureHoldTargetLocked(nowFunc());
@@ -206,35 +213,121 @@ bool EgoPlannerDriverNode::replanOnce()
     steady_target_.reset();
     setState(kStateExecuting);
     publishIntent(traj, completed_at);
-    // 滚动簿记：移除本段已覆盖的 waypoints，下一段从剩余部分取 horizon。
-    if (planning_horizon_ > 0.0 && snap->planned_waypoint_count > 0 &&
-        !remaining_waypoints_.empty())
-    {
-      const size_t n = std::min(snap->planned_waypoint_count, remaining_waypoints_.size());
-      remaining_waypoints_.erase(remaining_waypoints_.begin(),
-                                 remaining_waypoints_.begin() + n);
-    }
+    // 滚动窗口不在此 erase：窗口起点由 UAV 实际位置（advanceConsumed）推进，
+    // 避免"窗口消耗快于实际执行"导致后半段截取为空、UAV 停在半途。
   }
   return true;
 }
 
 std::vector<WayPoint> EgoPlannerDriverNode::truncateToHorizon(
-    const std::vector<WayPoint>& remaining, double horizon,
-    const Eigen::Vector3d& start) const
+    const std::vector<WayPoint>& waypoints, double horizon,
+    const Eigen::Vector3d& start, size_t consumed) const
 {
-  if (horizon <= 0.0 || remaining.size() < 2)
-    return remaining;
+  if (horizon <= 0.0)
+    return waypoints;
+  // 窗口起点：UAV 实际位置前方第一个尚未消费的 waypoint。
+  if (consumed >= waypoints.size())
+    return {};
   std::vector<WayPoint> out;
-  out.push_back(remaining.front());
-  double accumulated = (remaining.front().position - start).norm();
-  for (size_t i = 1; i < remaining.size(); ++i)
+  out.push_back(waypoints[consumed]);
+  double accumulated = (waypoints[consumed].position - start).norm();
+  for (size_t i = consumed + 1; i < waypoints.size(); ++i)
   {
-    accumulated += (remaining[i].position - remaining[i - 1].position).norm();
-    out.push_back(remaining[i]);
+    accumulated += (waypoints[i].position - waypoints[i - 1].position).norm();
+    out.push_back(waypoints[i]);
     if (accumulated >= horizon)
       break;
   }
   return out;
+}
+
+size_t EgoPlannerDriverNode::advanceConsumed(
+    const std::vector<WayPoint>& waypoints, const Eigen::Vector3d& start,
+    size_t consumed) const
+{
+  // 把 UAV 已经过（位于 start 前方弧长投影之前）的 waypoints 从窗口起点剔除。
+  // start 通常恰在 waypoints 上（上层首点=start 且航点密化），用「到 start 的
+  // 距离不超过已消费点间距量级」判断；垂直段 start 与前方点严格共线。
+  if (consumed >= waypoints.size())
+    return consumed;
+  while (consumed + 1 < waypoints.size())
+  {
+    const Eigen::Vector3d& a = waypoints[consumed].position;
+    const Eigen::Vector3d& b = waypoints[consumed + 1].position;
+    const Eigen::Vector3d seg = b - a;
+    const double seg_len = seg.norm();
+    if (seg_len < 1e-9)
+    {
+      ++consumed;
+      continue;
+    }
+    // start 到线段起点的向量在 seg 方向上的投影。
+    const double t = (start - a).dot(seg) / seg_len;
+    // t < 0：start 在线段起点后方，未越过 a；t >= seg_len：越过 b。
+    if (t < 0.0)
+      break;
+    if (t >= seg_len)
+    {
+      ++consumed;
+      continue;
+    }
+    break;
+  }
+  // 处理 start 已越过最后一个 waypoint 的情况（收敛判据由 checkArrival 兜底）。
+  return consumed;
+}
+
+void EgoPlannerDriverNode::currentDerivatives(Eigen::Vector3d& vel,
+                                              Eigen::Vector3d& acc) const
+{
+  vel = Eigen::Vector3d::Zero();
+  acc = Eigen::Vector3d::Zero();
+  if (!current_ || current_->pts.size() < 3)
+    return;
+  const double elapsed = (nowFunc() - plan_start_).toSec();
+  const std::vector<double>& t = current_->t;
+  const std::vector<Eigen::Vector3d>& pts = current_->pts;
+  // Prefer the exact B-spline derivative sampled at publish time; fall back
+  // to a central difference when vel is unavailable (older trajectories).
+  if (current_->vel.size() == pts.size())
+  {
+    for (size_t i = 0; i + 1 < pts.size(); ++i)
+    {
+      if (elapsed > t[i + 1])
+        continue;
+      const double dt = t[i + 1] - t[i];
+      const double a = dt > 1e-6 ? (elapsed - t[i]) / dt : 0.0;
+      vel = current_->vel[i] * (1.0 - a) + current_->vel[i + 1] * a;
+      break;
+    }
+  }
+  else
+  {
+    for (size_t i = 1; i + 1 < pts.size(); ++i)
+    {
+      if (t[i + 1] < elapsed)
+        continue;
+      const double dt_p = t[i + 1] - t[i - 1];
+      if (dt_p > 1e-6)
+        vel = (pts[i + 1] - pts[i - 1]) / dt_p;
+      break;
+    }
+  }
+  // Acceleration via position differences around the current sample.
+  for (size_t i = 1; i + 1 < pts.size(); ++i)
+  {
+    if (t[i + 1] < elapsed)
+      continue;
+    const double dt = t[i + 1] - t[i];
+    const double dt_prev = t[i] - t[i - 1];
+    if (dt > 1e-6 && dt_prev > 1e-6)
+    {
+      const Eigen::Vector3d v1 = (pts[i + 1] - pts[i]) / dt;
+      const Eigen::Vector3d v0 = (pts[i] - pts[i - 1]) / dt_prev;
+      acc = (v1 - v0) / ((dt + dt_prev) * 0.5);
+      break;
+    }
+  }
 }
 
 void EgoPlannerDriverNode::advanceHoldHandling()
@@ -278,7 +371,7 @@ void EgoPlannerDriverNode::onGoal(const geometry_msgs::PointStamped::ConstPtr& m
   std::lock_guard<std::mutex> lock(mutex_);
   pending_goal_ = GoalPoint{Eigen::Vector3d(msg->point.x, msg->point.y, msg->point.z), goal_yaw_};
   waypoints_.assign(1, WayPoint{pending_goal_->position, goal_yaw_});
-  remaining_waypoints_ = waypoints_;
+  waypoint_consumed_ = 0;
   resetRun();
   planning_requested_ = true;
 }
@@ -301,7 +394,7 @@ void EgoPlannerDriverNode::onWaypoints(const geometry_msgs::PolygonStamped::Cons
     return;
   pending_goal_ = GoalPoint{wp.back().position, goal_yaw_};
   waypoints_ = wp;
-  remaining_waypoints_ = waypoints_;
+  waypoint_consumed_ = 0;
   resetRun();
   planning_requested_ = true;
 }
@@ -544,6 +637,15 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
     }
   }
   publishPose(sample.x(), sample.y(), sample.z(), yaw);
+  // Periodic replan (time-triggered): once the current segment has executed
+  // for replan_period_s and there are still waypoints ahead, request a replan
+  // so replanLoop re-plans from the latest pose with fresh neighbor intents
+  // (upstream fsm/thresh_replan_time semantics).  Arrival still triggers the
+  // next segment; the final segment publishes COMPLETED via checkArrival.
+  if (planning_horizon_ > 0.0 && elapsed >= replan_period_s_ &&
+      waypoint_consumed_ + 1 < waypoints_.size() && !planning_requested_ &&
+      !hold_requested_)
+    planning_requested_ = true;
   if (elapsed >= current_->duration)
     checkArrival(current_->pts.back(), current_->yaw.back(), now);
 }
@@ -566,7 +668,7 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
       arrival_since_ = now;
     if ((now - *arrival_since_).toSec() >= stable_s_)
     {
-      if (planning_horizon_ <= 0.0 || remaining_waypoints_.empty())
+      if (planning_horizon_ <= 0.0 || waypoint_consumed_ + 1 >= waypoints_.size())
       {
         // 最终目标已到达：冻结目标位姿并发布 COMPLETED 终态（executor 判定成功）。
         // steady_target_ 非空时持续发布目标 setpoint 悬停；不再单独切 HOLD，
@@ -633,13 +735,26 @@ void EgoPlannerDriverNode::appendSample(swarm_uav_interfaces::UavTrajectoryInten
   msg.sampled_traj.push_back(pose);
 }
 
+bool EgoPlannerDriverNode::planningRequested() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return planning_requested_;
+}
+
+void EgoPlannerDriverNode::setReplanLoopEnabled(bool enabled)
+{
+  replan_loop_enabled_ = enabled;
+}
+
 void EgoPlannerDriverNode::replanLoop()
 {
   const ros::Duration period(kReplanPeriodS);
-  while (!stop_)
+  while (!stop_ && replan_loop_enabled_)
   {
     period.sleep();
     if (ros::isShuttingDown())
+      break;
+    if (!replan_loop_enabled_)
       break;
     struct Snapshot
     {
@@ -647,6 +762,8 @@ void EgoPlannerDriverNode::replanLoop()
       std::vector<WayPoint> waypoints;
       std::vector<NeighborTrajectory> neighbors;
       ros::Time now;
+      Eigen::Vector3d start_vel = Eigen::Vector3d::Zero();
+      Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
     };
     boost::optional<Snapshot> snap;
     ros::Time completed_at;
@@ -675,6 +792,7 @@ void EgoPlannerDriverNode::replanLoop()
                                             local_pose_->pose.position.y,
                                             local_pose_->pose.position.z);
       data.start.yaw = goal_yaw_;
+      currentDerivatives(data.start_vel, data.start_acc);
       data.waypoints = waypoints_;
       for (const auto& item : inbox_)
       {
@@ -690,7 +808,8 @@ void EgoPlannerDriverNode::replanLoop()
       continue;
     TimedTrajectory traj;
     double cost = 0.0;
-    if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost))
+    if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost,
+                         snap->start_vel, snap->start_acc))
     {
       std::lock_guard<std::mutex> lock(mutex_);
       setState(kStatePlanFailed);

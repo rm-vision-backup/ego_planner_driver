@@ -372,7 +372,9 @@ bool EgoPlannerCore::optimizeControls(double& final_cost)
 bool EgoPlannerCore::planOnce(const GoalPoint& start,
                               const std::vector<WayPoint>& sparse_waypoints,
                               const std::vector<NeighborTrajectory>& neighbors,
-                              TimedTrajectory& out, double& final_cost)
+                              TimedTrajectory& out, double& final_cost,
+                              const Eigen::Vector3d& start_vel,
+                              const Eigen::Vector3d& start_acc)
 {
   if (sparse_waypoints.empty())
   {
@@ -409,6 +411,9 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   }
 
   std::vector<Eigen::Vector3d> start_end_derivative(4, Eigen::Vector3d::Zero());
+  // upstream order: [0]=vel_start, [1]=vel_end, [2]=acc_start, [3]=acc_end
+  start_end_derivative[0] = start_vel;  // start velocity (rolling continuity)
+  start_end_derivative[2] = start_acc;  // start acceleration (rolling continuity)
   Eigen::MatrixXd ctrl_pts;
   ego_planner::UniformBspline::parameterizeToBspline(bspline_interval_, point_set,
                                         start_end_derivative, ctrl_pts);
@@ -427,6 +432,28 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   const int start_id = order_;
   const int end_id = cps_.size;
   variable_num_ = 3 * (end_id - start_id);
+  // Exact-anchor the leading control points so the spline start pose is
+  // exactly start.position.  The B-spline uses uniform (non-clamped) knots,
+  // so at t=0 the de Boor average B(0)=(P0+4P1+P2)/6 holds and the velocity
+  // row of parameterizeToBspline reads (P2-P0)/(2*ts) = start_vel.  The
+  // underlying parameterizeToBspline is an over-determined least-squares
+  // solve (K+2 controls vs K+4 constraints) and dilutes these boundary rows
+  // (measured start velocity came out ~8 m/s regardless of the requested
+  // derivative); re-solving P0..P2 here pins them exactly:
+  //   P0 = pos - vel*ts + acc*ts^2/3
+  //   P1 = pos - acc*ts^2/6
+  //   P2 = pos + vel*ts + acc*ts^2/3
+  // cols 0..2 are never optimized (start_id=3) nor rebound (rebound starts
+  // at i=order_).
+  if (cps_.points.cols() >= 3)
+  {
+    const double ts = bspline_interval_;
+    const double t2 = ts * ts;
+    const Eigen::Vector3d pos = start.position;
+    cps_.points.col(0) = pos - start_vel * ts + start_acc * (t2 / 3.0);
+    cps_.points.col(1) = pos - start_acc * (t2 / 6.0);
+    cps_.points.col(2) = pos + start_vel * ts + start_acc * (t2 / 3.0);
+  }
   if (!optimizeControls(final_cost))
     return false;
 
@@ -444,14 +471,22 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   traj.getTimeSpan(tm, tmp);
   const double duration = std::max(0.0, tmp - tm);
   out.duration = duration;
+  ego_planner::UniformBspline dtraj = traj.getDerivative();
+  double du0 = 0.0, dup = 0.0;
+  // The derivative B-spline drops the first/last knot, so its time span is
+  // shorter than the position trajectory; clamp derivative samples to it.
+  const double t_der_max =
+      (dtraj.getTimeSpan(du0, dup)) ? std::max(0.0, dup - du0 - 1e-3) : duration;
   out.t.clear();
   out.pts.clear();
+  out.vel.clear();
   out.yaw.clear();
 
   const double step = std::max(kSampleStepS, bspline_interval_ * 0.25);
   const int samples = static_cast<int>(std::floor(duration / step)) + 1;
   out.t.reserve(samples);
   out.pts.reserve(samples);
+  out.vel.reserve(samples);
   out.yaw.reserve(samples);
 
   for (int i = 0; i < samples; ++i)
@@ -459,12 +494,14 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     const double t_rel = std::min(duration, static_cast<double>(i) * step);
     out.t.push_back(t_rel);
     out.pts.push_back(traj.evaluateDeBoorT(t_rel));
+    out.vel.push_back(Eigen::Vector3d(dtraj.evaluateDeBoorT(std::min(t_rel, t_der_max))));
     out.yaw.push_back(start.yaw);
   }
   if (out.t.empty())
   {
     out.t.push_back(0.0);
     out.pts.push_back(start.position);
+    out.vel.push_back(Eigen::Vector3d::Zero());
     out.yaw.push_back(start.yaw);
   }
   // Anchor the sampled endpoints to the exact start position and the final

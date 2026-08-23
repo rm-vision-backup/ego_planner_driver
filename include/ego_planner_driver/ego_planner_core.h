@@ -72,6 +72,7 @@ struct TimedTrajectory
   double duration = 0.0;
   std::vector<double> t;                 // relative seconds, dense samples
   std::vector<Eigen::Vector3d> pts;      // global ENU, same length as t
+  std::vector<Eigen::Vector3d> vel;      // B-spline first derivative, same length
   std::vector<double> yaw;               // same length as t
 
   bool sample(double t_rel, Eigen::Vector3d& out) const
@@ -109,11 +110,15 @@ public:
   // Prepares an initial B-spline through the sparse key points, optimizes it
   // with the reciprocal swarm + smoothness + feasibility costs and samples
   // the resulting timed trajectory.  start is the current pose and is
-  // implicitly the first way point.
+  // implicitly the first way point.  start_vel/start_acc are the current
+  // trajectory derivatives (zero for the first segment) so rolling segments
+  // join velocity- and acceleration-continuously (upstream FSM semantics).
   bool planOnce(const GoalPoint& start,
                 const std::vector<WayPoint>& sparse_waypoints,
                 const std::vector<NeighborTrajectory>& neighbors,
-                TimedTrajectory& out, double& final_cost);
+                TimedTrajectory& out, double& final_cost,
+                const Eigen::Vector3d& start_vel = Eigen::Vector3d::Zero(),
+                const Eigen::Vector3d& start_acc = Eigen::Vector3d::Zero());
 
   // Exposes the reciprocal clearance check for tests and gates.
   bool checkClearance(const TimedTrajectory& trajectory,
