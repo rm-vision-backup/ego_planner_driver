@@ -53,6 +53,16 @@
 - `safety_supervisor_mode=off` 完全关闭；`shadow` 仅诊断。阶段 A 若误配 `active`，节点告警并
   降级 `shadow`，禁止伪装成已启用制动闭环。
 
+### 受约束紧急制动（阶段 B）
+
+- 显式配置 `safety_supervisor_mode=active` 后，任一 UAV 进入 `EMERGENCY` 即从当前执行轨迹同刻
+  P/V/A 生成五次多项式停车轨迹；时间伸长直到速度、加速度、jerk 门禁通过。
+- 紧急提交递增 safety generation，常规规划快照提交时校验 generation，晚到结果不能覆盖制动。
+- 对外状态 `EMERGENCY_BRAKE` 表示正在制动；轨迹结束锁存真实制动终点并发布 `BRAKE_HOLD`，
+  executor 将后者收口为失败。制动 intent 继续沿现有 active 语义广播。
+- 生成器异常时立即中止 nominal 并在当前样本位置 fallback HOLD，同时高优先告警；该降级只防止继续
+  nominal，不替代正常受约束制动验收。生产 launch 仍默认 `shadow`，SITL 标定前不默认 active。
+
 ## min-snap 统一单段重构（26082415）
 
 - 上层 `EgoSwarmDriver` 把分层关键点（start + 层点 + 弓字转折 + 目标）按最大 **2m** 间距密化后

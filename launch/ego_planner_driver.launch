@@ -58,6 +58,9 @@
     <param name="safety_compute_budget_s" value="0.05"/>
     <param name="peer_data_age_cap_s" value="2.0"/>
     <param name="emergency_decel_mps2" value="2.0"/>
+    <param name="emergency_jerk_mps3" value="8.0"/>
+    <param name="emergency_max_velocity_mps" value="1.5"/>
+    <param name="emergency_sample_period_s" value="0.02"/>
     <param name="warning_buffer_m" value="0.35"/>
     <param name="emergency_buffer_m" value="0.10"/>
     <param name="warning_ttc_s" value="3.0"/>

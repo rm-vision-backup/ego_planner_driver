@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 #include "ego_planner_driver/ego_planner_core.h"
+#include "ego_planner_driver/emergency_brake.h"
 #include "ego_planner_driver/safety_logger.h"
 #include "ego_planner_driver/safety_predictor.h"
 
@@ -43,6 +44,8 @@ static constexpr const char* kStatePoseStale = "POSE_STALE";
 static constexpr const char* kStatePlanFailed = "EGO_PLAN_FAILED";
 static constexpr const char* kStateExecTimeout = "EGO_EXEC_TIMEOUT";
 static constexpr const char* kStateTakeoff = "TAKEOFF";
+static constexpr const char* kStateEmergencyBrake = "EMERGENCY_BRAKE";
+static constexpr const char* kStateBrakeHold = "BRAKE_HOLD";
 
 constexpr double kSetpointRateHz = 30.0;
 constexpr double kNeighborStaleS = 5.0;
@@ -195,9 +198,12 @@ private:
   double episode_release_hysteresis_s_ = 1.0;
   SafetyPredictorConfig safety_config_;
   std::unique_ptr<SafetyPredictor> safety_predictor_;
+  std::unique_ptr<EmergencyBrakeGenerator> emergency_brake_generator_;
   SafetyLogger safety_logger_;
   ConflictEpisode conflict_episode_;
   SafetyPrediction last_safety_prediction_;
+  uint64_t safety_generation_ = 0;
+  bool emergency_braking_ = false;
 
   bool armed_ = false;
   bool offboard_ = false;

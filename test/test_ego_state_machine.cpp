@@ -162,6 +162,44 @@ TEST(EgoStateMachine, ShadowSafetyTickDoesNotChangeFlightBehavior)
   EXPECT_EQ(node.lastSafetyPrediction().pairs.size(), 1u);
 }
 
+TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setSafetySupervisorModeForTest("active");
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+
+  auto peer = makeIntent(100.0, 1, "A02");
+  peer.t = {0.0, 5.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 0.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+  node.safetySupervisorTick();
+  ASSERT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+  const auto braking = node.currentTrajectory();
+  ASSERT_TRUE(braking);
+  ASSERT_GT(braking->duration, 0.0);
+
+  while (clock.get() <= 100.0 + braking->duration + 0.1)
+  {
+    node.publishSetpointTick();
+    clock.advance(0.02);
+  }
+  node.publishSetpointTick();
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
+  const auto hold = node.steadyTarget();
+  ASSERT_TRUE(hold);
+  EXPECT_LT((hold->pos - braking->pts.back()).norm(), 1e-8);
+  EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
+}
+
 TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
 {
   FakeClock clock;

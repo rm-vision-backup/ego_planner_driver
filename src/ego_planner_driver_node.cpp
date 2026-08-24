@@ -69,19 +69,21 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   episode_release_hysteresis_s_ = pnh_.param(
       "safety_episode_release_s", 1.0);
   safety_predictor_.reset(new SafetyPredictor(safety_config_));
-  if (safety_supervisor_mode_ == "active")
-  {
-    ROS_ERROR("[%s] active safety supervisor is unavailable in stage A; using shadow",
-              uav_id_.c_str());
-    safety_supervisor_mode_ = "shadow";
-  }
-  if (safety_supervisor_mode_ != "off" && safety_supervisor_mode_ != "shadow")
+  EmergencyBrakeConfig brake_config;
+  brake_config.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
+  brake_config.max_acceleration_mps2 = config.max_acc;
+  brake_config.max_jerk_mps3 = pnh_.param("emergency_jerk_mps3", 8.0);
+  brake_config.nominal_deceleration_mps2 = safety_config_.emergency_decel_mps2;
+  brake_config.sample_period_s = pnh_.param("emergency_sample_period_s", 0.02);
+  emergency_brake_generator_.reset(new EmergencyBrakeGenerator(brake_config));
+  if (safety_supervisor_mode_ != "off" && safety_supervisor_mode_ != "shadow" &&
+      safety_supervisor_mode_ != "active")
   {
     ROS_ERROR("[%s] invalid safety_supervisor_mode=%s; disabling supervisor",
               uav_id_.c_str(), safety_supervisor_mode_.c_str());
     safety_supervisor_mode_ = "off";
   }
-  if (safety_supervisor_mode_ == "shadow")
+  if (safety_supervisor_mode_ != "off")
   {
     std::string identity = exec_target_;
     if (identity.empty())
@@ -201,6 +203,7 @@ bool EgoPlannerDriverNode::replanOnce()
     Eigen::Vector3d start_vel = Eigen::Vector3d::Zero();
     Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
     bool final_segment = false;
+    uint64_t safety_generation = 0;
   };
   boost::optional<Snapshot> snap;
   ros::Time completed_at;
@@ -227,6 +230,7 @@ bool EgoPlannerDriverNode::replanOnce()
     }
     Snapshot data;
     data.now = now;
+    data.safety_generation = safety_generation_;
     data.start.yaw = goal_yaw_;
     // 滚动重规划：从旧轨迹同一时刻取完整 P/V/A/yaw 作为新段起点（原版 FSM
     // 语义），避免"实际位置 + 旧导数"组合在切段时产生位置跳变与速度纹波。
@@ -322,6 +326,8 @@ bool EgoPlannerDriverNode::replanOnce()
     std::lock_guard<std::mutex> lock(mutex_);
     if (hold_requested_)
       return true;
+    if (emergency_braking_ || snap->safety_generation != safety_generation_)
+      return false;
     const std::vector<NeighborTrajectory> commit_neighbors = rebaseNeighbors(
         freshAbsoluteNeighborsLocked(completed_at), completed_at);
     if (!core_->checkClearance(traj, commit_neighbors,
@@ -451,7 +457,7 @@ void EgoPlannerDriverNode::safetySupervisorTick()
 void EgoPlannerDriverNode::setSafetySupervisorModeForTest(const std::string& mode)
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  safety_supervisor_mode_ = mode == "shadow" ? "shadow" : "off";
+  safety_supervisor_mode_ = (mode == "shadow" || mode == "active") ? mode : "off";
 }
 
 SafetyPrediction EgoPlannerDriverNode::lastSafetyPrediction() const
@@ -695,6 +701,7 @@ void EgoPlannerDriverNode::resetRun()
   // trajectory state (sampleCurrentState guards on current_).
   current_.reset();
   plan_start_ = ros::Time(0);
+  emergency_braking_ = false;
 }
 
 void EgoPlannerDriverNode::setState(const std::string& state)
@@ -876,7 +883,18 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
       planning_requested_ = true;
   }
   if (elapsed >= current_->duration)
+  {
+    if (emergency_braking_)
+    {
+      steady_target_ = HoldTarget{current_->pts.back(), current_->yaw.back()};
+      current_.reset();
+      plan_start_ = ros::Time(0);
+      emergency_braking_ = false;
+      setState(kStateBrakeHold);
+      return;
+    }
     checkArrival(current_->pts.back(), current_->yaw.back(), now);
+  }
 }
 
 std::vector<PeerTrajectoryInput> EgoPlannerDriverNode::safetyPeersLocked() const
@@ -916,7 +934,7 @@ std::string EgoPlannerDriverNode::formatSafetyLog(
          << " level=" << SafetyPredictor::levelName(prediction.level)
          << " primary_peer=" << prediction.primary_peer_id
          << " episode=" << (conflict_episode_.active() ? "active" : "none")
-         << " action=SHADOW_ONLY";
+         << " action=" << (safety_supervisor_mode_ == "active" ? "ACTIVE_GATE" : "SHADOW_ONLY");
   for (const PairPrediction& pair : prediction.pairs)
   {
     stream << " peer={id:" << pair.peer_id
@@ -965,6 +983,48 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
     line = formatSafetyLog(prediction, now);
   }
   safety_logger_.enqueue(line);
+  if (safety_supervisor_mode_ != "active" ||
+      prediction.level != SafetyLevel::EMERGENCY)
+    return;
+
+  TrajectorySample start;
+  if (!self->samplePVA(std::max(0.0, now.toSec() - activation.toSec()), start))
+    return;
+  TimedTrajectory braking;
+  if (!emergency_brake_generator_ ||
+      !emergency_brake_generator_->generate(start, braking))
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (current_ && plan_start_ == activation)
+    {
+      ++safety_generation_;
+      planning_requested_ = false;
+      current_.reset();
+      plan_start_ = ros::Time(0);
+      emergency_braking_ = false;
+      steady_target_ = HoldTarget{start.pos, start.yaw};
+      setState(kStateBrakeHold);
+    }
+    ROS_ERROR("[%s] emergency brake generation failed; nominal aborted to fallback HOLD",
+              uav_id_.c_str());
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (emergency_braking_ || !current_ || plan_start_ != activation)
+      return;
+    ++safety_generation_;
+    planning_requested_ = false;
+    current_.reset(new TimedTrajectory(braking));
+    plan_start_ = now;
+    arrival_since_.reset();
+    steady_target_.reset();
+    emergency_braking_ = true;
+    setState(kStateEmergencyBrake);
+    publishIntent(braking, now);
+    ROS_ERROR("[%s] emergency brake committed for peer=%s",
+              uav_id_.c_str(), prediction.primary_peer_id.c_str());
+  }
 }
 
 void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double yaw,
