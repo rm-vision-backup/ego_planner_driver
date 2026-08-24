@@ -162,6 +162,7 @@ private:
   double timeout_margin_ = 5.0;
   double planning_horizon_ = 0.0;
   double replan_period_s_ = 1.0;
+  double no_replan_thresh_m_ = 1.0;
   bool direct_control_active_ = false;
   volatile bool replan_loop_enabled_ = true;
 

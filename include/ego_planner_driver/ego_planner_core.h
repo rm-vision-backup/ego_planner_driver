@@ -29,6 +29,9 @@ struct EgoPlannerConfig
   double ts = 0.4;              // B-spline knot span (s)
   double max_vel = 8.0;         // m/s
   double max_acc = 6.0;         // m/s^2
+  // Permitted ratio by which vel/acc may exceed limits before time reparam
+  // triggers (upstream fsm: manager/feasibility_tolerance = 0.05).
+  double feasibility_tolerance = 0.05;
   // Receding-horizon planning range [m]: only the waypoints ahead of the
   // current pose within planning_horizon are parameterized per plan, aligned
   // with upstream ego-planner-swarm. <= 0 plans the full route at once

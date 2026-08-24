@@ -522,6 +522,17 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     reboundFromNeighbors(neighbors_, point_set, config_.swarm_clearance * 2.0);
 
   ego_planner::UniformBspline traj(cps_.points, order_, bspline_interval_);
+  // STEP 3 (upstream planner_manager): hard-cap velocity/acceleration by
+  // reallocating time.  When the optimized spline exceeds max_vel/max_acc,
+  // lengthen the middle knot span so the trajectory speed profile is pulled
+  // back to the physical limits (per-axis, upstream feasibility_tolerance).
+  // The start/end knot spans are left untouched so the pinned start
+  // derivatives (start_vel/start_acc) remain valid.
+  traj.setPhysicalLimits(config_.max_vel, config_.max_acc,
+                         config_.feasibility_tolerance);
+  double fea_ratio = 1.0;
+  if (!traj.checkFeasibility(fea_ratio))
+    traj.lengthenTime(fea_ratio);
   double tm, tmp;
   traj.getTimeSpan(tm, tmp);
   const double duration = std::max(0.0, tmp - tm);

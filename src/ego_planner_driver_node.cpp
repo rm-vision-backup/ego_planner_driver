@@ -26,6 +26,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   core_.reset(new EgoPlannerCore(config));
   planning_horizon_ = config.planning_horizon;
   replan_period_s_ = pnh_.param("replan_period_s", 1.0);
+  no_replan_thresh_m_ = pnh_.param("no_replan_thresh_m", 1.0);
   setpoint_topic_ = pnh_.param("setpoint_out_topic", std::string("setpoint/ego"));
   frame_id_ = pnh_.param("frame_id", std::string("map"));
   // Identity parameters live in the public namespace (/UAV1/*) so the
@@ -177,15 +178,15 @@ bool EgoPlannerDriverNode::replanOnce()
     // 滚动窗口推进用"实际位置"（真实进度感知），规划起点用旧轨迹状态
     // （连续性）——两者职责分离。若窗口也用旧轨迹期望位置推进，每 1s 换段
     // 时期望位置总在下降段中段，waypoint_consumed_ 会卡住，checkArrival 永不
-    // 触发。飞机进入最终目标容差后直接退化规划完整剩余航点，保证最后一段
-    // 的轨迹终点=目标，轨迹执行完即触发 COMPLETED。
+    // 触发。飞机进入最终目标 no_replan_thresh_m 后停止时间重规划并退化规划
+    // 完整剩余航点，保证最后一段轨迹终点=目标，轨迹执行完即触发 COMPLETED。
     if (planning_horizon_ > 0.0)
     {
       const Eigen::Vector3d live_pos(local_pose_->pose.position.x,
                                      local_pose_->pose.position.y,
                                      local_pose_->pose.position.z);
       const bool near_final = !waypoints_.empty() &&
-          (live_pos - waypoints_.back().position).norm() <= pos_tol_;
+          (live_pos - waypoints_.back().position).norm() <= no_replan_thresh_m_;
       if (near_final)
       {
         data.waypoints = std::vector<WayPoint>(
@@ -681,7 +682,7 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
   const bool near_final = !waypoints_.empty() && local_pose_ &&
       (Eigen::Vector3d(local_pose_->pose.position.x, local_pose_->pose.position.y,
                        local_pose_->pose.position.z) -
-       waypoints_.back().position).norm() <= pos_tol_;
+       waypoints_.back().position).norm() <= no_replan_thresh_m_;
   if (planning_horizon_ > 0.0 && !planning_requested_ && !hold_requested_ &&
       waypoint_consumed_ + 1 < waypoints_.size() && !near_final)
   {
@@ -865,7 +866,7 @@ void EgoPlannerDriverNode::replanLoop()
                                        local_pose_->pose.position.y,
                                        local_pose_->pose.position.z);
         const bool near_final = !waypoints_.empty() &&
-            (live_pos - waypoints_.back().position).norm() <= pos_tol_;
+            (live_pos - waypoints_.back().position).norm() <= no_replan_thresh_m_;
         if (near_final)
         {
           // 飞机已进入最终目标容差：退化规划完整剩余航点（含目标），并让

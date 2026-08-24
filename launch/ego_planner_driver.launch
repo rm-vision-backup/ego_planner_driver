@@ -11,6 +11,7 @@
 
   <node pkg="ego_planner_driver" type="ego_planner_driver_node" name="ego_planner_driver" output="screen">
     <param name="frame_id" value="map"/>
+    <!-- B-spline knot span: upstream ctrl_pt_dist/max_vel*1.5 = 0.4/1.0*1.5 = 0.6 s -->
     <param name="ts" value="0.4"/>
     <param name="max_vel" value="1.0"/>
     <param name="max_acc" value="6.0"/>
@@ -18,6 +19,9 @@
          对齐原版 ego-planner-swarm receding-horizon；0 表示全局规划（退化）。 -->
     <param name="planning_horizon" value="5.0"/>
     <param name="replan_period_s" value="1.0"/>
+    <!-- 最终目标附近（no_replan_thresh_m 内）停止时间触发重规划，让最后一段
+         轨迹自然减速走完（对齐原版 fsm/thresh_no_replan_meter） -->
+    <param name="no_replan_thresh_m" value="1.0"/>
     <!-- 候选 setpoint 话题（PositionTarget，relay 唯一出口，业务层不改 MAVROS 话题） -->
     <param name="setpoint_out_topic" value="/setpoint/ego"/>
     <!-- Per-aircraft clearance radius; reciprocal hard center spacing is 2x. -->
