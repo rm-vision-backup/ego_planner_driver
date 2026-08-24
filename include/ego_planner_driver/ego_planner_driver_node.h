@@ -46,6 +46,7 @@ static constexpr const char* kStateExecTimeout = "EGO_EXEC_TIMEOUT";
 static constexpr const char* kStateTakeoff = "TAKEOFF";
 static constexpr const char* kStateEmergencyBrake = "EMERGENCY_BRAKE";
 static constexpr const char* kStateBrakeHold = "BRAKE_HOLD";
+static constexpr const char* kStateNegotiating = "NEGOTIATING";
 
 constexpr double kSetpointRateHz = 30.0;
 constexpr double kNeighborStaleS = 5.0;
@@ -99,6 +100,7 @@ public:
   void publishSetpointTick();
   void safetySupervisorTick();
   void setSafetySupervisorModeForTest(const std::string& mode);
+  void setIntentNegotiationWaitForTest(double seconds);
   SafetyPrediction lastSafetyPrediction() const;
   std::string execState() const;
   boost::optional<HoldTarget> steadyTarget() const;
@@ -171,6 +173,9 @@ private:
   void processHoldLocked();
   void handleMavrosStateEdgeLocked();
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base);
+  void publishIntent(const TimedTrajectory& traj, const ros::Time& base,
+                     uint8_t phase);
+  bool activateTentativeLocked(const ros::Time& now);
   static void appendSample(swarm_uav_interfaces::UavTrajectoryIntent& msg,
                            const TimedTrajectory& traj, size_t i);
   void replanLoop();
@@ -204,6 +209,10 @@ private:
   SafetyPrediction last_safety_prediction_;
   uint64_t safety_generation_ = 0;
   bool emergency_braking_ = false;
+  double intent_negotiation_wait_s_ = 1.0;
+  std::shared_ptr<TimedTrajectory> tentative_;
+  ros::Time tentative_created_;
+  uint64_t tentative_generation_ = 0;
 
   bool armed_ = false;
   bool offboard_ = false;
@@ -263,6 +272,7 @@ private:
   // new sequence generation, allowing process restarts and int32 wraparound.
   std::map<std::string, std::pair<double, int32_t>> latest_neighbor_version_;
   std::map<std::string, std::pair<NeighborTrajectory, ros::Time>> inbox_;
+  std::map<std::string, uint8_t> neighbor_phase_;
 };
 
 }  // namespace ego_planner_driver

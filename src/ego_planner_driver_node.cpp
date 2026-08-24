@@ -68,6 +68,8 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
       "minimum_prediction_window_s", 0.25);
   episode_release_hysteresis_s_ = pnh_.param(
       "safety_episode_release_s", 1.0);
+  intent_negotiation_wait_s_ = std::max(0.0,
+      pnh_.param("intent_negotiation_wait_s", 0.0));
   safety_predictor_.reset(new SafetyPredictor(safety_config_));
   EmergencyBrakeConfig brake_config;
   brake_config.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
@@ -337,6 +339,20 @@ bool EgoPlannerDriverNode::replanOnce()
       setState(kStatePlanFailed);
       return false;
     }
+    // First candidate enters a bounded negotiation window. It is broadcast but
+    // never assigned to current_, so setpoint publication cannot execute it.
+    if (!current_ && intent_negotiation_wait_s_ > 0.0)
+    {
+      tentative_.reset(new TimedTrajectory(traj));
+      tentative_created_ = completed_at;
+      tentative_generation_ = safety_generation_;
+      arrival_since_.reset();
+      steady_target_.reset();
+      setState(kStateNegotiating);
+      publishIntent(traj, completed_at,
+                    swarm_uav_interfaces::UavTrajectoryIntent::PHASE_TENTATIVE);
+      return true;
+    }
     // The freshly generated trajectory owns a relative time axis beginning at
     // zero. Planning latency is represented exactly once by this activation
     // epoch; it must never be added to relative samples or duration.
@@ -460,6 +476,12 @@ void EgoPlannerDriverNode::setSafetySupervisorModeForTest(const std::string& mod
   safety_supervisor_mode_ = (mode == "shadow" || mode == "active") ? mode : "off";
 }
 
+void EgoPlannerDriverNode::setIntentNegotiationWaitForTest(double seconds)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  intent_negotiation_wait_s_ = std::max(0.0, seconds);
+}
+
 SafetyPrediction EgoPlannerDriverNode::lastSafetyPrediction() const
 {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -540,7 +562,13 @@ void EgoPlannerDriverNode::onNeighborIntent(
 bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
     const swarm_uav_interfaces::UavTrajectoryIntent& msg, const ros::Time& now)
 {
-  if (msg.protocol_version != "1.0" || msg.uav_id.empty() ||
+  const bool legacy = msg.protocol_version == "1.0";
+  const bool current_protocol = msg.protocol_version == "2.0";
+  const bool valid_phase = legacy ||
+      msg.phase == swarm_uav_interfaces::UavTrajectoryIntent::PHASE_TENTATIVE ||
+      msg.phase == swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE ||
+      msg.phase == swarm_uav_interfaces::UavTrajectoryIntent::PHASE_BRAKING;
+  if ((!legacy && !current_protocol) || !valid_phase || msg.uav_id.empty() ||
       msg.uav_id == uav_id_ || msg.exec_target.empty() ||
       msg.frame_id != frame_id_ || !std::isfinite(msg.stamp) ||
       !std::isfinite(msg.clearance) || msg.clearance <= 0.0 ||
@@ -591,6 +619,8 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
                         msg.sampled_traj[i].position.z);
   }
   inbox_[msg.uav_id] = std::make_pair(nb, now);
+  neighbor_phase_[msg.uav_id] = legacy
+      ? swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE : msg.phase;
   latest_neighbor_version_[msg.uav_id] = std::make_pair(msg.stamp, msg.traj_id);
   // Avoid reciprocal intent ping-pong: a new version only requests replanning
   // when it invalidates the trajectory currently being executed. With no
@@ -602,6 +632,13 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
     if (!core_->checkClearance(*current_, {relative},
                                core_->config().swarm_clearance * 2.0))
       planning_requested_ = true;
+  }
+  else if (tentative_)
+  {
+    // A newly arrived peer changes negotiation evidence. Discard candidate and
+    // regenerate against latest inbox; no tentative setpoint was ever emitted.
+    tentative_.reset();
+    planning_requested_ = true;
   }
   return true;
 }
@@ -702,6 +739,8 @@ void EgoPlannerDriverNode::resetRun()
   current_.reset();
   plan_start_ = ros::Time(0);
   emergency_braking_ = false;
+  tentative_.reset();
+  tentative_created_ = ros::Time(0);
 }
 
 void EgoPlannerDriverNode::setState(const std::string& state)
@@ -822,6 +861,12 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
   {
     publishPositionTarget(steady_target_->pos.x(), steady_target_->pos.y(),
                           steady_target_->pos.z(), steady_target_->yaw, kMaskHold);
+    return;
+  }
+  if (tentative_)
+  {
+    if ((now - tentative_created_).toSec() >= intent_negotiation_wait_s_)
+      activateTentativeLocked(now);
     return;
   }
   if (!current_ || current_->pts.empty())
@@ -1021,7 +1066,8 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
     steady_target_.reset();
     emergency_braking_ = true;
     setState(kStateEmergencyBrake);
-    publishIntent(braking, now);
+    publishIntent(braking, now,
+                  swarm_uav_interfaces::UavTrajectoryIntent::PHASE_BRAKING);
     ROS_ERROR("[%s] emergency brake committed for peer=%s",
               uav_id_.c_str(), prediction.primary_peer_id.c_str());
   }
@@ -1094,8 +1140,15 @@ void EgoPlannerDriverNode::processHoldLocked()
 
 void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros::Time& base)
 {
+  publishIntent(traj, base, swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+}
+
+void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj,
+                                         const ros::Time& base, uint8_t phase)
+{
   swarm_uav_interfaces::UavTrajectoryIntent msg;
-  msg.protocol_version = "1.0";
+  msg.protocol_version = "2.0";
+  msg.phase = phase;
   msg.uav_id = uav_id_;
   msg.exec_target = exec_target_;
   msg.frame_id = frame_id_;
@@ -1108,6 +1161,31 @@ void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros:
   if (!traj.pts.empty() && (traj.pts.size() - 1) % step != 0)
     appendSample(msg, traj, traj.pts.size() - 1);
   intent_pub_.publish(msg);
+}
+
+bool EgoPlannerDriverNode::activateTentativeLocked(const ros::Time& now)
+{
+  if (!tentative_ || tentative_generation_ != safety_generation_)
+    return false;
+  const std::vector<NeighborTrajectory> neighbors = rebaseNeighbors(
+      freshAbsoluteNeighborsLocked(now), now);
+  if (!core_->checkClearance(*tentative_, neighbors,
+                             core_->config().swarm_clearance * 2.0))
+  {
+    tentative_.reset();
+    captureHoldTargetLocked(now);
+    setState(kStatePlanFailed);
+    return false;
+  }
+  current_ = tentative_;
+  tentative_.reset();
+  plan_start_ = now;
+  arrival_since_.reset();
+  steady_target_.reset();
+  setState(kStateExecuting);
+  publishIntent(*current_, now,
+                swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+  return true;
 }
 
 void EgoPlannerDriverNode::appendSample(swarm_uav_interfaces::UavTrajectoryIntent& msg,

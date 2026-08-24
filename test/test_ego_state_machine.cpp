@@ -200,6 +200,75 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
   EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
 }
 
+TEST(EgoStateMachine, TentativeIntentWaitsWithoutPublishingTrajectorySetpoint)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIntentNegotiationWaitForTest(1.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  const size_t before = node.setpointCount();
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateNegotiating);
+  EXPECT_FALSE(node.currentTrajectory());
+  node.publishSetpointTick();
+  EXPECT_EQ(node.setpointCount(), before);
+
+  clock.advance(0.99);
+  node.publishSetpointTick();
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateNegotiating);
+  EXPECT_FALSE(node.currentTrajectory());
+  clock.advance(0.02);
+  node.publishSetpointTick();
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  EXPECT_TRUE(node.currentTrajectory());
+}
+
+TEST(EgoStateMachine, NewPeerIntentInvalidatesTentativeForReevaluation)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIntentNegotiationWaitForTest(1.0);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), ego_planner_driver::kStateNegotiating);
+  auto peer = makeIntent(100.0);
+  peer.protocol_version = "2.0";
+  peer.phase = swarm_uav_interfaces::UavTrajectoryIntent::PHASE_TENTATIVE;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+  EXPECT_TRUE(node.planningRequested());
+  clock.advance(1.1);
+  node.publishSetpointTick();
+  EXPECT_FALSE(node.currentTrajectory());
+}
+
+TEST(EgoStateMachine, IntentPhaseProtocolKeepsLegacyActiveOnly)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  auto legacy = makeIntent(100.0);
+  legacy.phase = swarm_uav_interfaces::UavTrajectoryIntent::PHASE_UNKNOWN;
+  EXPECT_TRUE(node.injectNeighborIntent(legacy));
+  auto invalid = makeIntent(100.1, 2);
+  invalid.protocol_version = "2.0";
+  invalid.phase = 99;
+  EXPECT_FALSE(node.injectNeighborIntent(invalid));
+  auto active = makeIntent(100.1, 2);
+  active.protocol_version = "2.0";
+  active.phase = swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE;
+  EXPECT_TRUE(node.injectNeighborIntent(active));
+}
+
 TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
 {
   FakeClock clock;

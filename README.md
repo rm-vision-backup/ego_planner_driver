@@ -63,6 +63,15 @@
 - 生成器异常时立即中止 nominal 并在当前样本位置 fallback HOLD，同时高优先告警；该降级只防止继续
   nominal，不替代正常受约束制动验收。生产 launch 仍默认 `shadow`，SITL 标定前不默认 active。
 
+### Intent 协商屏障（阶段 C）
+
+- `UavTrajectoryIntent` 协议 2.0 增加 `TENTATIVE/ACTIVE/BRAKING` phase。首个 nominal 候选只广播
+  tentative，不写 `current_`；生产配置最多等待 1s，期间不发布轨迹 setpoint。
+- 新 peer intent 到达会丢弃 tentative 并按最新 inbox 重算；超时后不等待从未出现的邻机，commit-lock
+  hard-clearance 通过才激活。协议 1.0 数据仅按旧 ACTIVE 语义接收。
+- ROS1 `.msg` 变更会改变 MD5；部署必须同批重建 interfaces、planner、executor 和 bridge，不能混跑
+  新旧二进制。bridge 仍只做 ROS 原生序列化透传，不理解 phase 业务。
+
 ## min-snap 统一单段重构（26082415）
 
 - 上层 `EgoSwarmDriver` 把分层关键点（start + 层点 + 弓字转折 + 目标）按最大 **2m** 间距密化后
