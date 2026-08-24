@@ -18,7 +18,10 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.planning_range = pnh_.param("planning_range", 30.0);
   config.lambda_smooth = pnh_.param("lambda_smooth", 1.0);
   config.lambda_swarm = pnh_.param("lambda_swarm", 1.0);
-  config.swarm_rebound = pnh_.param("swarm_rebound", true);
+  config.enable_rebound = pnh_.param("enable_rebound", false);
+  config.enable_time_reparam = pnh_.param("enable_time_reparam", false);
+  config.cruise_velocity = pnh_.param("cruise_velocity", 1.0);
+  config.acceleration_limit = pnh_.param("acceleration_limit", 2.0);
   config.lambda_feasibility = pnh_.param("lambda_feasibility", 1.0);
   config.max_iterations = pnh_.param("max_iterations", 200);
   config.mem_size = pnh_.param("mem_size", 16);
@@ -133,6 +136,7 @@ bool EgoPlannerDriverNode::replanOnce()
     ros::Time now;
     Eigen::Vector3d start_vel = Eigen::Vector3d::Zero();
     Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
+    bool final_segment = false;
   };
   boost::optional<Snapshot> snap;
   ros::Time completed_at;
@@ -180,12 +184,13 @@ bool EgoPlannerDriverNode::replanOnce()
     // 时期望位置总在下降段中段，waypoint_consumed_ 会卡住，checkArrival 永不
     // 触发。飞机进入最终目标 no_replan_thresh_m 后停止时间重规划并退化规划
     // 完整剩余航点，保证最后一段轨迹终点=目标，轨迹执行完即触发 COMPLETED。
+    bool near_final = false;
     if (planning_horizon_ > 0.0)
     {
       const Eigen::Vector3d live_pos(local_pose_->pose.position.x,
                                      local_pose_->pose.position.y,
                                      local_pose_->pose.position.z);
-      const bool near_final = !waypoints_.empty() &&
+      near_final = !waypoints_.empty() &&
           (live_pos - waypoints_.back().position).norm() <= no_replan_thresh_m_;
       if (near_final)
       {
@@ -202,6 +207,11 @@ bool EgoPlannerDriverNode::replanOnce()
             waypoints_, planning_horizon_, live_pos, waypoint_consumed_);
       }
     }
+    // 最终段判定：已进入最终目标容差、或全局规划（horizon<=0）、或窗口内
+    // 已无更多航点 -> 本段末端静止（end_vel=0）。其余巡航段 end_vel 保持
+    // 切线巡航速度，保证滚动段间速度连续。
+    data.final_segment = near_final || planning_horizon_ <= 0.0 ||
+        waypoint_consumed_ + 1 >= waypoints_.size();
     for (const auto& item : inbox_)
     {
       if ((now - item.second.second).toSec() > kNeighborStaleS)
@@ -217,7 +227,7 @@ bool EgoPlannerDriverNode::replanOnce()
   TimedTrajectory traj;
   double cost = 0.0;
   if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost,
-                       snap->start_vel, snap->start_acc))
+                       snap->start_vel, snap->start_acc, snap->final_segment))
   {
     std::lock_guard<std::mutex> lock(mutex_);
     captureHoldTargetLocked(nowFunc());
@@ -817,6 +827,7 @@ void EgoPlannerDriverNode::replanLoop()
       ros::Time now;
       Eigen::Vector3d start_vel = Eigen::Vector3d::Zero();
       Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
+      bool final_segment = false;
     };
     boost::optional<Snapshot> snap;
     ros::Time completed_at;
@@ -860,12 +871,13 @@ void EgoPlannerDriverNode::replanLoop()
       // （连续性）——两者职责分离（见 replanOnce 同款说明）。一次规划完整
       // 航线（120+ 点）会让 B-spline 参数化把长水平段压缩在起点附近，必须
       // 滚动窗口逐段推进。
+      bool near_final = false;
       if (planning_horizon_ > 0.0)
       {
         const Eigen::Vector3d live_pos(local_pose_->pose.position.x,
                                        local_pose_->pose.position.y,
                                        local_pose_->pose.position.z);
-        const bool near_final = !waypoints_.empty() &&
+        near_final = !waypoints_.empty() &&
             (live_pos - waypoints_.back().position).norm() <= no_replan_thresh_m_;
         if (near_final)
         {
@@ -893,6 +905,9 @@ void EgoPlannerDriverNode::replanLoop()
           }
         }
       }
+      // 最终段判定（同 replanOnce）：近目标 / 全局规划 / 窗口无更多航点。
+      data.final_segment = near_final || planning_horizon_ <= 0.0 ||
+          waypoint_consumed_ + 1 >= waypoints_.size();
       for (const auto& item : inbox_)
       {
         if ((now - item.second.second).toSec() > kNeighborStaleS)
@@ -908,7 +923,7 @@ void EgoPlannerDriverNode::replanLoop()
     TimedTrajectory traj;
     double cost = 0.0;
     if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost,
-                         snap->start_vel, snap->start_acc))
+                         snap->start_vel, snap->start_acc, snap->final_segment))
     {
       std::lock_guard<std::mutex> lock(mutex_);
       setState(kStatePlanFailed);

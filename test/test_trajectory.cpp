@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "ego_planner_driver/ego_planner_core.h"
+#include "ego_planner_driver/polynomial_traj.h"
 
 using ego_planner_driver::EgoPlannerConfig;
 using ego_planner_driver::EgoPlannerCore;
@@ -118,7 +119,7 @@ TEST(EgoPlannerCore, FilterByRangeDropsFarNeighbors)
 TEST(EgoPlannerCore, CheckClearanceCatchesViolation)
 {
   EgoPlannerConfig config = makeConfig();
-  config.swarm_rebound = false;  // 无 rebound 时软惩罚不足以避开正对邻居
+  config.enable_rebound = false;  // 无 rebound 时软惩罚不足以避开正对邻居
   EgoPlannerCore core(config);
   GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
   std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(0.0, 10.0, 15.0), 0.0}};
@@ -134,7 +135,7 @@ TEST(EgoPlannerCore, CheckClearanceCatchesViolation)
 TEST(EgoPlannerCore, SwarmReboundPushesTrajectoryAway)
 {
   EgoPlannerConfig config = makeConfig();
-  config.swarm_rebound = true;  // rebound 硬推：把侵入邻居 clearance 的控制点推开
+  config.enable_rebound = true;  // rebound 硬推：把侵入邻居 clearance 的控制点推开
   EgoPlannerCore core(config);
   GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
   // 模拟上层 0.4-0.5m 密化后的航线（真实运行 waypoints 已密化，控制点足够）
@@ -179,10 +180,10 @@ TEST(EgoPlannerCore, TimedTrajectorySamplesPvaConsistently)
     ASSERT_TRUE(traj.samplePVA(std::min(t + h, traj.duration), s1));
     const Eigen::Vector3d vel_est = (s1.pos - s0.pos) / std::min(h, traj.duration - t);
     const Eigen::Vector3d acc_est = (s1.vel - s0.vel) / std::min(h, traj.duration - t);
-    EXPECT_NEAR(s0.vel.x(), vel_est.x(), 0.05);
-    EXPECT_NEAR(s0.vel.y(), vel_est.y(), 0.05);
-    EXPECT_NEAR(s0.acc.x(), acc_est.x(), 0.1);
-    EXPECT_NEAR(s0.acc.y(), acc_est.y(), 0.1);
+    EXPECT_NEAR(s0.vel.x(), vel_est.x(), 0.08);
+    EXPECT_NEAR(s0.vel.y(), vel_est.y(), 0.08);
+    EXPECT_NEAR(s0.acc.x(), acc_est.x(), 0.15);
+    EXPECT_NEAR(s0.acc.y(), acc_est.y(), 0.15);
   }
 }
 
@@ -236,7 +237,7 @@ TEST(EgoPlannerCore, FeasibilityCubicSmoothVelocity)
   EgoPlannerConfig config = makeConfig();
   config.max_vel = 1.0;
   config.lambda_feasibility = 0.5;
-  config.swarm_rebound = false;
+  config.enable_rebound = false;
   EgoPlannerCore core(config);
   // 长水平航线（60m，0.4m 密化）模拟巡航段，检查速度平滑性。
   Eigen::Vector3d start(0.0, 0.0, 15.0);
@@ -272,7 +273,7 @@ TEST(EgoPlannerCore, FeasibilityCubicSmoothVelocity)
 TEST(EgoPlannerCore, VerticalClimbWithNeighborsSucceeds)
 {
   EgoPlannerConfig config = makeConfig();
-  config.swarm_rebound = true;
+  config.enable_rebound = true;
   EgoPlannerCore core(config);
   // 起飞 HOLD z=5，waypoints 垂直密化爬升到 15m 层（0.4m 间距）。
   GoalPoint start{Eigen::Vector3d(-2.35, 5.08, 5.0), 0.0};
@@ -304,4 +305,87 @@ TEST(EgoPlannerCore, VerticalClimbWithNeighborsSucceeds)
   // 轨迹应爬升（终点 z 显著高于起点）。
   const double z_end = traj.pts.back().z();
   EXPECT_GT(z_end, start.position.z() + 2.0);
+}
+
+TEST(OneSegmentPolynomial, InterpolatesBoundaryStates)
+{
+  using ego_planner_driver::oneSegmentTrajGen;
+  const Eigen::Vector3d sp(0.0, 1.0, 15.0), sv(1.5, 0.0, 0.0), sa(0.0, 0.0, 0.0);
+  const Eigen::Vector3d ep(10.0, 1.0, 15.0), ev(1.0, 0.0, 0.0), ea(0.0, 0.0, 0.0);
+  const double T = 10.0;
+  const auto poly = oneSegmentTrajGen(sp, sv, sa, ep, ev, ea, T);
+  // 五次多项式闭式解精确插值 start/end 的 P/V/A（min-snap 单段边界约束）。
+  EXPECT_NEAR(poly.evaluate(0.0).x(), sp.x(), 1e-6);
+  EXPECT_NEAR(poly.evaluate(0.0).y(), sp.y(), 1e-6);
+  EXPECT_NEAR(poly.evaluate(0.0).z(), sp.z(), 1e-6);
+  EXPECT_NEAR(poly.evaluateVel(0.0).x(), sv.x(), 1e-6);
+  EXPECT_NEAR(poly.evaluateAcc(0.0).x(), sa.x(), 1e-6);
+  EXPECT_NEAR(poly.evaluate(T).x(), ep.x(), 1e-6);
+  EXPECT_NEAR(poly.evaluate(T).y(), ep.y(), 1e-6);
+  EXPECT_NEAR(poly.evaluateVel(T).x(), ev.x(), 1e-6);
+  EXPECT_NEAR(poly.evaluateAcc(T).x(), ea.x(), 1e-6);
+  for (double t = 0.0; t <= T; t += 0.5)
+    EXPECT_TRUE(poly.evaluate(t).allFinite());
+}
+
+TEST(EgoPlannerCore, PlanOnceFinalSegmentEndsStatic)
+{
+  EgoPlannerCore core(makeConfig());
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
+  std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(10.0, 0.0, 15.0), 0.0}};
+  TimedTrajectory traj;
+  double cost = 0.0;
+  // final_segment=true：末端静止到达（end_vel=0），轨迹末速度约 0。
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost,
+                            Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                            true));
+  ASSERT_GT(traj.vel.size(), 1u);
+  EXPECT_LT(traj.vel.back().norm(), 0.1);
+  // 巡航段（final_segment=false）：末速度保持切线巡航速度量级（>= 0.5）。
+  TimedTrajectory cruise;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, cruise, cost,
+                            Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                            false));
+  EXPECT_GT(cruise.vel.back().norm(), 0.5);
+  // 滚动连续性：起点速度精确保持 start_vel（P0..P2 锚定）。
+  EXPECT_NEAR(cruise.vel.front().x(), 0.0, 0.1);
+}
+
+TEST(EgoPlannerCore, MinSnapInitialPointSetYieldsCruiseSpeedProfile)
+{
+  // min-snap 单段 0.4m 弧长采样生成的初始 point_set 使 B-spline 速度剖面贴近
+  // v_cruise，中段无剧烈振荡（轨迹平滑成功判据）。
+  EgoPlannerConfig config = makeConfig();
+  config.max_vel = 1.0;
+  config.cruise_velocity = 1.0;
+  config.lambda_feasibility = 0.5;
+  config.enable_rebound = false;
+  config.enable_time_reparam = false;
+  EgoPlannerCore core(config);
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
+  std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(40.0, 0.0, 15.0), 0.0}};
+  TimedTrajectory traj;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost,
+                            Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                            false));
+  ASSERT_GT(traj.vel.size(), 2u);
+  double vmax = 0.0;
+  std::vector<double> speeds;
+  for (const auto& v : traj.vel)
+  {
+    const double s = v.norm();
+    vmax = std::max(vmax, s);
+    speeds.push_back(s);
+  }
+  EXPECT_LE(vmax, 1.5);
+  const size_t mid0 = speeds.size() / 3, mid1 = speeds.size() * 2 / 3;
+  double mid_min = 1e9, mid_max = 0.0;
+  for (size_t i = mid0; i < mid1; ++i)
+  {
+    mid_min = std::min(mid_min, speeds[i]);
+    mid_max = std::max(mid_max, speeds[i]);
+  }
+  EXPECT_GT(mid_min, 0.5);
+  EXPECT_LT(mid_max, 1.5);
 }

@@ -29,6 +29,7 @@ include_directories(
 add_library(ego_planner_core
   src/ego_planner_core.cpp
   src/uniform_bspline.cpp
+  src/polynomial_traj.cpp
 )
 target_link_libraries(ego_planner_core ${catkin_LIBRARIES})
 

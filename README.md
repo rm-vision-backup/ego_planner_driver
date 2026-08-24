@@ -40,13 +40,26 @@
 - `replan_period_s` 默认 1.0 s（常规滚动重规划阈值，等价于降低轨迹陈旧风险；**不等价**原版
   20 Hz 独立安全检查、碰撞预测或紧急停止，本实现不包含这些机制）。
 
+## min-snap 统一单段重构（26082415）
+
+- 上层 `EgoSwarmDriver` 把分层关键点（start + 层点 + 弓字转折 + 目标）按最大 **2m** 间距密化后
+  发布 `/waypoints`；**2m 密化点只用于窗口推进（`advanceConsumed`）/末点参考，不进 B-spline**。
+- `planOnce` 用原版 `one_segment_traj_gen`（单段五次多项式闭式解，min-snap）生成初始轨迹：
+  起点=旧轨迹 P/V/A（滚动连续性），end_vel=末点切向 × min(`cruise_velocity`, `max_vel`)，
+  end_acc=0，仅最终段 end_vel=0；段时长 T 用梯形速度估计（v0 投影，加速-匀速-减速）。
+- 多项式按 **0.4m 弧长等距**采样为 point_set → `parameterizeToBspline` → L-BFGS（jerk +
+  feasibility 软惩罚）→ 采样发布 PositionTarget P/V/A。起点/末端控制点分别在优化前/后精确锚定。
+- 默认停用 `enable_rebound`（rebound 硬推）与 `enable_time_reparam`（时间重参数化）；机间安全由
+  执行层运行时距离门禁兜底（`EgoSwarmDriver._distance_safe`，水平 <1.0m 且垂直 <2.0m → 本机 HOLD）。
+- 多段 `minSnapTraj` 为备用方案（单段无法处理时的修改方案），本计划不实现。
+
 身份参数（`uav_id`/`exec_target`）位于公开命名空间 `<namespace>/`；规划调参位于私有 `<node_name>/`。
 
 ## 安全与验证
 
 - C++ 节点不 arm、不切 OFFBOARD，也不因 arm+OFFBOARD 自动起飞。除 FOLLOW_ROUTE follower 的 PI 位置跟随外，轨迹均由 Ego 规划；PI 直接控制期间通过仲裁暂停 EGO setpoint。
-- `swarm_clearance=0.5` 表示每机安全半径：互惠检查使用两倍值，对应 1.0 m 水平中心距；原有 2:1 椭球对应 2.0 m 垂直中心距。规划结果在发布前执行硬 clearance 校验。
-- 自动化：2026-08-13 全工作空间 133 tests 全绿（含本包 30 个 gtest 计数）。
+- `swarm_clearance=0.5` 表示每机安全半径：互惠检查使用两倍值，对应 1.0 m 水平中心距；原有 2:1 椭球对应 2.0 m 垂直中心距。规划结果在发布前执行硬 clearance 校验。rebound 硬推默认关闭，机间安全由执行层运行时距离门禁（`EgoSwarmDriver._distance_safe`）兜底：邻机水平 <1.0m 且垂直 <2.0m 时本机 HOLD 暂停。
+- 自动化：2026-08-24 min-snap 重构后 `catkin_test_results --all build` 166 tests 0 failure（含 one_segment_traj_gen 边界插值、最终段静止、巡航速度剖面、滚动连续性用例）。
 - 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS；2026-08-12 起初始态改为 `HOLD`，arm+OFFBOARD 后进入 `TAKEOFF` 软起飞。详见 `tcp_to_ros/docs/test_record_26081402.md`。
 
 ## 环境变量（ROS 日志重定向）

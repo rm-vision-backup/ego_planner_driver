@@ -29,10 +29,13 @@
     <param name="planning_range" value="30.0"/>
     <param name="lambda_smooth" value="1.0"/>
     <param name="lambda_swarm" value="1.0"/>
-    <!-- Swarm rebound hard push: after L-BFGS, control points intruding a
-         neighbor's clearance are pushed out along the waypoint-normal
-         direction (waypoints act as the safe-path reference). -->
-    <param name="swarm_rebound" value="true"/>
+    <!-- min-snap 重构：rebound 硬推与时间重参数化默认关闭（机间安全由执行层
+         运行时距离门禁兜底）；如需 A/B 对比或回退可改 enable_rebound/
+         enable_time_reparam。cruise_velocity 为滚动段末点切线巡航速度上限。 -->
+    <param name="enable_rebound" value="false"/>
+    <param name="enable_time_reparam" value="false"/>
+    <param name="cruise_velocity" value="1.0"/>
+    <param name="acceleration_limit" value="2.0"/>
     <param name="lambda_feasibility" value="0.5"/>
     <param name="setpoint_rate_hz" value="30.0"/>
     <param name="local_pose_timeout_s" value="1.0"/>

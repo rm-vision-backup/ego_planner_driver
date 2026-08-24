@@ -1,4 +1,5 @@
 #include "ego_planner_driver/ego_planner_core.h"
+#include "ego_planner_driver/polynomial_traj.h"
 
 #include <algorithm>
 #include <cmath>
@@ -40,6 +41,90 @@ Eigen::Vector3d sampleNeighbor(const NeighborTrajectory& traj, double t_rel)
 // the driver builds command-specific layered keypoints and densifies them to
 // 2 m before publishing waypoints.  This core only parameterizes whatever
 // waypoints it receives (node truncates them to planning_horizon).
+
+// Trapezoidal time estimator for the min-snap segment duration T.
+// v0 = start velocity projected onto the segment direction (already clamped).
+// Cruise at v_cruise with constant acceleration `a`; the final segment
+// decelerates to rest (end velocity projection = 0), cruise segments end at
+// v_cruise so the rolling replan joins continuously.
+double estimateTrapezoidTime(double dist, double v0, double v_cruise,
+                             double a, bool final_segment)
+{
+  if (dist <= 1e-9)
+    return 0.0;
+  v0 = std::min(std::max(v0, 0.0), v_cruise);  // clamp onto [0, v_cruise]
+  const double end_proj = final_segment ? 0.0 : v_cruise;
+  double t_acc = 0.0, d_acc = 0.0;
+  if (v0 < v_cruise)
+  {
+    t_acc = (v_cruise - v0) / a;
+    d_acc = v0 * t_acc + 0.5 * a * t_acc * t_acc;
+  }
+  const double t_dec = (v_cruise - end_proj) / a;
+  const double d_dec = 0.5 * (v_cruise + end_proj) * t_dec;
+  if (d_acc + d_dec >= dist)
+  {
+    // Triangular profile (no cruise): accelerate v0 -> v_peak then decelerate
+    // v_peak -> end_proj over the whole distance.
+    //   v_peak^2 = v0^2 + 2a*d1 = end_proj^2 + 2a*d2,  d1 + d2 = dist
+    double v_peak = std::sqrt(0.5 * (v0 * v0 + end_proj * end_proj) + a * dist);
+    if (!std::isfinite(v_peak) || v_peak <= v0)
+    {
+      // Distance too short to keep accelerating from v0: fall back to a
+      // linear average-speed estimate (T stays positive and finite).
+      return dist / (0.5 * (v0 + end_proj) + 1e-6);
+    }
+    const double t_dec_tri = (v_peak - end_proj) / a;
+    return std::max(0.0, (v_peak - v0) / a + t_dec_tri);
+  }
+  const double d_cruise = dist - d_acc - d_dec;
+  const double t_cruise = d_cruise / std::max(v_cruise, 1e-6);
+  return std::max(0.0, t_acc + t_cruise + t_dec);
+}
+
+// Samples the min-snap polynomial at `spacing` arc-length intervals.
+// A dense polyline is built with a fine time step, then points are taken every
+// `spacing` along it (linear interpolation).  `start`/`end` are always the
+// first/last samples so the B-spline parameterization anchors the exact
+// endpoints.
+std::vector<Eigen::Vector3d> samplePolynomialByArcLength(
+    const OneSegmentPolynomial& poly, double spacing,
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end)
+{
+  std::vector<Eigen::Vector3d> dense;
+  const double dt = 0.02;
+  for (double t = 0.0; t <= 1.0 + 1e-9; t += dt)
+    dense.push_back(poly.evaluate(t));
+  dense.back() = end;  // exact endpoint
+
+  std::vector<double> cum(dense.size(), 0.0);
+  for (size_t i = 1; i < dense.size(); ++i)
+    cum[i] = cum[i - 1] + (dense[i] - dense[i - 1]).norm();
+  const double total = cum.back();
+
+  std::vector<Eigen::Vector3d> out;
+  out.push_back(start);
+  if (spacing <= 0.0 || total <= spacing)
+  {
+    out.push_back(end);
+    return out;
+  }
+  size_t j = 1;
+  double target = spacing;
+  while (target < total - 1e-6)
+  {
+    while (j + 1 < cum.size() && cum[j] < target)
+      ++j;
+    const double span = cum[j] - cum[j - 1];
+    const double a = (span > 1e-12) ? (target - cum[j - 1]) / span : 0.0;
+    out.push_back(dense[j - 1] * (1.0 - a) + dense[j] * a);
+    target += spacing;
+  }
+  if ((out.back() - end).norm() > 1e-6)
+    out.push_back(end);
+  return out;
+}
+
 } // namespace
 
 EgoPlannerCore::EgoPlannerCore(const EgoPlannerConfig& config)
@@ -429,7 +514,8 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
                               const std::vector<NeighborTrajectory>& neighbors,
                               TimedTrajectory& out, double& final_cost,
                               const Eigen::Vector3d& start_vel,
-                              const Eigen::Vector3d& start_acc)
+                              const Eigen::Vector3d& start_acc,
+                              bool final_segment)
 {
   if (sparse_waypoints.empty())
   {
@@ -439,19 +525,50 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     final_cost = 0.0;
     return true;
   }
-  std::vector<Eigen::Vector3d> point_set;
-  point_set.reserve(sparse_waypoints.size() + 1);
-  point_set.push_back(start.position);
-  for (const auto& waypoint : sparse_waypoints)
-    point_set.push_back(waypoint.position);
+  // Window end point: the last waypoint of this plan.  The node already
+  // truncated sparse_waypoints to planning_horizon; when final_segment the
+  // waypoints are the full remaining route and end_vel must be zero (static
+  // arrival).  Cruise segments keep end_vel = tangent * min(v_cruise, max_vel)
+  // so the rolling replan's next segment joins velocity-continuously.
+  const Eigen::Vector3d end_pt = sparse_waypoints.back().position;
+  Eigen::Vector3d end_vel = Eigen::Vector3d::Zero();
+  if (!final_segment)
+  {
+    Eigen::Vector3d tangent;
+    if (sparse_waypoints.size() >= 2)
+      tangent = end_pt - sparse_waypoints[sparse_waypoints.size() - 2].position;
+    else
+      tangent = end_pt - start.position;
+    const double len = tangent.norm();
+    if (len > 1e-9)
+      end_vel = tangent / len * std::min(config_.cruise_velocity, config_.max_vel);
+  }
+  const Eigen::Vector3d end_acc = Eigen::Vector3d::Zero();
 
-  // Plan B: densification now happens on the Python driver layer; the node
-  // already truncated sparse_waypoints to planning_horizon when configured.
-  // Keep this core agnostic: parameterize exactly the waypoints it receives.
+  // Trapezoidal segment duration T (v0 projection, accel-cruise-decel).
+  const Eigen::Vector3d dir = end_pt - start.position;
+  const double dist = dir.norm();
+  double v0_proj = 0.0;
+  if (dist > 1e-9)
+    v0_proj = start_vel.dot(dir / dist);
+  const double v_cruise = std::max(0.0,
+      std::min(config_.cruise_velocity, config_.max_vel));
+  const double a = std::max(0.1, config_.acceleration_limit);
+  const double segment_time = estimateTrapezoidTime(
+      dist, v0_proj, v_cruise, a, final_segment);
 
-  // The parameterization yields (K+2) control points and the optimizer pins
-  // the first and last order_ (=3) columns, so K must be at least 5 to keep
-  // at least one free control point (variable_num_ = 3*(K-4)).
+  // min-snap single segment (one_segment_traj_gen): a quintic closed-form
+  // polynomial that interpolates start P/V/A -> end P/V/A.  Sample it at
+  // 0.4 m arc-length intervals to build the B-spline parameterization input
+  // (the 2 m driver waypoints never enter the B-spline directly).
+  const OneSegmentPolynomial poly = oneSegmentTrajGen(
+      start.position, start_vel, start_acc, end_pt, end_vel, end_acc,
+      std::max(segment_time, 1e-3));
+  std::vector<Eigen::Vector3d> point_set = samplePolynomialByArcLength(
+      poly, 0.4, start.position, end_pt);
+  // Short-window fallback only: the parameterization needs >= 5 points so the
+  // optimizer keeps at least one free control point; the min-snap 0.4 m
+  // sampling already provides this for normal windows.
   while (point_set.size() < 5)
   {
     std::vector<Eigen::Vector3d> subdivided;
@@ -468,7 +585,9 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   std::vector<Eigen::Vector3d> start_end_derivative(4, Eigen::Vector3d::Zero());
   // upstream order: [0]=vel_start, [1]=vel_end, [2]=acc_start, [3]=acc_end
   start_end_derivative[0] = start_vel;  // start velocity (rolling continuity)
+  start_end_derivative[1] = end_vel;    // end velocity (tangent cruise / stop)
   start_end_derivative[2] = start_acc;  // start acceleration (rolling continuity)
+  start_end_derivative[3] = end_acc;    // end acceleration (zero)
   Eigen::MatrixXd ctrl_pts;
   ego_planner::UniformBspline::parameterizeToBspline(bspline_interval_, point_set,
                                         start_end_derivative, ctrl_pts);
@@ -511,27 +630,41 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
   }
   if (!optimizeControls(final_cost))
     return false;
+  // Symmetric exact-anchor of the trailing control points AFTER the optimizer
+  // (the last order_=3 columns participate in L-BFGS; re-solving them here
+  // restores the exact end_pt / end_vel / end_acc boundary constraints that
+  // the smoothness cost would otherwise relax):
+  //   B(1)     = (P[n-3] + 4P[n-2] + P[n-1])/6 = end_pt
+  //   v(1)     = (P[n-1] - P[n-3])/(2*ts)      = end_vel
+  //   a(1)     = (P[n-3] - 2P[n-2] + P[n-1])/ts^2 = end_acc
+  if (cps_.points.cols() >= 3)
+  {
+    const double ts = bspline_interval_;
+    const double t2 = ts * ts;
+    const int n = static_cast<int>(cps_.points.cols());
+    cps_.points.col(n - 3) = end_pt - end_vel * ts + end_acc * (t2 / 3.0);
+    cps_.points.col(n - 2) = end_pt - end_acc * (t2 / 6.0);
+    cps_.points.col(n - 1) = end_pt + end_vel * ts + end_acc * (t2 / 3.0);
+  }
 
-  // Swarm rebound: hard-push control points that intrude a neighbor's
-  // clearance out along the waypoint-normal direction (waypoints act as the
-  // safe-path reference, replacing the upstream A* path).  No re-optimization
-  // afterwards: L-BFGS smoothness would pull the pushed control points back
-  // into the clearance; the pushed control points are sampled directly and
-  // checkClearance below is the hard gate.
-  if (config_.swarm_rebound)
+  // Swarm rebound hard push is DISABLED by default (min-snap refactor):
+  // inter-UAV safety is owned by the execution-layer runtime distance gate
+  // (EgoSwarmDriver), not the optimizer.  Re-enable via enable_rebound for
+  // A/B comparison or the backup configuration.
+  if (config_.enable_rebound)
     reboundFromNeighbors(neighbors_, point_set, config_.swarm_clearance * 2.0);
 
   ego_planner::UniformBspline traj(cps_.points, order_, bspline_interval_);
-  // STEP 3 (upstream planner_manager): hard-cap velocity/acceleration by
-  // reallocating time.  When the optimized spline exceeds max_vel/max_acc,
-  // lengthen the middle knot span so the trajectory speed profile is pulled
-  // back to the physical limits (per-axis, upstream feasibility_tolerance).
-  // The start/end knot spans are left untouched so the pinned start
-  // derivatives (start_vel/start_acc) remain valid.
+  // Physical-limit check (diagnostics only when time reparameterization is
+  // disabled).  Time reparameterization is DISABLED by default: the min-snap
+  // 0.4 m arc-length point set with ts = 0.4 s already yields ~1 m/s control
+  // spacing, and lengthening the time axis destabilizes the speed profile
+  // under 1 s rolling replan (see implementation_plan_26082415.md).
   traj.setPhysicalLimits(config_.max_vel, config_.max_acc,
                          config_.feasibility_tolerance);
   double fea_ratio = 1.0;
-  if (!traj.checkFeasibility(fea_ratio))
+  const bool feasible = traj.checkFeasibility(fea_ratio);
+  if (!feasible && config_.enable_time_reparam)
     traj.lengthenTime(fea_ratio);
   double tm, tmp;
   traj.getTimeSpan(tm, tmp);

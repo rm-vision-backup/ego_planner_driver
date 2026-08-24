@@ -49,7 +49,19 @@ struct EgoPlannerConfig
   // Rebound hard push: after L-BFGS, control points that intrude a neighbor's
   // clearance are pushed out along the waypoint-normal direction (waypoints
   // act as the safe-path reference, replacing the upstream A* path).
-  bool swarm_rebound = true;
+  // Disabled by default (min-snap refactor): inter-UAV safety is handled by
+  // the runtime distance gate in the execution layer, not the optimizer.
+  bool enable_rebound = false;
+  // Time reparameterization (setPhysicalLimits/checkFeasibility/lengthenTime)
+  // is disabled by default: the min-snap 0.4 m arc-length point set already
+  // yields ~ts-consistent control-point spacing.  When disabled the limits are
+  // still checked for diagnostics but the time axis is never lengthened.
+  bool enable_time_reparam = false;
+  // Cruise speed used for the segment end velocity (end_vel = tangent x
+  // min(v_cruise, max_vel)).  Only the final segment stops (end_vel = 0).
+  double cruise_velocity = 1.0;
+  // Acceleration limit for the trapezoidal time estimator (T = f(v0, dist, a)).
+  double acceleration_limit = 2.0;
   int max_iterations = 200;
   int mem_size = 16;
   double g_epsilon = 0.01;
@@ -175,12 +187,18 @@ public:
   // implicitly the first way point.  start_vel/start_acc are the current
   // trajectory derivatives (zero for the first segment) so rolling segments
   // join velocity- and acceleration-continuously (upstream FSM semantics).
+  // The initial point_set is generated from a single-segment min-snap
+  // polynomial (one_segment_traj_gen) sampled at 0.4 m arc-length intervals
+  // (min-snap unified single-segment refactor).  final_segment == true makes
+  // the segment end velocity zero (static arrival); otherwise end_vel follows
+  // the end-point tangent at min(cruise_velocity, max_vel) with end_acc = 0.
   bool planOnce(const GoalPoint& start,
                 const std::vector<WayPoint>& sparse_waypoints,
                 const std::vector<NeighborTrajectory>& neighbors,
                 TimedTrajectory& out, double& final_cost,
                 const Eigen::Vector3d& start_vel = Eigen::Vector3d::Zero(),
-                const Eigen::Vector3d& start_acc = Eigen::Vector3d::Zero());
+                const Eigen::Vector3d& start_acc = Eigen::Vector3d::Zero(),
+                bool final_segment = false);
 
   // Exposes the reciprocal clearance check for tests and gates.
   bool checkClearance(const TimedTrajectory& trajectory,
