@@ -37,8 +37,21 @@
 - 业务字段按 ROS ENU 填写，MAVROS setpoint_raw 插件完成 ENU→NED，禁止业务层重复换轴；
 - 轨迹耗尽后先切固定 position/yaw HOLD 再做 arrival 状态转换，末段非零导数不泄漏；
 - `direct_control_active=true` 时本节点停止发布候选，MAVROS 所有权由 relay 保证；
-- `replan_period_s` 默认 1.0 s（常规滚动重规划阈值，等价于降低轨迹陈旧风险；**不等价**原版
-  20 Hz 独立安全检查、碰撞预测或紧急停止，本实现不包含这些机制）。
+- `replan_period_s` 默认 1.0 s；另有 25 Hz `SafetyPredictor` 独立监督。阶段 A 默认 `shadow`，
+  只计算同一绝对时间轴的 CPA/TTC、动态 warning/emergency 门槛、ID right-of-way 并异步记录，
+  **不改变**状态、轨迹、intent 或 setpoint；受约束制动与主动让路尚未接通。
+
+## 预测安全监督（26082500 阶段 A）
+
+- `SafetyPredictor` 对本机执行轨迹和邻机 intent 取共同绝对时间窗，计算相对状态、closing speed、
+  CPA、首次越过 1m 的 TTC、数据年龄及动态两级距离门槛；预测窗不足显式输出
+  `INSUFFICIENT_DATA`。
+- 数字身份取末尾数字；低 ID=`STAND_ON`、高 ID=`YIELD`，非法或重复数字=`UNKNOWN`。
+- `SafetyLogger` 使用有界队列和单写线程。默认覆盖写
+  `/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner/UAVn-ego-planner.log`；安全 timer
+  不做同步磁盘 IO。目录和队列容量可由 launch 参数覆盖。
+- `safety_supervisor_mode=off` 完全关闭；`shadow` 仅诊断。阶段 A 若误配 `active`，节点告警并
+  降级 `shadow`，禁止伪装成已启用制动闭环。
 
 ## min-snap 统一单段重构（26082415）
 
@@ -64,7 +77,9 @@
 - C++ 节点不 arm、不切 OFFBOARD，也不因 arm+OFFBOARD 自动起飞。除 FOLLOW_ROUTE follower 的 PI 位置跟随外，轨迹均由 Ego 规划；PI 直接控制期间通过仲裁暂停 EGO setpoint。
 - `swarm_clearance=0.5` 表示每机安全半径：互惠检查使用两倍值，对应 1.0 m 水平中心距；原有 2:1 椭球对应 2.0 m 垂直中心距。规划结果在发布前执行硬 clearance 校验。rebound 硬推默认关闭，机间安全由执行层运行时距离门禁（`EgoSwarmDriver._distance_safe`）兜底：邻机水平 <1.0m 且垂直 <2.0m 时本机 HOLD 暂停。
 - rebound 手工启用时会对硬推后的轨迹强制时间重参数化，再按新时间轴重做 clearance；理想匀速正交交叉可在速度 ≤1.5m/s、加速度 ≤`max_acc*1.05` 下到达。但由同一 min-snap 核心生成的真实 peer nominal intent 仍可能使让路方规划失败，多轮互惠收敛尚未通过，因此禁止仅翻转默认开关。
-- 自动化：2026-08-24 最终回归 `catkin_test_results --all build` 186 tests 0 failure；`ego_planner_driver` 78 tests，覆盖 intent 校验/版本重置、规划耗时激活 epoch、精确末样本、交叉 clearance 与 rebound 动力学。
+- 自动化：2026-08-25 阶段 A `ego_planner_driver` 96 tests、0 failure（原 78 全回归 + 新 18），
+  覆盖 CPA/TTC、绝对时间同步、数据年龄、动态门槛、身份/角色、episode 迟滞、异步日志和 shadow
+  行为不变。双节点动力学、SITL 与完整链路尚未执行。
 - 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS；2026-08-12 起初始态改为 `HOLD`，arm+OFFBOARD 后进入 `TAKEOFF` 软起飞。详见 `tcp_to_ros/docs/test_record_26081402.md`。
 
 ## 环境变量（ROS 日志重定向）

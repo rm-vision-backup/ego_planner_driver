@@ -30,6 +30,8 @@ add_library(ego_planner_core
   src/ego_planner_core.cpp
   src/uniform_bspline.cpp
   src/polynomial_traj.cpp
+  src/safety_predictor.cpp
+  src/safety_logger.cpp
 )
 target_link_libraries(ego_planner_core ${catkin_LIBRARIES})
 
@@ -47,4 +49,6 @@ if(CATKIN_ENABLE_TESTING)
   target_link_libraries(test_trajectory ego_planner_driver_node_lib ego_planner_core ${catkin_LIBRARIES})
   catkin_add_gtest(test_ego_state_machine test/test_ego_state_machine.cpp)
   target_link_libraries(test_ego_state_machine ego_planner_driver_node_lib ego_planner_core ${catkin_LIBRARIES})
+  catkin_add_gtest(test_safety_predictor test/test_safety_predictor.cpp)
+  target_link_libraries(test_safety_predictor ego_planner_core ${catkin_LIBRARIES})
 endif()

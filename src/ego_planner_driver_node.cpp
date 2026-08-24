@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <iomanip>
+#include <sstream>
+#include <unistd.h>
 
 namespace ego_planner_driver
 {
@@ -47,6 +50,54 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   takeoff_height_ = pnh_.param("takeoff_height_m", 5.0);
   takeoff_ascend_speed_ = pnh_.param("takeoff_ascend_speed", 1.0);
 
+  safety_supervisor_mode_ = pnh_.param(
+      "safety_supervisor_mode", std::string("off"));
+  safety_supervisor_rate_hz_ = pnh_.param("safety_supervisor_rate_hz", 25.0);
+  safety_config_.protected_distance_m = pnh_.param("protected_distance_m", 1.0);
+  safety_config_.prediction_horizon_s = pnh_.param("safety_prediction_horizon_s", 5.0);
+  safety_config_.sample_period_s = pnh_.param("safety_sample_period_s", 0.05);
+  safety_config_.control_delay_s = pnh_.param("safety_control_delay_s", 0.20);
+  safety_config_.local_compute_budget_s = pnh_.param("safety_compute_budget_s", 0.05);
+  safety_config_.peer_data_age_cap_s = pnh_.param("peer_data_age_cap_s", 2.0);
+  safety_config_.emergency_decel_mps2 = pnh_.param("emergency_decel_mps2", 2.0);
+  safety_config_.warning_buffer_m = pnh_.param("warning_buffer_m", 0.35);
+  safety_config_.emergency_buffer_m = pnh_.param("emergency_buffer_m", 0.10);
+  safety_config_.warning_ttc_s = pnh_.param("warning_ttc_s", 3.0);
+  safety_config_.emergency_ttc_s = pnh_.param("emergency_ttc_s", 1.5);
+  safety_config_.minimum_prediction_window_s = pnh_.param(
+      "minimum_prediction_window_s", 0.25);
+  episode_release_hysteresis_s_ = pnh_.param(
+      "safety_episode_release_s", 1.0);
+  safety_predictor_.reset(new SafetyPredictor(safety_config_));
+  if (safety_supervisor_mode_ == "active")
+  {
+    ROS_ERROR("[%s] active safety supervisor is unavailable in stage A; using shadow",
+              uav_id_.c_str());
+    safety_supervisor_mode_ = "shadow";
+  }
+  if (safety_supervisor_mode_ != "off" && safety_supervisor_mode_ != "shadow")
+  {
+    ROS_ERROR("[%s] invalid safety_supervisor_mode=%s; disabling supervisor",
+              uav_id_.c_str(), safety_supervisor_mode_.c_str());
+    safety_supervisor_mode_ = "off";
+  }
+  if (safety_supervisor_mode_ == "shadow")
+  {
+    std::string identity = exec_target_;
+    if (identity.empty())
+    {
+      char hostname[256] = {};
+      if (::gethostname(hostname, sizeof(hostname) - 1) == 0) identity = hostname;
+    }
+    const std::string log_dir = pnh_.param(
+        "diagnostic_log_dir",
+        std::string("/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner"));
+    const int queue_capacity = std::max(1, pnh_.param("diagnostic_log_queue_size", 2048));
+    if (!safety_logger_.start(log_dir, identity, static_cast<size_t>(queue_capacity)))
+      ROS_WARN("[%s] safety diagnostic file unavailable; ROS logging remains active",
+               uav_id_.c_str());
+  }
+
   // Interface topics live under the public namespace (/UAV1/*) so the
   // Python EgoSwarmDriver and topology bridge can reach them without
   // knowing the private roslaunch node name. Parameters stay private.
@@ -65,6 +116,9 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   setState(kStateHold);
   timer_ = nh_.createTimer(ros::Duration(1.0 / setpoint_rate_),
                            &EgoPlannerDriverNode::publishSetpoint, this);
+  if (safety_supervisor_mode_ != "off" && safety_supervisor_rate_hz_ > 0.0)
+    safety_timer_ = nh_.createTimer(ros::Duration(1.0 / safety_supervisor_rate_hz_),
+        &EgoPlannerDriverNode::runSafetySupervisor, this);
   replan_thread_ = std::thread(&EgoPlannerDriverNode::replanLoop, this);
 }
 
@@ -73,6 +127,7 @@ EgoPlannerDriverNode::~EgoPlannerDriverNode()
   stop_ = true;
   if (replan_thread_.joinable())
     replan_thread_.join();
+  safety_logger_.stop();
 }
 
 void EgoPlannerDriverNode::setClockSource(ClockFn fn)
@@ -386,6 +441,23 @@ void EgoPlannerDriverNode::advanceHoldHandling()
 void EgoPlannerDriverNode::publishSetpointTick()
 {
   publishSetpoint(ros::TimerEvent());
+}
+
+void EgoPlannerDriverNode::safetySupervisorTick()
+{
+  runSafetySupervisor(ros::TimerEvent());
+}
+
+void EgoPlannerDriverNode::setSafetySupervisorModeForTest(const std::string& mode)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  safety_supervisor_mode_ = mode == "shadow" ? "shadow" : "off";
+}
+
+SafetyPrediction EgoPlannerDriverNode::lastSafetyPrediction() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return last_safety_prediction_;
 }
 
 std::string EgoPlannerDriverNode::execState() const
@@ -805,6 +877,94 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
   }
   if (elapsed >= current_->duration)
     checkArrival(current_->pts.back(), current_->yaw.back(), now);
+}
+
+std::vector<PeerTrajectoryInput> EgoPlannerDriverNode::safetyPeersLocked() const
+{
+  std::vector<PeerTrajectoryInput> peers;
+  peers.reserve(inbox_.size());
+  for (const auto& item : inbox_)
+  {
+    PeerTrajectoryInput peer;
+    peer.uav_id = item.first;
+    peer.traj_id = latest_neighbor_version_.count(item.first)
+        ? latest_neighbor_version_.at(item.first).second : 0;
+    peer.activation_epoch_s = item.second.first.start_time;
+    peer.receive_epoch_s = item.second.second.toSec();
+    peer.trajectory.duration = item.second.first.duration;
+    peer.trajectory.t = item.second.first.t;
+    peer.trajectory.pts = item.second.first.pts;
+    // Neighbor intents currently carry position samples only. Finite-difference
+    // velocity fallback in SafetyPredictor preserves same-epoch comparison.
+    // Keep derivative arrays empty so samplePVA rejects them and predictor uses
+    // finite differences. Filling zeros here would silently erase peer motion.
+    peers.push_back(peer);
+  }
+  return peers;
+}
+
+std::string EgoPlannerDriverNode::formatSafetyLog(
+    const SafetyPrediction& prediction, const ros::Time& now) const
+{
+  std::ostringstream stream;
+  stream << std::fixed << std::setprecision(6)
+         << "ros_s=" << now.toSec()
+         << " identity=" << SafetyLogger::sanitizeIdentity(exec_target_)
+         << " state=" << exec_state_
+         << " self_traj_id=" << traj_id_
+         << " mode=" << safety_supervisor_mode_
+         << " level=" << SafetyPredictor::levelName(prediction.level)
+         << " primary_peer=" << prediction.primary_peer_id
+         << " episode=" << (conflict_episode_.active() ? "active" : "none")
+         << " action=SHADOW_ONLY";
+  for (const PairPrediction& pair : prediction.pairs)
+  {
+    stream << " peer={id:" << pair.peer_id
+           << ",traj:" << pair.peer_traj_id
+           << ",age:" << pair.data_age_s
+           << ",window:" << pair.common_window_s
+           << ",distance:" << pair.current_distance_m
+           << ",closing:" << pair.closing_speed_mps
+           << ",cpa_t:" << pair.t_cpa_s
+           << ",cpa_d:" << pair.cpa_distance_m
+           << ",ttc:" << pair.ttc_s
+           << ",min_d:" << pair.min_distance_m
+           << ",warning_d:" << pair.warning_distance_m
+           << ",emergency_d:" << pair.emergency_distance_m
+           << ",role:" << SafetyPredictor::roleName(pair.role)
+           << ",level:" << SafetyPredictor::levelName(pair.level) << "}";
+  }
+  return stream.str();
+}
+
+void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
+{
+  if (safety_supervisor_mode_ == "off" || !safety_predictor_) return;
+  std::shared_ptr<TimedTrajectory> self;
+  std::vector<PeerTrajectoryInput> peers;
+  ros::Time activation;
+  ros::Time now;
+  std::string self_id;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!current_ || plan_start_.isZero()) return;
+    self.reset(new TimedTrajectory(*current_));
+    peers = safetyPeersLocked();
+    activation = plan_start_;
+    now = nowFunc();
+    self_id = !uav_id_.empty() ? uav_id_ : exec_target_;
+  }
+  const SafetyPrediction prediction = safety_predictor_->evaluate(
+      *self, activation.toSec(), self_id, peers, now.toSec());
+  std::string line;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_safety_prediction_ = prediction;
+    conflict_episode_.update(prediction, now.toSec(),
+                             episode_release_hysteresis_s_);
+    line = formatSafetyLog(prediction, now);
+  }
+  safety_logger_.enqueue(line);
 }
 
 void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double yaw,

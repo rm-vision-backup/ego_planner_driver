@@ -125,6 +125,43 @@ TEST(EgoStateMachine, PlanLatencyOnlyMovesActivationEpoch)
   EXPECT_NEAR(node.lastSetpoint().position.z, traj->pts.front().z(), 1e-9);
 }
 
+TEST(EgoStateMachine, ShadowSafetyTickDoesNotChangeFlightBehavior)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setSafetySupervisorModeForTest("shadow");
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+
+  auto peer = makeIntent(100.0, 1, "A02");
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.y = 0.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 0.0;
+  peer.sampled_traj[1].position.y = 0.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+
+  const auto trajectory_before = node.currentTrajectory();
+  const ros::Time start_before = node.planStart();
+  const std::string state_before = node.execState();
+  const size_t setpoints_before = node.setpointCount();
+  node.safetySupervisorTick();
+
+  const auto trajectory_after = node.currentTrajectory();
+  ASSERT_TRUE(trajectory_before && trajectory_after);
+  EXPECT_EQ(trajectory_after->pts.size(), trajectory_before->pts.size());
+  EXPECT_TRUE(trajectory_after->pts.front().isApprox(trajectory_before->pts.front()));
+  EXPECT_EQ(node.planStart(), start_before);
+  EXPECT_EQ(node.execState(), state_before);
+  EXPECT_EQ(node.setpointCount(), setpoints_before);
+  EXPECT_EQ(node.lastSafetyPrediction().pairs.size(), 1u);
+}
+
 TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
 {
   FakeClock clock;

@@ -22,6 +22,8 @@
 #include <thread>
 #include <vector>
 #include "ego_planner_driver/ego_planner_core.h"
+#include "ego_planner_driver/safety_logger.h"
+#include "ego_planner_driver/safety_predictor.h"
 
 using ego_planner_driver::EgoPlannerConfig;
 using ego_planner_driver::EgoPlannerCore;
@@ -92,6 +94,9 @@ public:
   bool replanOnce();
   void advanceHoldHandling();
   void publishSetpointTick();
+  void safetySupervisorTick();
+  void setSafetySupervisorModeForTest(const std::string& mode);
+  SafetyPrediction lastSafetyPrediction() const;
   std::string execState() const;
   boost::optional<HoldTarget> steadyTarget() const;
   mavros_msgs::PositionTarget lastSetpoint() const;
@@ -158,6 +163,7 @@ private:
                              const Eigen::Vector3d& acc = Eigen::Vector3d::Zero());
   static double yawFromQuat(const geometry_msgs::Quaternion& q);
   void publishSetpoint(const ros::TimerEvent& event);
+  void runSafetySupervisor(const ros::TimerEvent& event);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   void processHoldLocked();
   void handleMavrosStateEdgeLocked();
@@ -165,6 +171,9 @@ private:
   static void appendSample(swarm_uav_interfaces::UavTrajectoryIntent& msg,
                            const TimedTrajectory& traj, size_t i);
   void replanLoop();
+  std::vector<PeerTrajectoryInput> safetyPeersLocked() const;
+  std::string formatSafetyLog(const SafetyPrediction& prediction,
+                              const ros::Time& now) const;
 
   std::unique_ptr<EgoPlannerCore> core_;
   std::string frame_id_;
@@ -181,6 +190,14 @@ private:
   int activation_replan_attempts_ = 3;
   bool direct_control_active_ = false;
   volatile bool replan_loop_enabled_ = true;
+  std::string safety_supervisor_mode_ = "off";
+  double safety_supervisor_rate_hz_ = 25.0;
+  double episode_release_hysteresis_s_ = 1.0;
+  SafetyPredictorConfig safety_config_;
+  std::unique_ptr<SafetyPredictor> safety_predictor_;
+  SafetyLogger safety_logger_;
+  ConflictEpisode conflict_episode_;
+  SafetyPrediction last_safety_prediction_;
 
   bool armed_ = false;
   bool offboard_ = false;
@@ -206,6 +223,7 @@ private:
   ros::Subscriber mavros_state_sub_;
   ros::Subscriber direct_control_sub_;
   ros::Timer timer_;
+  ros::Timer safety_timer_;
 
   mutable std::mutex mutex_;
   std::thread replan_thread_;
