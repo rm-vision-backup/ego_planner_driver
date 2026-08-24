@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <limits>
 
 #include <geometry_msgs/PoseStamped.h>
 
@@ -46,6 +47,27 @@ geometry_msgs::PoseStamped makePose(double x, double y, double z, double t)
   return p;
 }
 
+swarm_uav_interfaces::UavTrajectoryIntent makeIntent(
+    double stamp, int32_t traj_id = 1, const std::string& uav_id = "A02")
+{
+  swarm_uav_interfaces::UavTrajectoryIntent msg;
+  msg.protocol_version = "1.0";
+  msg.uav_id = uav_id;
+  msg.exec_target = "UAV2";
+  msg.frame_id = "map";
+  msg.traj_id = traj_id;
+  msg.stamp = stamp;
+  msg.clearance = 0.5;
+  msg.t = {0.0, 1.0};
+  geometry_msgs::Pose p0;
+  p0.position.x = 1.0;
+  p0.position.z = 5.0;
+  geometry_msgs::Pose p1 = p0;
+  p1.position.x = 2.0;
+  msg.sampled_traj = {p0, p1};
+  return msg;
+}
+
 // 模拟理想位置控制器：把当前 setpoint 回灌为 local_pose
 void echoSetpoint(EgoPlannerDriverNode& node, FakeClock& clock)
 {
@@ -69,6 +91,122 @@ TEST(EgoStateMachine, InitialStateIsHold)
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
   EXPECT_EQ(node.execState(), kStateHold);
+}
+
+TEST(EgoStateMachine, PlanLatencyOnlyMovesActivationEpoch)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(5.0, 0.0, 5.0);
+
+  // Simulate optimizer wall time between the planning snapshot and commit.
+  int clock_calls = 0;
+  node.setClockSource([&clock, &clock_calls]() {
+    if (clock_calls++ > 0)
+      clock.set(100.75);
+    return clock.now();
+  });
+  ASSERT_TRUE(node.replanOnce());
+  const boost::optional<ego_planner_driver::TimedTrajectory> traj =
+      node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj));
+  ASSERT_FALSE(traj->t.empty());
+  EXPECT_DOUBLE_EQ(traj->t.front(), 0.0);
+  EXPECT_DOUBLE_EQ(traj->duration, traj->t.back());
+  EXPECT_DOUBLE_EQ(node.planStart().toSec(), 100.75);
+
+  node.publishSetpointTick();
+  EXPECT_NEAR(node.lastSetpoint().position.x, traj->pts.front().x(), 1e-9);
+  EXPECT_NEAR(node.lastSetpoint().position.y, traj->pts.front().y(), 1e-9);
+  EXPECT_NEAR(node.lastSetpoint().position.z, traj->pts.front().z(), 1e-9);
+}
+
+TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+
+  auto valid = makeIntent(100.0, 10);
+  EXPECT_TRUE(node.injectNeighborIntent(valid));
+  EXPECT_FALSE(node.planningRequested());
+  EXPECT_FALSE(node.injectNeighborIntent(valid));  // exact duplicate
+
+  auto same_epoch_older = valid;
+  same_epoch_older.traj_id = 9;
+  EXPECT_FALSE(node.injectNeighborIntent(same_epoch_older));
+
+  // A newer activation epoch establishes a new sequence generation. This
+  // accepts both process restarts and signed int32 wraparound.
+  auto restarted = makeIntent(100.1, std::numeric_limits<int32_t>::min());
+  EXPECT_TRUE(node.injectNeighborIntent(restarted));
+  auto old_epoch = makeIntent(100.0, std::numeric_limits<int32_t>::max());
+  EXPECT_FALSE(node.injectNeighborIntent(old_epoch));
+
+  auto malformed = makeIntent(100.2, 1);
+  malformed.protocol_version = "2.0";
+  EXPECT_FALSE(node.injectNeighborIntent(malformed));
+  malformed = makeIntent(100.2, 1);
+  malformed.frame_id = "odom";
+  EXPECT_FALSE(node.injectNeighborIntent(malformed));
+  malformed = makeIntent(100.2, 1);
+  malformed.t[0] = 0.1;
+  EXPECT_FALSE(node.injectNeighborIntent(malformed));
+  malformed = makeIntent(100.2, 1);
+  malformed.t[1] = malformed.t[0];
+  EXPECT_FALSE(node.injectNeighborIntent(malformed));
+  malformed = makeIntent(100.2, 1);
+  malformed.sampled_traj[1].position.x =
+      std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(node.injectNeighborIntent(malformed));
+  malformed = makeIntent(100.2, 1);
+  malformed.sampled_traj.pop_back();
+  EXPECT_FALSE(node.injectNeighborIntent(malformed));
+
+  clock.set(110.0);
+  EXPECT_FALSE(node.injectNeighborIntent(makeIntent(100.2, 2)));
+  EXPECT_FALSE(node.injectNeighborIntent(makeIntent(120.0, 2)));
+}
+
+TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)
+{
+  ros::param::set("/uav_id", "A02");
+  ros::param::set("/exec_target", "UAV2");
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_FALSE(node.planningRequested());
+
+  const boost::optional<ego_planner_driver::TimedTrajectory> own =
+      node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(own));
+  auto conflict = makeIntent(100.0, 1, "A01");
+  conflict.t = own->t;
+  conflict.sampled_traj.clear();
+  for (const auto& point : own->pts)
+  {
+    geometry_msgs::Pose pose;
+    pose.position.x = point.x();
+    pose.position.y = point.y();
+    pose.position.z = point.z();
+    conflict.sampled_traj.push_back(pose);
+  }
+  EXPECT_TRUE(node.injectNeighborIntent(conflict));
+  EXPECT_TRUE(node.planningRequested());
+
+  ros::param::set("/uav_id", "A01");
+  ros::param::set("/exec_target", "UAV1");
 }
 
 TEST(EgoStateMachine, ArmOffboardEdgeStartsTakeoff)

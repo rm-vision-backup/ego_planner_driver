@@ -82,6 +82,9 @@ public:
 
   // --- 测试/外部注入接口（线程安全） ---
   void injectLocalPose(const geometry_msgs::PoseStamped& pose);
+  // Returns true only when the neighbor intent satisfies the wire/time
+  // contract and supersedes the last accepted trajectory from that UAV.
+  bool injectNeighborIntent(const swarm_uav_interfaces::UavTrajectoryIntent& intent);
   void injectMavrosState(bool armed, bool offboard);
   void sendGoal(double x, double y, double z);
   void sendWaypoints(const std::vector<geometry_msgs::Point32>& points);
@@ -93,6 +96,8 @@ public:
   boost::optional<HoldTarget> steadyTarget() const;
   mavros_msgs::PositionTarget lastSetpoint() const;
   size_t setpointCount() const;
+  boost::optional<TimedTrajectory> currentTrajectory() const;
+  ros::Time planStart() const;
   // 测试断言：时间触发重规划是否已请求。
   bool planningRequested() const;
   // 测试用：禁用 replanLoop 线程（单测手动 replanOnce 驱动时避免线程抢占）。
@@ -104,6 +109,8 @@ private:
   void onWaypoints(const geometry_msgs::PolygonStamped::ConstPtr& msg);
   void onLocalPose(const geometry_msgs::PoseStamped::ConstPtr& msg);
   void onNeighborIntent(const swarm_uav_interfaces::UavTrajectoryIntent::ConstPtr& msg);
+  bool acceptNeighborIntentLocked(
+      const swarm_uav_interfaces::UavTrajectoryIntent& msg, const ros::Time& now);
   void onHold(const std_msgs::Empty::ConstPtr& msg);
   void onMavrosState(const mavros_msgs::State::ConstPtr& msg);
   void onDirectControl(const std_msgs::Bool::ConstPtr& msg);
@@ -129,6 +136,14 @@ private:
   // Euclidean norm so a pathological sampled derivative cannot spread the
   // pinned control points and amplify into a large setpoint overshoot.
   void clampStartDerivatives(Eigen::Vector3d& vel, Eigen::Vector3d& acc) const;
+  // Convert absolute neighbor activation epochs onto a candidate trajectory's
+  // relative axis (candidate activation == 0). This must be repeated after
+  // optimization because planning latency advances every moving neighbor.
+  static std::vector<NeighborTrajectory> rebaseNeighbors(
+      const std::vector<NeighborTrajectory>& absolute_neighbors,
+      const ros::Time& candidate_activation);
+  std::vector<NeighborTrajectory> freshAbsoluteNeighborsLocked(
+      const ros::Time& now) const;
 
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }
   void resetRun();
@@ -163,6 +178,7 @@ private:
   double planning_horizon_ = 0.0;
   double replan_period_s_ = 1.0;
   double no_replan_thresh_m_ = 1.0;
+  int activation_replan_attempts_ = 3;
   bool direct_control_active_ = false;
   volatile bool replan_loop_enabled_ = true;
 
@@ -219,7 +235,9 @@ private:
   boost::optional<mavros_msgs::PositionTarget> last_setpoint_;
 
   ClockFn clock_source_;
-  std::map<std::string, int32_t> latest_traj_id_;
+  // Last accepted (epoch, sequence) per neighbor. A newer epoch establishes a
+  // new sequence generation, allowing process restarts and int32 wraparound.
+  std::map<std::string, std::pair<double, int32_t>> latest_neighbor_version_;
   std::map<std::string, std::pair<NeighborTrajectory, ros::Time>> inbox_;
 };
 

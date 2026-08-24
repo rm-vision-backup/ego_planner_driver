@@ -141,7 +141,8 @@ struct TimedTrajectory
   // consistent derivatives (no cross-frame numeric differentiation).
   bool samplePVA(double t_rel, TrajectorySample& out) const
   {
-    if (pts.empty() || vel.empty() || acc.empty() || yaw.empty())
+    if (t.empty() || pts.size() != t.size() || vel.size() != t.size() ||
+        acc.size() != t.size() || yaw.size() != t.size())
       return false;
     if (t.size() == 1)
     {
@@ -151,10 +152,24 @@ struct TimedTrajectory
       out.yaw = yaw.front();
       return true;
     }
-    size_t lo = 0;
+    if (t_rel <= t.front())
+    {
+      out.pos = pts.front();
+      out.vel = vel.front();
+      out.acc = acc.front();
+      out.yaw = yaw.front();
+      return true;
+    }
     if (t_rel >= t.back())
-      lo = t.size() - 2;
-    else if (t_rel > t.front())
+    {
+      out.pos = pts.back();
+      out.vel = vel.back();
+      out.acc = acc.back();
+      out.yaw = yaw.back();
+      return true;
+    }
+    size_t lo = 0;
+    if (t_rel > t.front())
     {
       for (size_t i = 0; i + 1 < t.size(); ++i)
       {

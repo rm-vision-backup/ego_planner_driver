@@ -30,6 +30,8 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   planning_horizon_ = config.planning_horizon;
   replan_period_s_ = pnh_.param("replan_period_s", 1.0);
   no_replan_thresh_m_ = pnh_.param("no_replan_thresh_m", 1.0);
+  activation_replan_attempts_ = std::max(
+      1, pnh_.param("activation_replan_attempts", 3));
   setpoint_topic_ = pnh_.param("setpoint_out_topic", std::string("setpoint/ego"));
   frame_id_ = pnh_.param("frame_id", std::string("map"));
   // Identity parameters live in the public namespace (/UAV1/*) so the
@@ -92,6 +94,13 @@ void EgoPlannerDriverNode::injectLocalPose(const geometry_msgs::PoseStamped& pos
   local_pose_stamp_ = pose.header.stamp;
   if (exec_state_ == kStateHold && !steady_target_ && !direct_control_active_)
     captureHoldTargetLocked(nowFunc());
+}
+
+bool EgoPlannerDriverNode::injectNeighborIntent(
+    const swarm_uav_interfaces::UavTrajectoryIntent& intent)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return acceptNeighborIntentLocked(intent, nowFunc());
 }
 
 void EgoPlannerDriverNode::injectMavrosState(bool armed, bool offboard)
@@ -212,22 +221,42 @@ bool EgoPlannerDriverNode::replanOnce()
     // 切线巡航速度，保证滚动段间速度连续。
     data.final_segment = near_final || planning_horizon_ <= 0.0 ||
         waypoint_consumed_ + 1 >= waypoints_.size();
-    for (const auto& item : inbox_)
-    {
-      if ((now - item.second.second).toSec() > kNeighborStaleS)
-        continue;
-      NeighborTrajectory nb = item.second.first;
-      nb.start_time = nb.start_time - now.toSec();  // local axis: now==0
-      data.neighbors.push_back(nb);
-    }
+    data.neighbors = freshAbsoluteNeighborsLocked(now);
     snap = Snapshot(std::move(data));
   }
   if (!snap)
     return false;
   TimedTrajectory traj;
   double cost = 0.0;
-  if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost,
-                       snap->start_vel, snap->start_acc, snap->final_segment))
+  bool safe_candidate = false;
+  ros::Time assumed_activation = snap->now;
+  for (int attempt = 0; attempt < activation_replan_attempts_; ++attempt)
+  {
+    std::vector<NeighborTrajectory> absolute_neighbors;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      absolute_neighbors = freshAbsoluteNeighborsLocked(nowFunc());
+    }
+    const std::vector<NeighborTrajectory> planning_neighbors =
+        rebaseNeighbors(absolute_neighbors, assumed_activation);
+    if (!core_->planOnce(snap->start, snap->waypoints, planning_neighbors, traj, cost,
+                         snap->start_vel, snap->start_acc, snap->final_segment))
+    {
+      assumed_activation = nowFunc();
+      continue;
+    }
+    completed_at = nowFunc();
+    const std::vector<NeighborTrajectory> activation_neighbors =
+        rebaseNeighbors(absolute_neighbors, completed_at);
+    if (core_->checkClearance(traj, activation_neighbors,
+                              core_->config().swarm_clearance * 2.0))
+    {
+      safe_candidate = true;
+      break;
+    }
+    assumed_activation = completed_at;
+  }
+  if (!safe_candidate)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     captureHoldTargetLocked(nowFunc());
@@ -238,14 +267,18 @@ bool EgoPlannerDriverNode::replanOnce()
     std::lock_guard<std::mutex> lock(mutex_);
     if (hold_requested_)
       return true;
-    completed_at = nowFunc();
-    const double offset = (completed_at - snap->now).toSec();
-    if (offset > 0.0)
+    const std::vector<NeighborTrajectory> commit_neighbors = rebaseNeighbors(
+        freshAbsoluteNeighborsLocked(completed_at), completed_at);
+    if (!core_->checkClearance(traj, commit_neighbors,
+                               core_->config().swarm_clearance * 2.0))
     {
-      for (double& tv : traj.t)
-        tv += offset;
-      traj.duration += offset;
+      captureHoldTargetLocked(completed_at);
+      setState(kStatePlanFailed);
+      return false;
     }
+    // The freshly generated trajectory owns a relative time axis beginning at
+    // zero. Planning latency is represented exactly once by this activation
+    // epoch; it must never be added to relative samples or duration.
     current_.reset(new TimedTrajectory(traj));
     plan_start_ = completed_at;
     arrival_since_.reset();
@@ -422,31 +455,100 @@ void EgoPlannerDriverNode::onLocalPose(const geometry_msgs::PoseStamped::ConstPt
 void EgoPlannerDriverNode::onNeighborIntent(
     const swarm_uav_interfaces::UavTrajectoryIntent::ConstPtr& msg)
 {
-  if (msg->uav_id == uav_id_)
-    return;
   std::lock_guard<std::mutex> lock(mutex_);
-  auto it = latest_traj_id_.find(msg->uav_id);
-  if (it != latest_traj_id_.end() && msg->traj_id <= it->second)
-    return;
-  const size_t n = std::min(msg->t.size(), msg->sampled_traj.size());
-  if (n < 2)
-    return;
+  acceptNeighborIntentLocked(*msg, nowFunc());
+}
+
+bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
+    const swarm_uav_interfaces::UavTrajectoryIntent& msg, const ros::Time& now)
+{
+  if (msg.protocol_version != "1.0" || msg.uav_id.empty() ||
+      msg.uav_id == uav_id_ || msg.exec_target.empty() ||
+      msg.frame_id != frame_id_ || !std::isfinite(msg.stamp) ||
+      !std::isfinite(msg.clearance) || msg.clearance <= 0.0 ||
+      msg.t.size() != msg.sampled_traj.size() || msg.t.size() < 2)
+    return false;
+
+  // A trajectory epoch is its activation time. Reject already stale epochs and
+  // implausibly future epochs rather than retaining unusable or unsynchronised
+  // trajectories in the reciprocal planner.
+  const double age = now.toSec() - msg.stamp;
+  if (age > kNeighborStaleS || age < -kNeighborStaleS)
+    return false;
+
+  constexpr double kTimeEpsilon = 1e-9;
+  if (!std::isfinite(msg.t.front()) || std::abs(msg.t.front()) > kTimeEpsilon)
+    return false;
+  for (size_t i = 0; i < msg.t.size(); ++i)
+  {
+    const geometry_msgs::Point& p = msg.sampled_traj[i].position;
+    if (!std::isfinite(msg.t[i]) || !std::isfinite(p.x) ||
+        !std::isfinite(p.y) || !std::isfinite(p.z) ||
+        (i > 0 && msg.t[i] <= msg.t[i - 1]))
+      return false;
+  }
+
+  auto version = latest_neighbor_version_.find(msg.uav_id);
+  if (version != latest_neighbor_version_.end())
+  {
+    const double previous_epoch = version->second.first;
+    if (msg.stamp < previous_epoch - kTimeEpsilon ||
+        (std::abs(msg.stamp - previous_epoch) <= kTimeEpsilon &&
+         msg.traj_id <= version->second.second))
+      return false;
+  }
+
+  const size_t n = msg.t.size();
   NeighborTrajectory nb;
-  nb.start_time = msg->stamp;  // absolute seconds; converted relative at replan
-  nb.clearance = msg->clearance;
-  nb.duration = msg->t[n - 1];
+  nb.start_time = msg.stamp;  // absolute epoch; converted at planning snapshot
+  nb.clearance = msg.clearance;
+  nb.duration = msg.t.back();
   nb.t.reserve(n);
   nb.pts.reserve(n);
   for (size_t i = 0; i < n; ++i)
   {
-    nb.t.push_back(msg->t[i]);
-    nb.pts.emplace_back(msg->sampled_traj[i].position.x,
-                        msg->sampled_traj[i].position.y,
-                        msg->sampled_traj[i].position.z);
+    nb.t.push_back(msg.t[i]);
+    nb.pts.emplace_back(msg.sampled_traj[i].position.x,
+                        msg.sampled_traj[i].position.y,
+                        msg.sampled_traj[i].position.z);
   }
-  inbox_[msg->uav_id] = std::make_pair(nb, nowFunc());
-  latest_traj_id_[msg->uav_id] = msg->traj_id;
-  planning_requested_ = true;
+  inbox_[msg.uav_id] = std::make_pair(nb, now);
+  latest_neighbor_version_[msg.uav_id] = std::make_pair(msg.stamp, msg.traj_id);
+  // Avoid reciprocal intent ping-pong: a new version only requests replanning
+  // when it invalidates the trajectory currently being executed. With no
+  // active trajectory it is simply retained for the next requested plan.
+  if (current_ && !plan_start_.isZero())
+  {
+    NeighborTrajectory relative = nb;
+    relative.start_time -= plan_start_.toSec();
+    if (!core_->checkClearance(*current_, {relative},
+                               core_->config().swarm_clearance * 2.0))
+      planning_requested_ = true;
+  }
+  return true;
+}
+
+std::vector<NeighborTrajectory> EgoPlannerDriverNode::rebaseNeighbors(
+    const std::vector<NeighborTrajectory>& absolute_neighbors,
+    const ros::Time& candidate_activation)
+{
+  std::vector<NeighborTrajectory> result = absolute_neighbors;
+  for (auto& neighbor : result)
+    neighbor.start_time -= candidate_activation.toSec();
+  return result;
+}
+
+std::vector<NeighborTrajectory>
+EgoPlannerDriverNode::freshAbsoluteNeighborsLocked(const ros::Time& now) const
+{
+  std::vector<NeighborTrajectory> result;
+  result.reserve(inbox_.size());
+  for (const auto& item : inbox_)
+  {
+    if ((now - item.second.second).toSec() <= kNeighborStaleS)
+      result.push_back(item.second.first);
+  }
+  return result;
 }
 
 void EgoPlannerDriverNode::onHold(const std_msgs::Empty::ConstPtr&)
@@ -776,6 +878,7 @@ void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros:
   msg.protocol_version = "1.0";
   msg.uav_id = uav_id_;
   msg.exec_target = exec_target_;
+  msg.frame_id = frame_id_;
   msg.traj_id = ++traj_id_;
   msg.stamp = base.toSec();
   msg.clearance = core_->config().swarm_clearance;
@@ -802,6 +905,20 @@ bool EgoPlannerDriverNode::planningRequested() const
 {
   std::lock_guard<std::mutex> lock(mutex_);
   return planning_requested_;
+}
+
+boost::optional<TimedTrajectory> EgoPlannerDriverNode::currentTrajectory() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!current_)
+    return boost::none;
+  return *current_;
+}
+
+ros::Time EgoPlannerDriverNode::planStart() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return plan_start_;
 }
 
 void EgoPlannerDriverNode::setReplanLoopEnabled(bool enabled)
@@ -908,24 +1025,45 @@ void EgoPlannerDriverNode::replanLoop()
       // 最终段判定（同 replanOnce）：近目标 / 全局规划 / 窗口无更多航点。
       data.final_segment = near_final || planning_horizon_ <= 0.0 ||
           waypoint_consumed_ + 1 >= waypoints_.size();
-      for (const auto& item : inbox_)
-      {
-        if ((now - item.second.second).toSec() > kNeighborStaleS)
-          continue;
-        NeighborTrajectory nb = item.second.first;
-        nb.start_time = nb.start_time - now.toSec();  // local axis: now==0
-        data.neighbors.push_back(nb);
-      }
+      data.neighbors = freshAbsoluteNeighborsLocked(now);
       snap = Snapshot(std::move(data));
     }
     if (!snap)
       continue;
     TimedTrajectory traj;
     double cost = 0.0;
-    if (!core_->planOnce(snap->start, snap->waypoints, snap->neighbors, traj, cost,
-                         snap->start_vel, snap->start_acc, snap->final_segment))
+    bool safe_candidate = false;
+    ros::Time assumed_activation = snap->now;
+    for (int attempt = 0; attempt < activation_replan_attempts_; ++attempt)
+    {
+      std::vector<NeighborTrajectory> absolute_neighbors;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        absolute_neighbors = freshAbsoluteNeighborsLocked(nowFunc());
+      }
+      const std::vector<NeighborTrajectory> planning_neighbors =
+          rebaseNeighbors(absolute_neighbors, assumed_activation);
+      if (!core_->planOnce(snap->start, snap->waypoints, planning_neighbors, traj, cost,
+                           snap->start_vel, snap->start_acc, snap->final_segment))
+      {
+        assumed_activation = nowFunc();
+        continue;
+      }
+      completed_at = nowFunc();
+      const std::vector<NeighborTrajectory> activation_neighbors =
+          rebaseNeighbors(absolute_neighbors, completed_at);
+      if (core_->checkClearance(traj, activation_neighbors,
+                                core_->config().swarm_clearance * 2.0))
+      {
+        safe_candidate = true;
+        break;
+      }
+      assumed_activation = completed_at;
+    }
+    if (!safe_candidate)
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      captureHoldTargetLocked(nowFunc());
       setState(kStatePlanFailed);
       continue;
     }
@@ -933,17 +1071,17 @@ void EgoPlannerDriverNode::replanLoop()
       std::lock_guard<std::mutex> lock(mutex_);
       if (hold_requested_)
         continue;
-      completed_at = nowFunc();
-      const double offset = (completed_at - snap->now).toSec();
-      if (offset > 0.0)
+      const std::vector<NeighborTrajectory> commit_neighbors = rebaseNeighbors(
+          freshAbsoluteNeighborsLocked(completed_at), completed_at);
+      if (!core_->checkClearance(traj, commit_neighbors,
+                                 core_->config().swarm_clearance * 2.0))
       {
-        // The optimizer consumed wall-clock time after the snapshot; shift
-        // the trajectory so its epoch is the publish moment, otherwise the
-        // execution timeline starts mid-trajectory.
-        for (double& tv : traj.t)
-          tv += offset;
-        traj.duration += offset;
+        captureHoldTargetLocked(completed_at);
+        setState(kStatePlanFailed);
+        continue;
       }
+      // Activation epoch accounts for planning latency exactly once; traj.t
+      // remains relative and starts at zero.
       current_.reset(new TimedTrajectory(traj));
       plan_start_ = completed_at;
       arrival_since_.reset();

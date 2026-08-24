@@ -664,7 +664,12 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
                          config_.feasibility_tolerance);
   double fea_ratio = 1.0;
   const bool feasible = traj.checkFeasibility(fea_ratio);
-  if (!feasible && config_.enable_time_reparam)
+  // Rebound changes geometry after optimization and can create large control
+  // point derivatives. Never release an actively avoided trajectory that
+  // violates the configured physical limits. Reparameterize rebound output
+  // even when generic rolling-segment reparameterization remains disabled;
+  // the final clearance check below evaluates the resulting time axis again.
+  if (!feasible && (config_.enable_time_reparam || config_.enable_rebound))
     traj.lengthenTime(fea_ratio);
   double tm, tmp;
   traj.getTimeSpan(tm, tmp);
@@ -701,6 +706,19 @@ bool EgoPlannerCore::planOnce(const GoalPoint& start,
     out.pts.push_back(traj.evaluateDeBoorT(t_rel));
     out.vel.push_back(Eigen::Vector3d(dtraj.evaluateDeBoorT(std::min(t_rel, t_der_max))));
     out.acc.push_back(Eigen::Vector3d(ddtraj.evaluateDeBoorT(std::min(t_rel, t_acc_max))));
+    out.yaw.push_back(start.yaw);
+  }
+  // The fixed sampling step rarely divides the exact B-spline duration. The
+  // intent contract requires t.back() == duration so neighbors can predict the
+  // entire execution interval rather than losing the fractional final sample.
+  if (!out.t.empty() && duration - out.t.back() > 1e-9)
+  {
+    out.t.push_back(duration);
+    out.pts.push_back(traj.evaluateDeBoorT(duration));
+    out.vel.push_back(Eigen::Vector3d(
+        dtraj.evaluateDeBoorT(std::min(duration, t_der_max))));
+    out.acc.push_back(Eigen::Vector3d(
+        ddtraj.evaluateDeBoorT(std::min(duration, t_acc_max))));
     out.yaw.push_back(start.yaw);
   }
   if (out.t.empty())

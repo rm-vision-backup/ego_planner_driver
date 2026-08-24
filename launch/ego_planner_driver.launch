@@ -19,6 +19,9 @@
          对齐原版 ego-planner-swarm receding-horizon；0 表示全局规划（退化）。 -->
     <param name="planning_horizon" value="5.0"/>
     <param name="replan_period_s" value="1.0"/>
+    <!-- Candidate activation-time reconciliation retries. Each retry advances
+         neighbor intent epochs to the actual post-optimization activation. -->
+    <param name="activation_replan_attempts" value="3"/>
     <!-- 最终目标附近（no_replan_thresh_m 内）停止时间触发重规划，让最后一段
          轨迹自然减速走完（对齐原版 fsm/thresh_no_replan_meter） -->
     <param name="no_replan_thresh_m" value="1.0"/>

@@ -51,6 +51,10 @@
   feasibility 软惩罚）→ 采样发布 PositionTarget P/V/A。起点/末端控制点分别在优化前/后精确锚定。
 - 默认停用 `enable_rebound`（rebound 硬推）与 `enable_time_reparam`（时间重参数化）；机间安全由
   执行层运行时距离门禁兜底（`EgoSwarmDriver._distance_safe`，水平 <1.0m 且垂直 <2.0m → 本机 HOLD）。
+- `UavTrajectoryIntent.stamp` 是轨迹实际激活 epoch，`t` 严格递增且相对该 epoch（`t[0]=0`、
+  `t.back()=duration`）；生产者填写 `frame_id=map`。接收端拒绝协议、frame、epoch、序列、长度、
+  单调性或有限值不合法的 intent。规划完成后按候选实际激活时刻重新推进邻机时间轴，最多重试 3 次，
+  并在提交锁内使用最新 intent 再做一次 1m hard-clearance 校验，防止规划耗时与并发更新批准陈旧候选。
 - 多段 `minSnapTraj` 为备用方案（单段无法处理时的修改方案），本计划不实现。
 
 身份参数（`uav_id`/`exec_target`）位于公开命名空间 `<namespace>/`；规划调参位于私有 `<node_name>/`。
@@ -59,7 +63,8 @@
 
 - C++ 节点不 arm、不切 OFFBOARD，也不因 arm+OFFBOARD 自动起飞。除 FOLLOW_ROUTE follower 的 PI 位置跟随外，轨迹均由 Ego 规划；PI 直接控制期间通过仲裁暂停 EGO setpoint。
 - `swarm_clearance=0.5` 表示每机安全半径：互惠检查使用两倍值，对应 1.0 m 水平中心距；原有 2:1 椭球对应 2.0 m 垂直中心距。规划结果在发布前执行硬 clearance 校验。rebound 硬推默认关闭，机间安全由执行层运行时距离门禁（`EgoSwarmDriver._distance_safe`）兜底：邻机水平 <1.0m 且垂直 <2.0m 时本机 HOLD 暂停。
-- 自动化：2026-08-24 min-snap 重构后 `catkin_test_results --all build` 166 tests 0 failure（含 one_segment_traj_gen 边界插值、最终段静止、巡航速度剖面、滚动连续性用例）。
+- rebound 手工启用时会对硬推后的轨迹强制时间重参数化，再按新时间轴重做 clearance；理想匀速正交交叉可在速度 ≤1.5m/s、加速度 ≤`max_acc*1.05` 下到达。但由同一 min-snap 核心生成的真实 peer nominal intent 仍可能使让路方规划失败，多轮互惠收敛尚未通过，因此禁止仅翻转默认开关。
+- 自动化：2026-08-24 最终回归 `catkin_test_results --all build` 186 tests 0 failure；`ego_planner_driver` 78 tests，覆盖 intent 校验/版本重置、规划耗时激活 epoch、精确末样本、交叉 clearance 与 rebound 动力学。
 - 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS；2026-08-12 起初始态改为 `HOLD`，arm+OFFBOARD 后进入 `TAKEOFF` 软起飞。详见 `tcp_to_ros/docs/test_record_26081402.md`。
 
 ## 环境变量（ROS 日志重定向）
