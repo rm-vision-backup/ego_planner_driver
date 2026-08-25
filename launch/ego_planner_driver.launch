@@ -51,6 +51,7 @@
          trajectory, intent, or setpoint behavior changes in shadow mode. -->
     <param name="safety_supervisor_mode" value="shadow"/>
     <param name="safety_supervisor_rate_hz" value="25.0"/>
+    <param name="intent_publish_rate_hz" value="5.0"/>
     <param name="safety_prediction_horizon_s" value="5.0"/>
     <param name="safety_sample_period_s" value="0.05"/>
     <param name="protected_distance_m" value="1.0"/>

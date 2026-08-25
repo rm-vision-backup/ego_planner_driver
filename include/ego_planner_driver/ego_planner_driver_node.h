@@ -50,7 +50,12 @@ static constexpr const char* kStateBrakeHold = "BRAKE_HOLD";
 static constexpr const char* kStateNegotiating = "NEGOTIATING";
 
 constexpr double kSetpointRateHz = 30.0;
-constexpr double kNeighborStaleS = 5.0;
+// Intent freshness bound: peers keep their intent within [now-30s, now+30s]
+// of the trajectory epoch. The 5.0s bound was too tight for long rolling
+// trajectories (>5s execution) refreshed periodically with a fixed epoch —
+// peers rejected the refresh as stale and the dynamic safe clearance kept
+// the old (large) intent age.
+constexpr double kNeighborStaleS = 30.0;
 constexpr double kReplanPeriodS = 0.5;
 
 // PositionTarget type masks (mavros_msgs constants):
@@ -173,6 +178,7 @@ private:
   static double yawFromQuat(const geometry_msgs::Quaternion& q);
   void publishSetpoint(const ros::TimerEvent& event);
   void runSafetySupervisor(const ros::TimerEvent& event);
+  void publishCurrentIntentTick(const ros::TimerEvent& event);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   void processHoldLocked();
   void handleMavrosStateEdgeLocked();
@@ -255,6 +261,15 @@ private:
   ros::Subscriber direct_control_sub_;
   ros::Timer timer_;
   ros::Timer safety_timer_;
+  // Periodic intent refresh (intent_publish_rate_hz): republishes the current
+  // executed trajectory with the fixed activation epoch and an incremented
+  // traj_id, so peers see a fresh receive age (small data_age_s -> small
+  // dynamic safe clearance) without changing the trajectory's time axis.
+  ros::Timer intent_refresh_timer_;
+  double intent_publish_rate_hz_ = 5.0;
+  // Serializes traj_id_ increment + intent_pub_ publish across the replan
+  // thread and the periodic intent-refresh timer callback.
+  std::mutex intent_pub_mutex_;
 
   mutable std::mutex mutex_;
   std::thread replan_thread_;

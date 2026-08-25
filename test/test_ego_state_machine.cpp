@@ -418,9 +418,11 @@ TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
   malformed.sampled_traj.pop_back();
   EXPECT_FALSE(node.injectNeighborIntent(malformed));
 
-  clock.set(110.0);
-  EXPECT_FALSE(node.injectNeighborIntent(makeIntent(100.2, 2)));
-  EXPECT_FALSE(node.injectNeighborIntent(makeIntent(120.0, 2)));
+  // kNeighborStaleS=30s（周期 intent 刷新 + 长轨迹）：意图 epoch 允许在
+  // [now-30, now+30]，超过才拒绝。
+  clock.set(140.0);
+  EXPECT_FALSE(node.injectNeighborIntent(makeIntent(100.2, 2)));  // age=39.8s > 30s
+  EXPECT_FALSE(node.injectNeighborIntent(makeIntent(60.0, 2)));   // age=80s > 30s
 }
 
 TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)

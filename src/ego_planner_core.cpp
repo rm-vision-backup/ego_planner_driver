@@ -809,11 +809,12 @@ bool EgoPlannerCore::checkClearance(const TimedTrajectory& trajectory,
       const double ellip_dist = std::sqrt(
           dist_vec(2) * dist_vec(2) * kInvA2 +
           (dist_vec(0) * dist_vec(0) + dist_vec(1) * dist_vec(1)) * kInvB2);
-      // 预测式避碰：用节点算好的动态安全距离（SafetyPredictor 公式），使提交
-      // 轨迹必须在 peer 的预测冲突区域（同刻交点局部）之外。
-      const double gate = neighbor.safe_clearance_m > 0.0
-          ? neighbor.safe_clearance_m : clearance;
-      if (ellip_dist < gate)
+      // 硬校验保持固定 swarm clearance（物理安全门，1 m），不随监督动态
+      // 距离收紧：SITL 实测动态距离（含反应+制动余量，正交交叉时 ≈4 m）
+      // 作为硬门会让规划在交叉走廊内拒绝一切穿越轨迹 → EGO_PLAN_FAILED
+      // （比监督制动兜底更差）。动态距离只用于 calcSwarmCost 软惩罚激励
+      // 绕开，运行时由 SafetyPredictor/监督层兜底。
+      if (ellip_dist < clearance)
         return false;
     }
   }

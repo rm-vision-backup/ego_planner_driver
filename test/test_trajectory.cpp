@@ -300,7 +300,9 @@ TEST(EgoPlannerCore, PredictiveAvoidanceDeviatesAroundCrossingPeer)
             << " max_dev_avoided=" << max_dev_avoided
             << " plan_once_ok=true" << std::endl;
 
-  // 硬校验应通过：轨迹全程都在 peer 的动态安全距离之外。
+  // 分层安全（SITL 实测修正）：动态距离只做软惩罚绕开激励；硬校验保持
+  // 固定物理安全门（1m），否则正交交叉走廊内一切穿越轨迹都会被动态门
+  // 拒绝 → EGO_PLAN_FAILED。绕开轨迹必然满足 1m 硬门。
   EXPECT_TRUE(core.checkClearance(avoided, {peer}, config.swarm_clearance * 2.0));
 }
 

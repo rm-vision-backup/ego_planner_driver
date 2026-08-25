@@ -65,6 +65,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.safety_emergency_buffer_m = pnh_.param("emergency_buffer_m", 0.10);
   config.safety_protected_distance_m = pnh_.param("protected_distance_m", 1.0);
   config.swarm_soft_margin = pnh_.param("swarm_soft_margin", 0.5);
+  intent_publish_rate_hz_ = pnh_.param("intent_publish_rate_hz", 5.0);
   core_.reset(new EgoPlannerCore(config));
   planning_horizon_ = config.planning_horizon;
   replan_period_s_ = pnh_.param("replan_period_s", 1.0);
@@ -178,6 +179,10 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   if (safety_supervisor_mode_ != "off" && safety_supervisor_rate_hz_ > 0.0)
     safety_timer_ = nh_.createTimer(ros::Duration(1.0 / safety_supervisor_rate_hz_),
         &EgoPlannerDriverNode::runSafetySupervisor, this);
+  if (intent_publish_rate_hz_ > 0.0)
+    intent_refresh_timer_ = nh_.createTimer(
+        ros::Duration(1.0 / intent_publish_rate_hz_),
+        &EgoPlannerDriverNode::publishCurrentIntentTick, this);
   replan_thread_ = std::thread(&EgoPlannerDriverNode::replanLoop, this);
 }
 
@@ -754,6 +759,13 @@ EgoPlannerDriverNode::freshAbsoluteNeighborsLocked(const ros::Time& now) const
       neighbor.safe_clearance_m = EgoPlannerCore::computeSafeClearance(
           core_config, neighbor, now.toSec() - neighbor.start_time,
           self_pos, self_vel);
+      // 诊断：暴露动态安全距离的输入分解（age / peer 相对时间 / safe），
+      // 用于确认交叉场景 4m 门槛来自 age 还是 closing。
+      ROS_INFO_STREAM_THROTTLE(1.0, "[safe_clearance] peer=" << item.first
+          << " age=" << neighbor.data_age_s
+          << " t_rel=" << (now.toSec() - neighbor.start_time)
+          << " safe=" << neighbor.safe_clearance_m
+          << " self_vel=" << self_vel.norm());
       result.push_back(neighbor);
     }
   }
@@ -1377,6 +1389,17 @@ void EgoPlannerDriverNode::processHoldLocked()
   captureHoldTargetLocked(now);
 }
 
+void EgoPlannerDriverNode::publishCurrentIntentTick(const ros::TimerEvent&)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  // 周期刷新 intent：固定激活时刻（plan_start_，epoch 不变），递增 traj_id，
+  // 只刷新邻机接收时刻 → 邻机 data_age 小 → 动态安全距离小。轨迹时间轴不变，
+  // 邻机采样 peer 同刻位置不受影响。
+  if (current_ && !plan_start_.isZero())
+    publishIntent(*current_, plan_start_,
+                  swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+}
+
 void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros::Time& base)
 {
   publishIntent(traj, base, swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
@@ -1385,6 +1408,7 @@ void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros:
 void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj,
                                          const ros::Time& base, uint8_t phase)
 {
+  std::lock_guard<std::mutex> pub_lock(intent_pub_mutex_);
   swarm_uav_interfaces::UavTrajectoryIntent msg;
   msg.protocol_version = "2.0";
   msg.phase = phase;
