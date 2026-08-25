@@ -71,7 +71,6 @@
     <param name="neighbor_stale_policy" value="diagnose_only"/>
     <param name="neighbor_intent_stale_s" value="2.0"/>
     <param name="neighbor_missing_policy" value="continue_after_barrier"/>
-    <param name="intent_negotiation_wait_s" value="1.0"/>
     <param name="diagnostic_log_dir" value="/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner"/>
     <param name="diagnostic_log_queue_size" value="2048"/>
   </node>
