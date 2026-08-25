@@ -108,7 +108,7 @@
 - 自动化：2026-08-25 阶段 A `ego_planner_driver` 96 tests、0 failure（原 78 全回归 + 新 18），
   覆盖 CPA/TTC、绝对时间同步、数据年龄、动态门槛、身份/角色、episode 迟滞、异步日志和 shadow
   行为不变。双节点动力学、SITL 与完整链路尚未执行。
-- 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS；2026-08-12 起初始态改为 `HOLD`，arm+OFFBOARD 后进入 `TAKEOFF` 软起飞。详见 `tcp_to_ros/docs/test_record_26081402.md`。
+- 单 Master 冒烟（2026-08-10）：`IDLE → EXECUTING → COMPLETED → HOLD` 生命周期 PASS；2026-08-12 起初始态改为 `HOLD`，arm+OFFBOARD 后进入 `TAKEOFF` 软起飞。详见 `tcp_to_ros/test_records/test_record_26081402.md`。
 
 ## 环境变量（ROS 日志重定向）
 
