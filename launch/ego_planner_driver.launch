@@ -73,5 +73,12 @@
     <param name="intent_negotiation_wait_s" value="1.0"/>
     <param name="diagnostic_log_dir" value="/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner"/>
     <param name="diagnostic_log_queue_size" value="2048"/>
+    <param name="enable_yield_candidates" value="true"/>
+    <param name="yield_lateral_offset_m" value="2.2"/>
+    <param name="yield_lateral_time_scale" value="1.5"/>
+    <param name="yield_slow_time_scale" value="1.5"/>
+    <param name="yield_fast_time_scale" value="0.8"/>
+    <param name="yield_max_velocity_mps" value="1.5"/>
+    <param name="yield_max_jerk_mps3" value="12.0"/>
   </node>
 </launch>

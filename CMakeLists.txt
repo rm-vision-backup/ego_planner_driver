@@ -33,6 +33,7 @@ add_library(ego_planner_core
   src/safety_predictor.cpp
   src/safety_logger.cpp
   src/emergency_brake.cpp
+  src/yield_candidates.cpp
 )
 target_link_libraries(ego_planner_core ${catkin_LIBRARIES})
 
@@ -54,4 +55,6 @@ if(CATKIN_ENABLE_TESTING)
   target_link_libraries(test_safety_predictor ego_planner_core ${catkin_LIBRARIES})
   catkin_add_gtest(test_emergency_brake test/test_emergency_brake.cpp)
   target_link_libraries(test_emergency_brake ego_planner_core ${catkin_LIBRARIES})
+  catkin_add_gtest(test_yield_candidates test/test_yield_candidates.cpp)
+  target_link_libraries(test_yield_candidates ego_planner_core ${catkin_LIBRARIES})
 endif()

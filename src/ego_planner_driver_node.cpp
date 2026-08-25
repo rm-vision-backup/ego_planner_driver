@@ -9,6 +9,34 @@
 
 namespace ego_planner_driver
 {
+namespace
+{
+TimedTrajectory remainingTrajectory(const TimedTrajectory& source, double elapsed)
+{
+  TimedTrajectory out;
+  if (source.t.empty()) return out;
+  const double begin = std::max(0.0, std::min(elapsed, source.duration));
+  TrajectorySample first;
+  if (!source.samplePVA(begin, first)) return out;
+  out.t.push_back(0.0);
+  out.pts.push_back(first.pos);
+  out.vel.push_back(first.vel);
+  out.acc.push_back(first.acc);
+  out.yaw.push_back(first.yaw);
+  for (size_t i = 0; i < source.t.size(); ++i)
+  {
+    if (source.t[i] <= begin + 1e-9) continue;
+    out.t.push_back(source.t[i] - begin);
+    out.pts.push_back(source.pts[i]);
+    out.vel.push_back(source.vel[i]);
+    out.acc.push_back(source.acc[i]);
+    out.yaw.push_back(source.yaw[i]);
+  }
+  out.duration = source.duration - begin;
+  return out;
+}
+}  // namespace
+
 EgoPlannerDriverNode::EgoPlannerDriverNode()
     : nh_(), pnh_("~")
 {
@@ -78,6 +106,17 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   brake_config.nominal_deceleration_mps2 = safety_config_.emergency_decel_mps2;
   brake_config.sample_period_s = pnh_.param("emergency_sample_period_s", 0.02);
   emergency_brake_generator_.reset(new EmergencyBrakeGenerator(brake_config));
+  YieldCandidateConfig yield_config;
+  yield_config.lateral_offset_m = pnh_.param("yield_lateral_offset_m", 2.2);
+  yield_config.lateral_time_scale = pnh_.param("yield_lateral_time_scale", 1.5);
+  yield_config.slow_time_scale = pnh_.param("yield_slow_time_scale", 1.5);
+  yield_config.fast_time_scale = pnh_.param("yield_fast_time_scale", 0.8);
+  yield_config.max_velocity_mps = pnh_.param("yield_max_velocity_mps", 1.5);
+  yield_config.max_acceleration_mps2 = config.max_acc;
+  yield_config.max_jerk_mps3 = pnh_.param("yield_max_jerk_mps3", 12.0);
+  yield_config.clearance_m = safety_config_.protected_distance_m;
+  yield_candidate_generator_.reset(new YieldCandidateGenerator(yield_config));
+  enable_yield_candidates_ = pnh_.param("enable_yield_candidates", true);
   if (safety_supervisor_mode_ != "off" && safety_supervisor_mode_ != "shadow" &&
       safety_supervisor_mode_ != "active")
   {
@@ -741,6 +780,8 @@ void EgoPlannerDriverNode::resetRun()
   emergency_braking_ = false;
   tentative_.reset();
   tentative_created_ = ros::Time(0);
+  episode_maneuver_ = boost::none;
+  yield_committed_ = false;
 }
 
 void EgoPlannerDriverNode::setState(const std::string& state)
@@ -1025,12 +1066,76 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
     last_safety_prediction_ = prediction;
     conflict_episode_.update(prediction, now.toSec(),
                              episode_release_hysteresis_s_);
+    if (!conflict_episode_.active())
+    {
+      episode_maneuver_ = boost::none;
+      yield_committed_ = false;
+    }
     line = formatSafetyLog(prediction, now);
   }
   safety_logger_.enqueue(line);
-  if (safety_supervisor_mode_ != "active" ||
-      prediction.level != SafetyLevel::EMERGENCY)
+  if (safety_supervisor_mode_ != "active")
     return;
+
+  const auto primary = std::find_if(prediction.pairs.begin(), prediction.pairs.end(),
+      [&prediction](const PairPrediction& pair) {
+        return pair.peer_id == prediction.primary_peer_id;
+      });
+  const PairRole role = primary == prediction.pairs.end()
+      ? PairRole::UNKNOWN : primary->role;
+  bool force_brake = prediction.level == SafetyLevel::EMERGENCY;
+  if (prediction.level == SafetyLevel::WARNING && role == PairRole::STAND_ON)
+    return;
+  if (prediction.level == SafetyLevel::WARNING && role == PairRole::YIELD &&
+      yield_committed_)
+    return;
+  if (prediction.level == SafetyLevel::WARNING && role == PairRole::YIELD &&
+      enable_yield_candidates_ && yield_candidate_generator_)
+  {
+    const TimedTrajectory remaining = remainingTrajectory(
+        *self, now.toSec() - activation.toSec());
+    std::vector<NeighborTrajectory> relative_peers;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      relative_peers = rebaseNeighbors(freshAbsoluteNeighborsLocked(now), now);
+    }
+    const std::vector<YieldCandidate> candidates =
+        yield_candidate_generator_->generate(remaining, relative_peers);
+    YieldCandidate selected;
+    if (episode_maneuver_)
+    {
+      const auto locked = std::find_if(candidates.begin(), candidates.end(),
+          [this](const YieldCandidate& candidate) {
+            return candidate.maneuver == *episode_maneuver_ && candidate.feasible;
+          });
+      if (locked != candidates.end()) selected = *locked;
+      else yield_candidate_generator_->chooseBest(candidates, selected);
+    }
+    else
+    {
+      yield_candidate_generator_->chooseBest(candidates, selected);
+    }
+    if (selected.feasible)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!emergency_braking_ && current_ && plan_start_ == activation)
+      {
+        ++safety_generation_;
+        current_.reset(new TimedTrajectory(selected.trajectory));
+        plan_start_ = now;
+        planning_requested_ = false;
+        episode_maneuver_ = selected.maneuver;
+        yield_committed_ = true;
+        publishIntent(*current_, now,
+                      swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+      }
+      return;
+    }
+    force_brake = true;
+  }
+  if (prediction.level == SafetyLevel::WARNING && role == PairRole::UNKNOWN)
+    force_brake = true;
+  if (!force_brake) return;
 
   TrajectorySample start;
   if (!self->samplePVA(std::max(0.0, now.toSec() - activation.toSec()), start))

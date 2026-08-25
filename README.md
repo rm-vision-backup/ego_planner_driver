@@ -72,6 +72,15 @@
 - ROS1 `.msg` 变更会改变 MD5；部署必须同批重建 interfaces、planner、executor 和 bridge，不能混跑
   新旧二进制。bridge 仍只做 ROS 原生序列化透传，不理解 phase 业务。
 
+### 确定性让路候选（阶段 D）
+
+- active WARNING 时低 ID `STAND_ON` 保持 nominal；高 ID `YIELD` 按固定顺序构造 LEFT、RIGHT、
+  SLOW、FAST。UNKNOWN 不猜责任，转制动；EMERGENCY 对所有角色直接制动。
+- LEFT/RIGHT 使用 C2 横向 bell，候选起终点 P/V/A 连续；四类均经过 finite、速度、加速度、jerk
+  和全 peer clearance validator。评分固定为 clearance、到达时间增量、横移、枚举顺序。
+- episode 内候选只提交一次并锁存方向，避免 25Hz 重复切轨迹；失败转阶段 B 制动。`enable_rebound`
+  仍为 false。生产默认 shadow，因此 SITL 验收前不会自动执行候选。
+
 ## min-snap 统一单段重构（26082415）
 
 - 上层 `EgoSwarmDriver` 把分层关键点（start + 层点 + 弓字转折 + 目标）按最大 **2m** 间距密化后

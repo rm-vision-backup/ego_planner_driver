@@ -25,6 +25,7 @@
 #include "ego_planner_driver/emergency_brake.h"
 #include "ego_planner_driver/safety_logger.h"
 #include "ego_planner_driver/safety_predictor.h"
+#include "ego_planner_driver/yield_candidates.h"
 
 using ego_planner_driver::EgoPlannerConfig;
 using ego_planner_driver::EgoPlannerCore;
@@ -204,6 +205,10 @@ private:
   SafetyPredictorConfig safety_config_;
   std::unique_ptr<SafetyPredictor> safety_predictor_;
   std::unique_ptr<EmergencyBrakeGenerator> emergency_brake_generator_;
+  std::unique_ptr<YieldCandidateGenerator> yield_candidate_generator_;
+  bool enable_yield_candidates_ = true;
+  boost::optional<YieldManeuver> episode_maneuver_;
+  bool yield_committed_ = false;
   SafetyLogger safety_logger_;
   ConflictEpisode conflict_episode_;
   SafetyPrediction last_safety_prediction_;
