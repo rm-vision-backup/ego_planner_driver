@@ -200,6 +200,62 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
   EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
 }
 
+TEST(EgoStateMachine, ActiveYieldCommitsOnceAndReevaluatesOnPeerUpdate)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIdentityForTest("A02", "UAV2");  // self=A02 > peer A01 → YIELD
+  node.setSafetySupervisorModeForTest("active");
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+
+  // peer A01 平行同向、横向 1.2m：distance 恒 1.2，落在 warning(1.35) 与
+  // emergency(1.1) 之间 → WARNING + YIELD。
+  auto peer = makeIntent(100.0, 1, "A01");
+  peer.t = {0.0, 5.0};
+  peer.sampled_traj[0].position.x = 0.0;
+  peer.sampled_traj[0].position.y = 1.2;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.y = 1.2;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+
+  // 首次 tick：WARNING+YIELD → 提交让路候选，不制动（缺陷 2 主路径）。
+  node.safetySupervisorTick();
+  ASSERT_EQ(node.execState(), kStateExecuting);
+  ASSERT_TRUE(node.yieldCommittedForTest());
+
+  // peer 未更新：保持已提交候选，不重复切轨迹（缺陷 2 防抖）。
+  node.safetySupervisorTick();
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  EXPECT_TRUE(node.yieldCommittedForTest());
+
+  // peer 更新（traj_id=2）且轨迹逼近当前候选（横向 0.6m < clearance）：
+  // 旧代码因 yield_committed_ 无条件早退会忽略；新代码重新评估并制动。
+  auto peer2 = makeIntent(100.0, 2, "A01");
+  peer2.t = {0.0, 5.0};
+  peer2.sampled_traj[0].position.x = 0.0;
+  peer2.sampled_traj[0].position.y = 0.6;
+  peer2.sampled_traj[0].position.z = 5.0;
+  peer2.sampled_traj[1].position.x = 5.0;
+  peer2.sampled_traj[1].position.y = 0.6;
+  peer2.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer2));
+  node.safetySupervisorTick();
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+
+  // 缺陷 4 诊断字段：peer activation epoch 应等于 intent stamp（100.0）。
+  const ego_planner_driver::SafetyPrediction prediction =
+      node.lastSafetyPrediction();
+  ASSERT_FALSE(prediction.pairs.empty());
+  EXPECT_DOUBLE_EQ(prediction.pairs.front().peer_activation_epoch_s, 100.0);
+}
+
 TEST(EgoStateMachine, TentativeIntentWaitsWithoutPublishingTrajectorySetpoint)
 {
   FakeClock clock;

@@ -102,7 +102,10 @@ public:
   void safetySupervisorTick();
   void setSafetySupervisorModeForTest(const std::string& mode);
   void setIntentNegotiationWaitForTest(double seconds);
+  void setIdentityForTest(const std::string& uav_id,
+                          const std::string& exec_target);
   SafetyPrediction lastSafetyPrediction() const;
+  bool yieldCommittedForTest() const;
   std::string execState() const;
   boost::optional<HoldTarget> steadyTarget() const;
   mavros_msgs::PositionTarget lastSetpoint() const;
@@ -182,7 +185,12 @@ private:
   void replanLoop();
   std::vector<PeerTrajectoryInput> safetyPeersLocked() const;
   std::string formatSafetyLog(const SafetyPrediction& prediction,
-                              const ros::Time& now) const;
+                              const ros::Time& now,
+                              double self_odom_dev_m) const;
+  // 缺陷 2：已提交让路候选后，仅当邻机 intent 版本有更新或当前候选已恶化到
+  // emergency 边界内时才重新评估；否则保持以避免 25Hz 重复切轨迹。
+  bool peerVersionsUnchangedLocked() const;
+  std::map<std::string, int32_t> peerVersionsSnapshotLocked() const;
 
   std::unique_ptr<EgoPlannerCore> core_;
   std::string frame_id_;
@@ -209,6 +217,9 @@ private:
   bool enable_yield_candidates_ = true;
   boost::optional<YieldManeuver> episode_maneuver_;
   bool yield_committed_ = false;
+  // 提交让路候选时记录的邻机 intent 版本（uav_id -> traj_id），用于缺陷 2
+  // 的"peer 更新才重新评估"判断。
+  std::map<std::string, int32_t> yield_peer_versions_;
   SafetyLogger safety_logger_;
   ConflictEpisode conflict_episode_;
   SafetyPrediction last_safety_prediction_;

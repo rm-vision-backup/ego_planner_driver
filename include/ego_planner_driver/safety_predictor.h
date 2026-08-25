@@ -47,6 +47,7 @@ struct PairPrediction
   SafetyLevel level = SafetyLevel::SAFE;
   PairRole role = PairRole::UNKNOWN;
   double data_age_s = 0.0;
+  double peer_activation_epoch_s = 0.0;
   double common_window_s = 0.0;
   double current_distance_m = std::numeric_limits<double>::infinity();
   double closing_speed_mps = 0.0;

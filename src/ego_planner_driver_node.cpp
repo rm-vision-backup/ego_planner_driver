@@ -115,6 +115,14 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   yield_config.max_acceleration_mps2 = config.max_acc;
   yield_config.max_jerk_mps3 = pnh_.param("yield_max_jerk_mps3", 12.0);
   yield_config.clearance_m = safety_config_.protected_distance_m;
+  // 候选验证必须与运行时 SafetyPredictor 使用同一动态 emergency 门槛
+  // （缺陷 3），否则候选提交后下一 tick 会被判 EMERGENCY。
+  yield_config.protected_distance_m = safety_config_.protected_distance_m;
+  yield_config.control_delay_s = safety_config_.control_delay_s;
+  yield_config.local_compute_budget_s = safety_config_.local_compute_budget_s;
+  yield_config.peer_data_age_cap_s = safety_config_.peer_data_age_cap_s;
+  yield_config.emergency_decel_mps2 = safety_config_.emergency_decel_mps2;
+  yield_config.emergency_buffer_m = safety_config_.emergency_buffer_m;
   yield_candidate_generator_.reset(new YieldCandidateGenerator(yield_config));
   enable_yield_candidates_ = pnh_.param("enable_yield_candidates", true);
   if (safety_supervisor_mode_ != "off" && safety_supervisor_mode_ != "shadow" &&
@@ -519,6 +527,20 @@ void EgoPlannerDriverNode::setIntentNegotiationWaitForTest(double seconds)
 {
   std::lock_guard<std::mutex> lock(mutex_);
   intent_negotiation_wait_s_ = std::max(0.0, seconds);
+}
+
+void EgoPlannerDriverNode::setIdentityForTest(const std::string& uav_id,
+                                              const std::string& exec_target)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  uav_id_ = uav_id;
+  exec_target_ = exec_target;
+}
+
+bool EgoPlannerDriverNode::yieldCommittedForTest() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return yield_committed_;
 }
 
 SafetyPrediction EgoPlannerDriverNode::lastSafetyPrediction() const
@@ -1007,8 +1029,31 @@ std::vector<PeerTrajectoryInput> EgoPlannerDriverNode::safetyPeersLocked() const
   return peers;
 }
 
+bool EgoPlannerDriverNode::peerVersionsUnchangedLocked() const
+{
+  if (yield_peer_versions_.size() != latest_neighbor_version_.size())
+    return false;
+  for (const auto& item : latest_neighbor_version_)
+  {
+    const auto recorded = yield_peer_versions_.find(item.first);
+    if (recorded == yield_peer_versions_.end() ||
+        recorded->second != item.second.second)
+      return false;
+  }
+  return true;
+}
+
+std::map<std::string, int32_t> EgoPlannerDriverNode::peerVersionsSnapshotLocked() const
+{
+  std::map<std::string, int32_t> versions;
+  for (const auto& item : latest_neighbor_version_)
+    versions[item.first] = item.second.second;
+  return versions;
+}
+
 std::string EgoPlannerDriverNode::formatSafetyLog(
-    const SafetyPrediction& prediction, const ros::Time& now) const
+    const SafetyPrediction& prediction, const ros::Time& now,
+    double self_odom_dev_m) const
 {
   std::ostringstream stream;
   stream << std::fixed << std::setprecision(6)
@@ -1020,12 +1065,16 @@ std::string EgoPlannerDriverNode::formatSafetyLog(
          << " level=" << SafetyPredictor::levelName(prediction.level)
          << " primary_peer=" << prediction.primary_peer_id
          << " episode=" << (conflict_episode_.active() ? "active" : "none")
-         << " action=" << (safety_supervisor_mode_ == "active" ? "ACTIVE_GATE" : "SHADOW_ONLY");
+         << " action=" << (safety_supervisor_mode_ == "active" ? "ACTIVE_GATE" : "SHADOW_ONLY")
+         // 缺陷 4 诊断：本机实际 odometry 与 supervisor 所用 current_ 同刻采样
+         // 位置的偏差。显著 >0 表示 current_ 与实际执行脱节（时间轴/覆盖疑点）。
+         << " self_odom_dev=" << self_odom_dev_m;
   for (const PairPrediction& pair : prediction.pairs)
   {
     stream << " peer={id:" << pair.peer_id
            << ",traj:" << pair.peer_traj_id
            << ",age:" << pair.data_age_s
+           << ",act:" << pair.peer_activation_epoch_s
            << ",window:" << pair.common_window_s
            << ",distance:" << pair.current_distance_m
            << ",closing:" << pair.closing_speed_mps
@@ -1049,6 +1098,7 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
   ros::Time activation;
   ros::Time now;
   std::string self_id;
+  double self_odom_dev_m = -1.0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!current_ || plan_start_.isZero()) return;
@@ -1057,6 +1107,17 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
     activation = plan_start_;
     now = nowFunc();
     self_id = !uav_id_.empty() ? uav_id_ : exec_target_;
+    // 缺陷 4 诊断：实际 odometry 与 supervisor 所用 current_ 同刻采样位置偏差。
+    if (local_pose_)
+    {
+      const Eigen::Vector3d odom(local_pose_->pose.position.x,
+                                 local_pose_->pose.position.y,
+                                 local_pose_->pose.position.z);
+      TrajectorySample sample;
+      const double elapsed = now.toSec() - activation.toSec();
+      if (self->samplePVA(std::max(0.0, elapsed), sample))
+        self_odom_dev_m = (odom - sample.pos).norm();
+    }
   }
   const SafetyPrediction prediction = safety_predictor_->evaluate(
       *self, activation.toSec(), self_id, peers, now.toSec());
@@ -1071,7 +1132,7 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
       episode_maneuver_ = boost::none;
       yield_committed_ = false;
     }
-    line = formatSafetyLog(prediction, now);
+    line = formatSafetyLog(prediction, now, self_odom_dev_m);
   }
   safety_logger_.enqueue(line);
   if (safety_supervisor_mode_ != "active")
@@ -1086,52 +1147,73 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
   bool force_brake = prediction.level == SafetyLevel::EMERGENCY;
   if (prediction.level == SafetyLevel::WARNING && role == PairRole::STAND_ON)
     return;
-  if (prediction.level == SafetyLevel::WARNING && role == PairRole::YIELD &&
-      yield_committed_)
-    return;
-  if (prediction.level == SafetyLevel::WARNING && role == PairRole::YIELD &&
-      enable_yield_candidates_ && yield_candidate_generator_)
+  if (prediction.level == SafetyLevel::WARNING && role == PairRole::YIELD)
   {
-    const TimedTrajectory remaining = remainingTrajectory(
-        *self, now.toSec() - activation.toSec());
-    std::vector<NeighborTrajectory> relative_peers;
+    if (!enable_yield_candidates_ || !yield_candidate_generator_)
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      relative_peers = rebaseNeighbors(freshAbsoluteNeighborsLocked(now), now);
-    }
-    const std::vector<YieldCandidate> candidates =
-        yield_candidate_generator_->generate(remaining, relative_peers);
-    YieldCandidate selected;
-    if (episode_maneuver_)
-    {
-      const auto locked = std::find_if(candidates.begin(), candidates.end(),
-          [this](const YieldCandidate& candidate) {
-            return candidate.maneuver == *episode_maneuver_ && candidate.feasible;
-          });
-      if (locked != candidates.end()) selected = *locked;
-      else yield_candidate_generator_->chooseBest(candidates, selected);
+      // 让路候选被禁用但已提交候选：保持当前轨迹；无法让路则制动。
+      if (yield_committed_) return;
+      force_brake = true;
     }
     else
     {
-      yield_candidate_generator_->chooseBest(candidates, selected);
-    }
-    if (selected.feasible)
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!emergency_braking_ && current_ && plan_start_ == activation)
+      // 缺陷 2 修复：不再无条件早退。已提交候选时，仅当邻机 intent 有更新
+      // 或当前候选已恶化到 emergency 边界内才重新评估；否则保持，避免
+      // 25Hz 重复切轨迹与方向抖动。
+      if (yield_committed_)
       {
-        ++safety_generation_;
-        current_.reset(new TimedTrajectory(selected.trajectory));
-        plan_start_ = now;
-        planning_requested_ = false;
-        episode_maneuver_ = selected.maneuver;
-        yield_committed_ = true;
-        publishIntent(*current_, now,
-                      swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+        const PairPrediction& primary_pair = *primary;
+        bool versions_unchanged;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          versions_unchanged = peerVersionsUnchangedLocked();
+        }
+        if (primary_pair.min_distance_m > primary_pair.emergency_distance_m &&
+            versions_unchanged)
+          return;
       }
-      return;
+      const TimedTrajectory remaining = remainingTrajectory(
+          *self, now.toSec() - activation.toSec());
+      std::vector<NeighborTrajectory> relative_peers;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        relative_peers = rebaseNeighbors(freshAbsoluteNeighborsLocked(now), now);
+      }
+      const std::vector<YieldCandidate> candidates =
+          yield_candidate_generator_->generate(remaining, relative_peers);
+      YieldCandidate selected;
+      if (episode_maneuver_)
+      {
+        const auto locked = std::find_if(candidates.begin(), candidates.end(),
+            [this](const YieldCandidate& candidate) {
+              return candidate.maneuver == *episode_maneuver_ && candidate.feasible;
+            });
+        if (locked != candidates.end()) selected = *locked;
+        else yield_candidate_generator_->chooseBest(candidates, selected);
+      }
+      else
+      {
+        yield_candidate_generator_->chooseBest(candidates, selected);
+      }
+      if (selected.feasible)
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!emergency_braking_ && current_ && plan_start_ == activation)
+        {
+          ++safety_generation_;
+          current_.reset(new TimedTrajectory(selected.trajectory));
+          plan_start_ = now;
+          planning_requested_ = false;
+          episode_maneuver_ = selected.maneuver;
+          yield_committed_ = true;
+          yield_peer_versions_ = peerVersionsSnapshotLocked();
+          publishIntent(*current_, now,
+                        swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+        }
+        return;
+      }
+      force_brake = true;
     }
-    force_brake = true;
   }
   if (prediction.level == SafetyLevel::WARNING && role == PairRole::UNKNOWN)
     force_brake = true;

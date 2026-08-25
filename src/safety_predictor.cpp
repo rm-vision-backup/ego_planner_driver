@@ -101,6 +101,7 @@ PairPrediction SafetyPredictor::evaluatePair(
   out.peer_traj_id = peer.traj_id;
   out.role = determineRole(self_id, out.peer_id);
   out.data_age_s = std::max(0.0, now_epoch_s - peer.receive_epoch_s);
+  out.peer_activation_epoch_s = peer.activation_epoch_s;
 
   const double self_end = self_activation_epoch_s + self.duration;
   const double peer_end = peer.activation_epoch_s + peer.trajectory.duration;

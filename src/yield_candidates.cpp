@@ -94,6 +94,16 @@ Eigen::Vector3d YieldCandidateGenerator::samplePeer(const NeighborTrajectory& pe
   return peer.pts.back();
 }
 
+Eigen::Vector3d YieldCandidateGenerator::samplePeerVelocity(
+    const NeighborTrajectory& peer, double t)
+{
+  if (peer.pts.size() < 2 || peer.t.size() < 2)
+    return Eigen::Vector3d::Zero();
+  const double dt = std::max(1e-6, (peer.t.back() - peer.t.front()) /
+      static_cast<double>(peer.pts.size() - 1));
+  return (samplePeer(peer, t + dt) - samplePeer(peer, t - dt)) / (2.0 * dt);
+}
+
 bool YieldCandidateGenerator::validate(
     const TimedTrajectory& trajectory,
     const std::vector<NeighborTrajectory>& peers,
@@ -106,6 +116,11 @@ bool YieldCandidateGenerator::validate(
   {
     reason = "shape"; return false;
   }
+  // 动态 emergency 距离：用候选起点（t[0]=now）时刻的 closing speed 计算，
+  // 与 SafetyPredictor::evaluatePair 使用同一公式和同一时间基准，保证候选
+  // 提交后下一 safety tick 不会立即被判 EMERGENCY（缺陷 3）。
+  std::vector<double> emergency_distance(peers.size(),
+      std::numeric_limits<double>::infinity());
   for (size_t i = 0; i < n; ++i)
   {
     if (!trajectory.pts[i].allFinite() || !trajectory.vel[i].allFinite() ||
@@ -123,12 +138,33 @@ bool YieldCandidateGenerator::validate(
           config_.max_jerk_mps3 * 1.05)
       { reason = "jerk"; return false; }
     }
-    for (const NeighborTrajectory& peer : peers)
+    for (size_t p = 0; p < peers.size(); ++p)
     {
-      const double distance = (trajectory.pts[i] - samplePeer(peer, trajectory.t[i])).norm();
+      const double t = trajectory.t[i];
+      const Eigen::Vector3d peer_pos = samplePeer(peers[p], t);
+      const double distance = (trajectory.pts[i] - peer_pos).norm();
       minimum_clearance = std::min(minimum_clearance, distance);
       if (distance < config_.clearance_m)
       { reason = "clearance"; return false; }
+      if (i == 0)
+      {
+        const Eigen::Vector3d peer_vel = samplePeerVelocity(peers[p], t);
+        const Eigen::Vector3d r = peer_pos - trajectory.pts[i];
+        const Eigen::Vector3d v_rel = peer_vel - trajectory.vel[i];
+        const double r_norm = r.norm();
+        const double closing = r_norm > 1e-9
+            ? std::max(0.0, -r.dot(v_rel) / r_norm) : 0.0;
+        const double reaction = std::max(0.0, config_.control_delay_s) +
+            std::max(0.0, config_.local_compute_budget_s) +
+            std::max(0.0, config_.peer_data_age_cap_s);
+        const double decel = std::max(1e-6, config_.emergency_decel_mps2);
+        const double margin = closing * reaction +
+            closing * closing / (2.0 * decel);
+        emergency_distance[p] = config_.protected_distance_m + margin +
+            std::max(0.0, config_.emergency_buffer_m);
+      }
+      if (distance < emergency_distance[p])
+      { reason = "emergency_boundary"; return false; }
     }
   }
   reason.clear();

@@ -21,6 +21,16 @@ struct YieldCandidateConfig
   double max_acceleration_mps2 = 6.0;
   double max_jerk_mps3 = 12.0;
   double clearance_m = 1.0;
+  // 动态 emergency 门槛（与 SafetyPredictor 对齐）。候选在提交前必须在全时域
+  // 满足"不进入 emergency 边界"，否则提交后下一 safety tick 会立即被判
+  // EMERGENCY 而触发制动（缺陷 3）。reaction 用 peer_data_age_cap 上界，
+  // 保证 worst-case 数据年龄下仍安全。
+  double protected_distance_m = 1.0;
+  double control_delay_s = 0.20;
+  double local_compute_budget_s = 0.05;
+  double peer_data_age_cap_s = 2.0;
+  double emergency_decel_mps2 = 2.0;
+  double emergency_buffer_m = 0.10;
 };
 
 struct YieldCandidate
@@ -55,6 +65,8 @@ private:
   TimedTrajectory lateral(const TimedTrajectory& nominal, double sign) const;
   TimedTrajectory retime(const TimedTrajectory& nominal, double scale) const;
   static Eigen::Vector3d samplePeer(const NeighborTrajectory& peer, double t);
+  static Eigen::Vector3d samplePeerVelocity(const NeighborTrajectory& peer,
+                                            double t);
 
   YieldCandidateConfig config_;
 };
