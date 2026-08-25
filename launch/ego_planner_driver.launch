@@ -51,7 +51,9 @@
          trajectory, intent, or setpoint behavior changes in shadow mode. -->
     <param name="safety_supervisor_mode" value="shadow"/>
     <param name="safety_supervisor_rate_hz" value="25.0"/>
-    <param name="intent_publish_rate_hz" value="5.0"/>
+    <!-- 周期碰撞检查：10Hz，本机轨迹 vs fresh 邻机轨迹，< 固定 clearance → replan
+         （implementation_plan_26082602；intent 生成即发，无周期 5Hz 刷新）。 -->
+    <param name="collision_check_rate_hz" value="10.0"/>
     <param name="bias_valid_s" value="120.0"/>
     <param name="safety_prediction_horizon_s" value="5.0"/>
     <param name="safety_sample_period_s" value="0.05"/>

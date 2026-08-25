@@ -35,17 +35,11 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.max_iterations = pnh_.param("max_iterations", 200);
   config.mem_size = pnh_.param("mem_size", 16);
   config.g_epsilon = pnh_.param("g_epsilon", 0.01);
-  // 预测式避碰：把 SafetyPredictor 参数同步给规划核心，使规划 clearance 用
-  // 动态安全距离（含反应+制动余量），在 peer 的预测冲突区域局部绕开。
-  config.safety_control_delay_s = pnh_.param("safety_control_delay_s", 0.20);
-  config.safety_compute_budget_s = pnh_.param("safety_compute_budget_s", 0.05);
-  config.safety_emergency_decel_mps2 = pnh_.param("emergency_decel_mps2", 2.0);
-  config.safety_emergency_buffer_m = pnh_.param("emergency_buffer_m", 0.10);
-  config.safety_protected_distance_m = pnh_.param("protected_distance_m", 1.0);
-  config.safety_peer_data_age_cap_s = pnh_.param("peer_data_age_cap_s", 2.0);
-  config.swarm_soft_margin = pnh_.param("swarm_soft_margin", 0.5);
+  // 规划层避碰门槛回固定 clearance（implementation_plan_26082602）：不再把
+  // SafetyPredictor 动态距离参数同步给规划核心；监督层参数读入 safety_config_
+  // （下方），规划层只消费 swarm_clearance×2 固定 gate。
   bias_valid_s_ = pnh_.param("bias_valid_s", 120.0);
-  intent_publish_rate_hz_ = pnh_.param("intent_publish_rate_hz", 5.0);
+  collision_check_rate_hz_ = pnh_.param("collision_check_rate_hz", 10.0);
   core_.reset(new EgoPlannerCore(config));
   planning_horizon_ = config.planning_horizon;
   replan_period_s_ = pnh_.param("replan_period_s", 1.0);
@@ -139,10 +133,10 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   if (safety_supervisor_mode_ != "off" && safety_supervisor_rate_hz_ > 0.0)
     safety_timer_ = nh_.createTimer(ros::Duration(1.0 / safety_supervisor_rate_hz_),
         &EgoPlannerDriverNode::runSafetySupervisor, this);
-  if (intent_publish_rate_hz_ > 0.0)
-    intent_refresh_timer_ = nh_.createTimer(
-        ros::Duration(1.0 / intent_publish_rate_hz_),
-        &EgoPlannerDriverNode::publishCurrentIntentTick, this);
+  if (collision_check_rate_hz_ > 0.0)
+    collision_check_timer_ = nh_.createTimer(
+        ros::Duration(1.0 / collision_check_rate_hz_),
+        &EgoPlannerDriverNode::collisionCheckTick, this);
   replan_thread_ = std::thread(&EgoPlannerDriverNode::replanLoop, this);
 }
 
@@ -694,17 +688,9 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
   neighbor_phase_[msg.uav_id] = legacy
       ? swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE : msg.phase;
   latest_neighbor_version_[msg.uav_id] = std::make_pair(epoch, msg.traj_id);
-  // Avoid reciprocal intent ping-pong: a new version only requests replanning
-  // when it invalidates the trajectory currently being executed. With no
-  // active trajectory it is simply retained for the next requested plan.
-  if (current_ && !plan_start_.isZero())
-  {
-    NeighborTrajectory relative = nb;
-    relative.start_time -= plan_start_.toSec();
-    if (!core_->checkClearance(*current_, {relative},
-                               core_->config().swarm_clearance * 2.0))
-      planning_requested_ = true;
-  }
+  // 事件驱动 replan 已删除（implementation_plan_26082602 §2.3/§5）：与 10Hz
+  // 周期碰撞检查作用重复，周期检查用最新缓冲轨迹，邻机更新后 ≤100ms 即检测
+  // 同一碰撞；新 intent 只更新缓冲，由 collisionCheckTick 统一触发 replan。
   return true;
 }
 
@@ -723,40 +709,12 @@ EgoPlannerDriverNode::freshAbsoluteNeighborsLocked(const ros::Time& now) const
 {
   std::vector<NeighborTrajectory> result;
   result.reserve(inbox_.size());
-  // self 当前状态（位置 + 速度），用于动态 safe clearance 的 closing 计算。
-  Eigen::Vector3d self_pos = Eigen::Vector3d::Zero();
-  Eigen::Vector3d self_vel = Eigen::Vector3d::Zero();
-  if (local_pose_)
-  {
-    self_pos = Eigen::Vector3d(local_pose_->pose.position.x,
-                               local_pose_->pose.position.y,
-                               local_pose_->pose.position.z);
-  }
-  if (current_ && !plan_start_.isZero())
-  {
-    TrajectorySample sample;
-    if (current_->samplePVA(std::max(0.0, (now - plan_start_).toSec()), sample))
-      self_vel = sample.vel;
-  }
-  const EgoPlannerConfig core_config = core_->config();
   for (const auto& item : inbox_)
   {
     if ((now - item.second.second).toSec() <= kNeighborStaleS)
     {
       NeighborTrajectory neighbor = item.second.first;
       neighbor.data_age_s = std::max(0.0, (now - item.second.second).toSec());
-      // 预测式避碰：按 SafetyPredictor 公式计算动态安全距离，使规划在 peer
-      // 进入预测冲突区域（同刻交点局部）时提前绕开。
-      neighbor.safe_clearance_m = EgoPlannerCore::computeSafeClearance(
-          core_config, neighbor, now.toSec() - neighbor.start_time,
-          self_pos, self_vel);
-      // 诊断：暴露动态安全距离的输入分解（age / peer 相对时间 / safe），
-      // 用于确认交叉场景 4m 门槛来自 age 还是 closing。
-      ROS_INFO_STREAM_THROTTLE(1.0, "[safe_clearance] peer=" << item.first
-          << " age=" << neighbor.data_age_s
-          << " t_rel=" << (now.toSec() - neighbor.start_time)
-          << " safe=" << neighbor.safe_clearance_m
-          << " self_vel=" << self_vel.norm());
       result.push_back(neighbor);
     }
   }
@@ -1248,15 +1206,28 @@ void EgoPlannerDriverNode::processHoldLocked()
   captureHoldTargetLocked(now);
 }
 
-void EgoPlannerDriverNode::publishCurrentIntentTick(const ros::TimerEvent&)
+void EgoPlannerDriverNode::collisionCheckTick(const ros::TimerEvent&)
+{
+  runCollisionCheckTick();
+}
+
+void EgoPlannerDriverNode::runCollisionCheckTick()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  // 周期刷新 intent：固定激活时刻（plan_start_，epoch 不变），递增 traj_id，
-  // 只刷新邻机接收时刻 → 邻机 data_age 小 → 动态安全距离小。轨迹时间轴不变，
-  // 邻机采样 peer 同刻位置不受影响。
-  if (current_ && !plan_start_.isZero())
-    publishIntent(*current_, plan_start_,
-                  swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+  if (!current_ || plan_start_.isZero() || hold_requested_)
+    return;
+  const ros::Time now = nowFunc();
+  // 周期碰撞检查（implementation_plan_26082602 §3.3）：本机执行轨迹 vs 全部
+  // fresh 邻机轨迹，同刻距离 < 固定 clearance → planning_requested_，由
+  // replanLoop 定时合并执行。邻机 start_time 是绝对 epoch（GPS bias 修正），
+  // rebase 到本机轨迹激活时刻。邻机 intent 停发时仍依赖缓冲轨迹检出碰撞。
+  std::vector<NeighborTrajectory> neighbors = freshAbsoluteNeighborsLocked(now);
+  const double base = plan_start_.toSec();
+  for (auto& neighbor : neighbors)
+    neighbor.start_time -= base;
+  if (!core_->checkClearance(*current_, neighbors,
+                             core_->config().swarm_clearance * 2.0))
+    planning_requested_ = true;
 }
 
 void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros::Time& base)

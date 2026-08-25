@@ -40,6 +40,12 @@
 - `replan_period_s` 默认 1.0 s；另有 25 Hz `SafetyPredictor` 独立监督。阶段 A 默认 `shadow`，
   只计算同一绝对时间轴的 CPA/TTC、动态 warning/emergency 门槛、ID right-of-way 并异步记录，
   **不改变**状态、轨迹、intent 或 setpoint；受约束制动与主动让路尚未接通。
+- 避碰门槛解耦（26082602）：规划层 `calcSwarmCost` 回**固定 clearance**（`swarm_clearance×2=1m`），
+  不再消费 `data_age`/动态安全距离；`intent_publish_rate_hz` 周期 5Hz 刷新已删除，intent
+  **生成即发**（replan/制动提交时发布，带 `stamp`+`traj_id`）；新增 **10Hz 周期碰撞检查**
+  `collisionCheckTick`（本机 `current_` vs fresh 邻机轨迹 <1m → 请求 replan），接收邻机 intent
+  的事件驱动 replan 已删除（作用重复，备用记录见计划 §5）。监督层 `SafetyPredictor` 动态
+  EMERGENCY 门槛、GPS bias 修正与旧 1m 门禁保留。
 
 ## 预测安全监督（26082500 阶段 A）
 

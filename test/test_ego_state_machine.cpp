@@ -358,6 +358,9 @@ TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)
   node.sendGoal(5.0, 0.0, 5.0);
   ASSERT_TRUE(node.replanOnce());
   EXPECT_FALSE(node.planningRequested());
+  // 无邻机时周期碰撞检查不置位（replan 后立即检查）。
+  node.runCollisionCheckTick();
+  EXPECT_FALSE(node.planningRequested());
 
   const boost::optional<ego_planner_driver::TimedTrajectory> own =
       node.currentTrajectory();
@@ -374,6 +377,11 @@ TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)
     conflict.sampled_traj.push_back(pose);
   }
   EXPECT_TRUE(node.injectNeighborIntent(conflict));
+  // 事件驱动 replan 已删除（implementation_plan_26082602）：接收邻机 intent
+  // 只更新缓冲，不再立即置 planning_requested_。
+  EXPECT_FALSE(node.planningRequested());
+  // 周期碰撞检查（10Hz tick 等价）：本机轨迹 vs 冲突邻机 < 1m → 请求 replan。
+  node.runCollisionCheckTick();
   EXPECT_TRUE(node.planningRequested());
 
   ros::param::set("/uav_id", "A01");

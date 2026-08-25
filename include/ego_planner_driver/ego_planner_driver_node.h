@@ -120,6 +120,9 @@ public:
   ros::Time planStart() const;
   // 测试断言：时间触发重规划是否已请求。
   bool planningRequested() const;
+  // 测试/外部注入接口：执行一次周期碰撞检查（等价 collision_check_rate_hz tick），
+  // 本机 current_ 与 fresh 邻机轨迹 < 固定 clearance → planning_requested_。
+  void runCollisionCheckTick();
   // 测试用：禁用 replanLoop 线程（单测手动 replanOnce 驱动时避免线程抢占）。
   void setReplanLoopEnabled(bool enabled);
 
@@ -188,7 +191,9 @@ private:
   static double yawFromQuat(const geometry_msgs::Quaternion& q);
   void publishSetpoint(const ros::TimerEvent& event);
   void runSafetySupervisor(const ros::TimerEvent& event);
-  void publishCurrentIntentTick(const ros::TimerEvent& event);
+  // 周期碰撞检查（collision_check_rate_hz）：本机 current_ 与全部 fresh 邻机
+  // 轨迹同刻距离 < 固定 clearance → planning_requested_（implementation_plan_26082602）。
+  void collisionCheckTick(const ros::TimerEvent& event);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   void processHoldLocked();
   void handleMavrosStateEdgeLocked();
@@ -263,14 +268,14 @@ private:
   ros::Subscriber own_bias_sub_;
   ros::Timer timer_;
   ros::Timer safety_timer_;
-  // Periodic intent refresh (intent_publish_rate_hz): republishes the current
-  // executed trajectory with the fixed activation epoch and an incremented
-  // traj_id, so peers see a fresh receive age (small data_age_s -> small
-  // dynamic safe clearance) without changing the trajectory's time axis.
-  ros::Timer intent_refresh_timer_;
-  double intent_publish_rate_hz_ = 5.0;
+  // Periodic collision check (collision_check_rate_hz): replan trigger aligned
+  // with upstream's independent safety timer. Peers refresh intent on replan
+  // commit only (publish-on-commit); the check uses the buffered neighbor
+  // trajectories so a stopped peer stream is still detected.
+  ros::Timer collision_check_timer_;
+  double collision_check_rate_hz_ = 10.0;
   // Serializes traj_id_ increment + intent_pub_ publish across the replan
-  // thread and the periodic intent-refresh timer callback.
+  // thread and the safety-timer emergency-brake commit.
   std::mutex intent_pub_mutex_;
 
   mutable std::mutex mutex_;
