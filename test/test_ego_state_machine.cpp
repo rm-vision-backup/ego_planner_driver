@@ -200,6 +200,55 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
   EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
 }
 
+TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setSafetySupervisorModeForTest("active");
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), kStateExecuting);
+
+  auto peer = makeIntent(100.0, 1, "A02");
+  peer.t = {0.0, 5.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 0.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+  node.safetySupervisorTick();
+  ASSERT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+  const auto braking = node.currentTrajectory();
+  ASSERT_TRUE(braking);
+  ASSERT_GT(braking->duration, 0.0);
+  const ros::Time brake_start = node.planStart();
+
+  // 缺陷 8 回归：紧急制动后常规 replan 提交必须被拒绝，制动轨迹不能被覆盖。
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+  const auto after = node.currentTrajectory();
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->pts.size(), braking->pts.size());
+  EXPECT_TRUE(after->pts.front().isApprox(braking->pts.front()));
+  EXPECT_EQ(node.planStart(), brake_start);
+
+  // 制动轨迹正常走完 → BRAKE_HOLD（不再被 replan 打断恢复 EXECUTING）。
+  while (clock.get() <= 100.0 + braking->duration + 0.1)
+  {
+    node.publishSetpointTick();
+    clock.advance(0.02);
+  }
+  node.publishSetpointTick();
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
+  const auto hold = node.steadyTarget();
+  ASSERT_TRUE(hold);
+  EXPECT_LT((hold->pos - braking->pts.back()).norm(), 1e-8);
+}
+
 TEST(EgoStateMachine, ActiveYieldCommitsOnceAndReevaluatesOnPeerUpdate)
 {
   FakeClock clock;

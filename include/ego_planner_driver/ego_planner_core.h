@@ -38,9 +38,25 @@ struct EgoPlannerConfig
   // (global-planning regression mode).
   double planning_horizon = 0.0;
   // Per-aircraft clearance radius. Reciprocal checks use twice this value;
-  // 0.5 m therefore enforces 1.0 m horizontal centre distance and, with the
-  // existing 2:1 ellipsoid, 2.0 m vertical centre distance.
+  // 0.5 m therefore enforces 1.0 m centre distance in every axis (symmetric
+  // clearance sphere; the vertical axis was reduced from 2.0 m to 1.0 m).
   double swarm_clearance = 0.5;
+  // Predictive avoidance: the planner clearance uses a dynamic safe distance
+  // (protected + closing*reaction + braking margin) matching SafetyPredictor,
+  // so planning deviates locally around the same-instant crossing point instead
+  // of reacting only inside the fixed 1 m clearance. These mirror the
+  // safety_* supervisor parameters (kept in sync by the node).
+  double safety_control_delay_s = 0.20;
+  double safety_compute_budget_s = 0.05;
+  double safety_emergency_decel_mps2 = 2.0;
+  double safety_emergency_buffer_m = 0.10;
+  double safety_protected_distance_m = 1.0;
+  // Soft-penalty overshoot for predictive avoidance: the optimizer converges
+  // slightly short of the requested gate (measured ~0.1 m under), so the swarm
+  // cost targets safe_clearance + this margin while the hard gate stays at
+  // safe_clearance. Prevents planOnce from failing the hard check by a few
+  // centimetres and degrading a would-be deviation into HOLD/brake.
+  double swarm_soft_margin = 0.5;
   double planning_range = 30.0; // neighbor trajectories beyond this are ignored
   double lambda_smooth = 1.0;
   double lambda_swarm = 1.0;
@@ -87,6 +103,15 @@ struct NeighborTrajectory
   double start_time = 0.0;
   double duration = 0.0;
   double clearance = 0.0;   // <=0 means this neighbor does not participate
+  // Data age of the intent at the snapshot instant [s]. Fillers propagate the
+  // actual (now - receive_epoch) age so candidate validation uses the same
+  // dynamic emergency gate as SafetyPredictor, not a fixed cap upper bound.
+  double data_age_s = 0.0;
+  // Dynamic safe clearance [m] computed by the node at the snapshot instant
+  // (protected + closing*reaction + braking margin, SafetyPredictor formula).
+  // <= 0 falls back to the fixed swarm clearance; > 0 makes planning and the
+  // hard gate deviate locally around the same-instant crossing point.
+  double safe_clearance_m = 0.0;
   std::vector<double> t;
   std::vector<Eigen::Vector3d> pts;
 };
@@ -225,6 +250,18 @@ public:
   static std::vector<NeighborTrajectory> filterByRange(
       const std::vector<NeighborTrajectory>& neighbors,
       const Eigen::Vector3d& local_position, double planning_range);
+
+  // Dynamic safe clearance for one neighbor at the self pose/velocity, using the
+  // same closing/reaction/braking formula as SafetyPredictor. Used by the node
+  // to fill NeighborTrajectory::safe_clearance_m (predictive avoidance: plan
+  // deviates locally where the peer will be too close). peer_t_rel is the
+  // neighbor-trajectory relative time of the self instant (node passes
+  // now - neighbor.start_time).
+  static double computeSafeClearance(const EgoPlannerConfig& config,
+                                     const NeighborTrajectory& neighbor,
+                                     double peer_t_rel,
+                                     const Eigen::Vector3d& self_pos,
+                                     const Eigen::Vector3d& self_vel);
 
 private:
   struct ControlPoints

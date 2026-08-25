@@ -156,7 +156,8 @@ bool YieldCandidateGenerator::validate(
             ? std::max(0.0, -r.dot(v_rel) / r_norm) : 0.0;
         const double reaction = std::max(0.0, config_.control_delay_s) +
             std::max(0.0, config_.local_compute_budget_s) +
-            std::max(0.0, config_.peer_data_age_cap_s);
+            std::max(0.0, peers[p].data_age_s >= 0.0
+                ? peers[p].data_age_s : config_.peer_data_age_cap_s);
         const double decel = std::max(1e-6, config_.emergency_decel_mps2);
         const double margin = closing * reaction +
             closing * closing / (2.0 * decel);

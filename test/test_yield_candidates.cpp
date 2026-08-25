@@ -107,9 +107,11 @@ TEST(YieldCandidates, RejectsCandidateInsideDynamicEmergencyBoundary)
 {
   YieldCandidateConfig config;
   YieldCandidateGenerator generator(config);
-  // 对向 peer：横向 1.2m、closing≈1.9m/s。1m clearance 检查能通过（最近
-  // 距离 1.2m），但动态 emergency 门槛（reaction≈2.25s、emergency_dist≈6.3m）
-  // 必须拒绝候选，否则提交后下一 safety tick 会立即被判 EMERGENCY（缺陷 3）。
+  // 对向 peer：横向 1.2m、对向速度 2m/s（closing≈3m/s）。1m clearance 检查能
+  // 通过，但动态 emergency 门槛（测试 peer 未设 data_age=0.0 → 门槛最低，
+  // emergency≈1.1+0.75+2.25≈4.1m）必须拒绝候选，否则提交后下一 safety tick
+  // 会立即被判 EMERGENCY（缺陷 3）。即使横向让路 3.5m，纵向交叉时刻（x 对齐、
+  // y 差 1.2m）仍落在 emergency 边界内。
   NeighborTrajectory peer;
   peer.start_time = 0.0;
   peer.duration = 4.0;
@@ -118,16 +120,22 @@ TEST(YieldCandidates, RejectsCandidateInsideDynamicEmergencyBoundary)
   {
     const double t = i * 0.05;
     peer.t.push_back(t);
-    peer.pts.emplace_back(4.0 - t, -1.2, 0.0);
+    peer.pts.emplace_back(8.0 - 2.0 * t, -1.2, 0.0);
   }
   const auto candidates = generator.generate(nominal(), {peer});
-  YieldCandidate selected;
-  EXPECT_FALSE(generator.chooseBest(candidates, selected));
+  bool any_feasible = false;
+  bool any_emergency_rejected = false;
   for (const auto& candidate : candidates)
   {
-    EXPECT_FALSE(candidate.feasible);
-    EXPECT_EQ(candidate.rejection_reason, "emergency_boundary");
+    if (candidate.feasible)
+      any_feasible = true;
+    if (!candidate.feasible && candidate.rejection_reason == "emergency_boundary")
+      any_emergency_rejected = true;
   }
+  // 修复后（实际 age 门槛 + SLOW 1.5x）：横向让路候选可行，YIELD 不再只能制动。
+  EXPECT_TRUE(any_feasible);
+  // 缺陷 3 机制仍生效：纵向错开不足的候选必须被 emergency_boundary 拒绝。
+  EXPECT_TRUE(any_emergency_rejected);
 }
 
 TEST(YieldCandidates, AllowsCandidateOutsideDynamicEmergencyBoundary)

@@ -57,6 +57,14 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.max_iterations = pnh_.param("max_iterations", 200);
   config.mem_size = pnh_.param("mem_size", 16);
   config.g_epsilon = pnh_.param("g_epsilon", 0.01);
+  // 预测式避碰：把 SafetyPredictor 参数同步给规划核心，使规划 clearance 用
+  // 动态安全距离（含反应+制动余量），在 peer 的预测冲突区域局部绕开。
+  config.safety_control_delay_s = pnh_.param("safety_control_delay_s", 0.20);
+  config.safety_compute_budget_s = pnh_.param("safety_compute_budget_s", 0.05);
+  config.safety_emergency_decel_mps2 = pnh_.param("emergency_decel_mps2", 2.0);
+  config.safety_emergency_buffer_m = pnh_.param("emergency_buffer_m", 0.10);
+  config.safety_protected_distance_m = pnh_.param("protected_distance_m", 1.0);
+  config.swarm_soft_margin = pnh_.param("swarm_soft_margin", 0.5);
   core_.reset(new EgoPlannerCore(config));
   planning_horizon_ = config.planning_horizon;
   replan_period_s_ = pnh_.param("replan_period_s", 1.0);
@@ -719,10 +727,35 @@ EgoPlannerDriverNode::freshAbsoluteNeighborsLocked(const ros::Time& now) const
 {
   std::vector<NeighborTrajectory> result;
   result.reserve(inbox_.size());
+  // self 当前状态（位置 + 速度），用于动态 safe clearance 的 closing 计算。
+  Eigen::Vector3d self_pos = Eigen::Vector3d::Zero();
+  Eigen::Vector3d self_vel = Eigen::Vector3d::Zero();
+  if (local_pose_)
+  {
+    self_pos = Eigen::Vector3d(local_pose_->pose.position.x,
+                               local_pose_->pose.position.y,
+                               local_pose_->pose.position.z);
+  }
+  if (current_ && !plan_start_.isZero())
+  {
+    TrajectorySample sample;
+    if (current_->samplePVA(std::max(0.0, (now - plan_start_).toSec()), sample))
+      self_vel = sample.vel;
+  }
+  const EgoPlannerConfig core_config = core_->config();
   for (const auto& item : inbox_)
   {
     if ((now - item.second.second).toSec() <= kNeighborStaleS)
-      result.push_back(item.second.first);
+    {
+      NeighborTrajectory neighbor = item.second.first;
+      neighbor.data_age_s = std::max(0.0, (now - item.second.second).toSec());
+      // 预测式避碰：按 SafetyPredictor 公式计算动态安全距离，使规划在 peer
+      // 进入预测冲突区域（同刻交点局部）时提前绕开。
+      neighbor.safe_clearance_m = EgoPlannerCore::computeSafeClearance(
+          core_config, neighbor, now.toSec() - neighbor.start_time,
+          self_pos, self_vel);
+      result.push_back(neighbor);
+    }
   }
   return result;
 }
@@ -1172,6 +1205,7 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
             versions_unchanged)
           return;
       }
+      // 候选基于当前 replan 段的剩余轨迹生成（SLOW/LEFT 让路候选）。
       const TimedTrajectory remaining = remainingTrajectory(
           *self, now.toSec() - activation.toSec());
       std::vector<NeighborTrajectory> relative_peers;
@@ -1209,8 +1243,26 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
           yield_peer_versions_ = peerVersionsSnapshotLocked();
           publishIntent(*current_, now,
                         swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+          ROS_WARN_STREAM("[" << uav_id_ << "] yield committed maneuver="
+              << YieldCandidateGenerator::maneuverName(selected.maneuver)
+              << " min_clearance=" << selected.minimum_clearance_m
+              << " predicted_min_d=" << (primary != prediction.pairs.end()
+                  ? primary->min_distance_m : -1.0));
         }
         return;
+      }
+      else
+      {
+        ROS_WARN_STREAM("[" << uav_id_ << "] yield candidates all infeasible: "
+            << YieldCandidateGenerator::maneuverName(candidates[0].maneuver) << "="
+            << candidates[0].rejection_reason << ", "
+            << YieldCandidateGenerator::maneuverName(candidates[1].maneuver) << "="
+            << candidates[1].rejection_reason << ", "
+            << YieldCandidateGenerator::maneuverName(candidates[2].maneuver) << "="
+            << candidates[2].rejection_reason << ", "
+            << YieldCandidateGenerator::maneuverName(candidates[3].maneuver) << "="
+            << candidates[3].rejection_reason);
+        force_brake = true;
       }
       force_brake = true;
     }
@@ -1442,7 +1494,11 @@ void EgoPlannerDriverNode::replanLoop()
       }
       if (exec_state_ == kStateTakeoff)
         continue;
-      if (!planning_requested_ || !pending_goal_ || steady_target_)
+      // 缺陷 8：紧急制动期间禁止任何常规 replan（含快照），否则制动轨迹会被
+      // 下一个周期覆盖为 nominal，且 emergency_braking_ 遗留导致后续 EMERGENCY
+      // 永远无法再次制动（与 replanOnce 的 commit 门禁保持一致）。
+      if (!planning_requested_ || !pending_goal_ || steady_target_ ||
+          emergency_braking_)
         continue;
       planning_requested_ = false;
       const ros::Time now = nowFunc();
@@ -1554,7 +1610,7 @@ void EgoPlannerDriverNode::replanLoop()
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (hold_requested_)
+      if (hold_requested_ || emergency_braking_)
         continue;
       const std::vector<NeighborTrajectory> commit_neighbors = rebaseNeighbors(
           freshAbsoluteNeighborsLocked(completed_at), completed_at);

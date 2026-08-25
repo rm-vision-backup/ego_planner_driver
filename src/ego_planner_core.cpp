@@ -10,9 +10,12 @@ namespace ego_planner_driver
 
 namespace
 {
-// Ellipsoid shape of the reciprocal penalty from the original kernel:
-// horizontal axes 1.0 m, vertical axis 2.0 m (paper Eq. 5 style).
-constexpr double kSwarmA = 2.0;
+// Clearance ellipsoid of the reciprocal penalty: symmetric 1.0 m sphere
+// (horizontal 1.0 m, vertical 1.0 m).  The vertical axis was reduced from
+// 2.0 m to 1.0 m so vertical separation matches horizontal: layered cruise
+// (15/12/8 m) no longer penalizes neighbors separated by more than 1 m in z,
+// and the planner clearance now agrees with SafetyPredictor (1.0 m 3D).
+constexpr double kSwarmA = 1.0;
 constexpr double kSwarmB = 1.0;
 constexpr double kInvA2 = 1.0 / (kSwarmA * kSwarmA);
 constexpr double kInvB2 = 1.0 / (kSwarmB * kSwarmB);
@@ -35,6 +38,16 @@ Eigen::Vector3d sampleNeighbor(const NeighborTrajectory& traj, double t_rel)
     }
   }
   return traj.pts.back();
+}
+
+Eigen::Vector3d sampleNeighborVelocity(const NeighborTrajectory& traj, double t_rel)
+{
+  if (traj.pts.size() < 2 || traj.t.size() != traj.pts.size())
+    return Eigen::Vector3d::Zero();
+  const double dt = std::max(1e-6, (traj.t.back() - traj.t.front()) /
+      static_cast<double>(traj.pts.size() - 1));
+  return (sampleNeighbor(traj, t_rel + dt) - sampleNeighbor(traj, t_rel - dt)) /
+         (2.0 * dt);
 }
 
 // Uniform densification moved to the Python EgoSwarmDriver layer (plan B):
@@ -132,6 +145,32 @@ EgoPlannerCore::EgoPlannerCore(const EgoPlannerConfig& config)
   , bspline_interval_(config.ts)
   , order_(config.order)
 {
+}
+
+double EgoPlannerCore::computeSafeClearance(
+    const EgoPlannerConfig& config, const NeighborTrajectory& neighbor,
+    double peer_t_rel, const Eigen::Vector3d& self_pos,
+    const Eigen::Vector3d& self_vel)
+{
+  if (neighbor.pts.size() < 2 || neighbor.t.size() != neighbor.pts.size())
+    return config.swarm_clearance * 2.0;
+  if (peer_t_rel < neighbor.t.front() || peer_t_rel > neighbor.t.back())
+    return config.swarm_clearance * 2.0;
+  const Eigen::Vector3d peer_pos = sampleNeighbor(neighbor, peer_t_rel);
+  const Eigen::Vector3d peer_vel = sampleNeighborVelocity(neighbor, peer_t_rel);
+  const Eigen::Vector3d r = peer_pos - self_pos;
+  const Eigen::Vector3d v_rel = peer_vel - self_vel;
+  const double r_norm = r.norm();
+  const double closing = r_norm > 1e-9
+      ? std::max(0.0, -r.dot(v_rel) / r_norm) : 0.0;
+  const double reaction = std::max(0.0, config.safety_control_delay_s) +
+      std::max(0.0, config.safety_compute_budget_s) +
+      std::max(0.0, neighbor.data_age_s);
+  const double decel = std::max(1e-6, config.safety_emergency_decel_mps2);
+  const double margin = closing * reaction +
+      closing * closing / (2.0 * decel);
+  return config.safety_protected_distance_m + margin +
+      std::max(0.0, config.safety_emergency_buffer_m);
 }
 
 void EgoPlannerCore::combineCost(const double* x, double* grad, double& cost,
@@ -305,7 +344,6 @@ void EgoPlannerCore::calcSwarmCost(const Eigen::MatrixXd& q, double& cost,
   const int end_idx = q.cols() - order_ -
                       static_cast<int>(static_cast<double>(q.cols() - 2 * order_) / 3.0);
   const double clearance = config_.swarm_clearance * 2.0;
-
   for (int i = order_; i < end_idx; ++i)
   {
     const double glb_time = (static_cast<double>(order_ - 1) / 2.0 +
@@ -329,14 +367,22 @@ void EgoPlannerCore::calcSwarmCost(const Eigen::MatrixXd& q, double& cost,
       const double ellip_dist = std::sqrt(
           dist_vec(2) * dist_vec(2) * kInvA2 +
           (dist_vec(0) * dist_vec(0) + dist_vec(1) * dist_vec(1)) * kInvB2);
-      const double dist_err = clearance - ellip_dist;
+      // 预测式避碰：使用节点按 SafetyPredictor 公式计算的动态安全距离，
+      // 使规划在 peer 进入预测冲突区域（同刻交点局部）时提前绕开，而非只
+      // 在固定 1m clearance 内才推开。软惩罚目标对动态距离带超调余量
+      // （swarm_soft_margin），因为 L-BFGS 收敛总比请求 gate 短约 0.1m；
+      // 固定 clearance 场景不加 margin，保持原行为。
+      const double gate = neighbor.safe_clearance_m > 0.0
+          ? neighbor.safe_clearance_m + config_.swarm_soft_margin
+          : clearance;
+      const double dist_err = gate - ellip_dist;
       if (dist_err >= 0.0)
       {
         cost += std::pow(dist_err, 2);
         Eigen::Vector3d coeff;
-        coeff(0) = -2.0 * (clearance / ellip_dist - 1.0) * kInvB2;
+        coeff(0) = -2.0 * (gate / ellip_dist - 1.0) * kInvB2;
         coeff(1) = coeff(0);
-        coeff(2) = -2.0 * (clearance / ellip_dist - 1.0) * kInvA2;
+        coeff(2) = -2.0 * (gate / ellip_dist - 1.0) * kInvA2;
         gradient.col(i) += (coeff.array() * dist_vec.array()).matrix();
       }
     }
@@ -763,7 +809,11 @@ bool EgoPlannerCore::checkClearance(const TimedTrajectory& trajectory,
       const double ellip_dist = std::sqrt(
           dist_vec(2) * dist_vec(2) * kInvA2 +
           (dist_vec(0) * dist_vec(0) + dist_vec(1) * dist_vec(1)) * kInvB2);
-      if (ellip_dist < clearance)
+      // 预测式避碰：用节点算好的动态安全距离（SafetyPredictor 公式），使提交
+      // 轨迹必须在 peer 的预测冲突区域（同刻交点局部）之外。
+      const double gate = neighbor.safe_clearance_m > 0.0
+          ? neighbor.safe_clearance_m : clearance;
+      if (ellip_dist < gate)
         return false;
     }
   }

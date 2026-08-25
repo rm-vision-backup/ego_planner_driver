@@ -239,6 +239,71 @@ TEST(EgoPlannerCore, ReciprocalNominalIntentBlocksUnsafeDefaultEnablement)
   EXPECT_NEAR(nominal_a.pts.back().x(), 10.0, 1e-3);
 }
 
+// 预测式避碰（方向 A）：节点把 SafetyPredictor 公式的动态安全距离注入
+// neighbor.safe_clearance_m，规划必须把同刻交叉段当"冲突区域"局部绕开，
+// 而不是只在固定 1 m clearance 内推开。正交交叉下 self 沿 y 轴前进、peer
+// 沿 x 轴前进且同时到达交点。
+TEST(EgoPlannerCore, PredictiveAvoidanceDeviatesAroundCrossingPeer)
+{
+  EgoPlannerConfig config = makeConfig();
+  config.cruise_velocity = 1.5;
+  config.lambda_swarm = 1.0;
+  config.safety_control_delay_s = 0.20;
+  config.safety_compute_budget_s = 0.05;
+  config.safety_emergency_decel_mps2 = 2.0;
+  config.safety_emergency_buffer_m = 0.10;
+  config.safety_protected_distance_m = 1.0;
+  EgoPlannerCore core(config);
+
+  // self（UAV2）沿 y 轴从 (0,-4) 到 (0,4)，v=1.5；crossing 点在 y=0。
+  const GoalPoint start{Eigen::Vector3d(0.0, -4.0, 15.0), 0.0};
+  const std::vector<WayPoint> waypoints{
+      WayPoint{Eigen::Vector3d(0.0, 4.0, 15.0), 0.0}};
+  const Eigen::Vector3d start_vel(0.0, 1.5, 0.0);
+
+  // peer（UAV1）沿 x 轴从 (-4,0) 到 (4,0)，v=1 m/s，start_time=-2s（已激活
+  // 2s，self 当前时刻 peer 位于 x≈-2，正对接近）。
+  NeighborTrajectory peer;
+  peer.clearance = 0.5;
+  peer.start_time = -2.0;
+  peer.duration = 8.0;
+  peer.data_age_s = 0.0;
+  for (int i = 0; i < 100; ++i)
+  {
+    const double a = static_cast<double>(i) / 99.0;
+    peer.t.push_back(a * 8.0);
+    peer.pts.emplace_back(-4.0 + 8.0 * a, 0.0, 15.0);
+  }
+
+  // 动态安全距离：closing≈1.79 m/s → reaction 0.25s + 制动余量 → safe≈2.35m，
+  // 明显大于固定 swarm_clearance*2=1m。
+  const double safe = EgoPlannerCore::computeSafeClearance(
+      config, peer, -peer.start_time, start.position, start_vel);
+  EXPECT_GT(safe, 1.8);
+  peer.safe_clearance_m = safe;
+
+  TimedTrajectory baseline, avoided;
+  double cost = 0.0;
+  ASSERT_TRUE(core.planOnce(start, waypoints, {}, baseline, cost, start_vel));
+  ASSERT_TRUE(core.planOnce(start, waypoints, {peer}, avoided, cost, start_vel));
+
+  // 无 peer 时轨迹基本贴直线（x≈0）；有动态 clearance 时必须在交叉点局部
+  // 产生明显 x 方向偏移。
+  double max_dev_baseline = 0.0, max_dev_avoided = 0.0;
+  for (const auto& p : baseline.pts)
+    max_dev_baseline = std::max(max_dev_baseline, std::fabs(p.x()));
+  for (const auto& p : avoided.pts)
+    max_dev_avoided = std::max(max_dev_avoided, std::fabs(p.x()));
+  EXPECT_GT(max_dev_avoided, max_dev_baseline + 0.15);
+  std::cout << "[predictive_avoidance] safe=" << safe
+            << " max_dev_baseline=" << max_dev_baseline
+            << " max_dev_avoided=" << max_dev_avoided
+            << " plan_once_ok=true" << std::endl;
+
+  // 硬校验应通过：轨迹全程都在 peer 的动态安全距离之外。
+  EXPECT_TRUE(core.checkClearance(avoided, {peer}, config.swarm_clearance * 2.0));
+}
+
 TEST(EgoPlannerCore, TimedTrajectorySamplesPvaConsistently)
 {
   EgoPlannerCore core(makeConfig());
