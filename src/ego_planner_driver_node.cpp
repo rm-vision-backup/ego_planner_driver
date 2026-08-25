@@ -44,7 +44,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.safety_protected_distance_m = pnh_.param("protected_distance_m", 1.0);
   config.safety_peer_data_age_cap_s = pnh_.param("peer_data_age_cap_s", 2.0);
   config.swarm_soft_margin = pnh_.param("swarm_soft_margin", 0.5);
-  bias_valid_s_ = pnh_.param("bias_valid_s", 30.0);
+  bias_valid_s_ = pnh_.param("bias_valid_s", 120.0);
   intent_publish_rate_hz_ = pnh_.param("intent_publish_rate_hz", 5.0);
   core_.reset(new EgoPlannerCore(config));
   planning_horizon_ = config.planning_horizon;

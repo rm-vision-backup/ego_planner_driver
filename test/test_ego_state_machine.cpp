@@ -288,10 +288,10 @@ TEST(EgoStateMachine, GpsBiasCorrectsNeighborIntentEpoch)
   ASSERT_TRUE(node.injectNeighborIntent(makeIntent(100.0, 1, "A02")));
   EXPECT_NEAR(node.neighborStartTimeForTest("A02"), 99.0, 1e-6);
 
-  // bias 过期（> bias_valid_s_=30s）→ 回退不修正（epoch = 原始 stamp）。
-  clock.advance(31.0);  // now = 131.0
-  ASSERT_TRUE(node.injectNeighborIntent(makeIntent(131.0, 2, "A02")));
-  EXPECT_NEAR(node.neighborStartTimeForTest("A02"), 131.0, 1e-6);
+  // bias 过期（> bias_valid_s_=120s）→ 回退不修正（epoch = 原始 stamp）。
+  clock.advance(121.0);  // now = 221.0
+  ASSERT_TRUE(node.injectNeighborIntent(makeIntent(221.0, 2, "A02")));
+  EXPECT_NEAR(node.neighborStartTimeForTest("A02"), 221.0, 1e-6);
 }
 
 TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
