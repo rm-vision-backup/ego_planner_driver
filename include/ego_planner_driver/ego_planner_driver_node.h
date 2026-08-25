@@ -95,6 +95,11 @@ public:
   // Returns true only when the neighbor intent satisfies the wire/time
   // contract and supersedes the last accepted trajectory from that UAV.
   bool injectNeighborIntent(const swarm_uav_interfaces::UavTrajectoryIntent& intent);
+  // GPS 时钟偏置注入（单测）：own = 本机 bias，peer = 邻机 bias（秒）。
+  void injectOwnBias(double bias);
+  void injectPeerBias(const std::string& uav_id, double bias);
+  // 读取邻机已修正的激活时刻（本机时间轴，单测验证）。
+  double neighborStartTimeForTest(const std::string& uav_id) const;
   void injectMavrosState(bool armed, bool offboard);
   void sendGoal(double x, double y, double z);
   void sendWaypoints(const std::vector<geometry_msgs::Point32>& points);
@@ -124,6 +129,15 @@ private:
   void onWaypoints(const geometry_msgs::PolygonStamped::ConstPtr& msg);
   void onLocalPose(const geometry_msgs::PoseStamped::ConstPtr& msg);
   void onNeighborIntent(const swarm_uav_interfaces::UavTrajectoryIntent::ConstPtr& msg);
+  // GPS 时钟偏置：本机 /gps_bias 与邻机 /UAVn/gps_bias（bridge 转发）。
+  void onOwnBias(const std_msgs::Float64::ConstPtr& msg);
+  void onNeighborBias(const std_msgs::Float64::ConstPtr& msg,
+                      const std::string& uav_id);
+  // 首次收到某邻机 intent 时订阅其 /UAVn/gps_bias（bridge 转发到本机 master）。
+  void ensureNeighborBiasSubscribed(const std::string& uav_id);
+  // 邻机 intent 时间戳修正量：T_own = T_other - bias_other + bias_own。
+  // 本机与邻机 bias 都新鲜（bias_valid_s_ 内）才修正，否则回退 0（相对时钟）。
+  double timeCorrectionFor(const std::string& uav_id) const;
   bool acceptNeighborIntentLocked(
       const swarm_uav_interfaces::UavTrajectoryIntent& msg, const ros::Time& now);
   void onHold(const std_msgs::Empty::ConstPtr& msg);
@@ -215,6 +229,13 @@ private:
   SafetyPrediction last_safety_prediction_;
   uint64_t safety_generation_ = 0;
   bool emergency_braking_ = false;
+  // GPS 时钟偏置（秒）：own = 本机 /gps_bias，peer = 邻机 /UAVn/gps_bias。
+  // 新鲜度由各自接收时刻判定；超 bias_valid_s_ 视为失效回退相对时钟。
+  double own_bias_s_ = 0.0;
+  ros::Time own_bias_received_;
+  std::map<std::string, std::pair<double, ros::Time>> peer_bias_;
+  double bias_valid_s_ = 30.0;
+  std::map<std::string, ros::Subscriber> neighbor_bias_subs_;
 
   bool armed_ = false;
   bool offboard_ = false;
@@ -239,6 +260,7 @@ private:
   ros::Subscriber hold_sub_;
   ros::Subscriber mavros_state_sub_;
   ros::Subscriber direct_control_sub_;
+  ros::Subscriber own_bias_sub_;
   ros::Timer timer_;
   ros::Timer safety_timer_;
   // Periodic intent refresh (intent_publish_rate_hz): republishes the current

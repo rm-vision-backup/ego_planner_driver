@@ -1,8 +1,10 @@
 #include "ego_planner_driver/ego_planner_driver_node.h"
 
 #include <algorithm>
+#include <boost/bind.hpp>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 #include <unistd.h>
@@ -42,6 +44,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.safety_protected_distance_m = pnh_.param("protected_distance_m", 1.0);
   config.safety_peer_data_age_cap_s = pnh_.param("peer_data_age_cap_s", 2.0);
   config.swarm_soft_margin = pnh_.param("swarm_soft_margin", 0.5);
+  bias_valid_s_ = pnh_.param("bias_valid_s", 30.0);
   intent_publish_rate_hz_ = pnh_.param("intent_publish_rate_hz", 5.0);
   core_.reset(new EgoPlannerCore(config));
   planning_horizon_ = config.planning_horizon;
@@ -125,6 +128,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   waypoints_sub_ = nh_.subscribe("waypoints", 1, &EgoPlannerDriverNode::onWaypoints, this);
   pose_sub_ = nh_.subscribe("local_pose", 1, &EgoPlannerDriverNode::onLocalPose, this);
   intent_sub_ = nh_.subscribe("neighbor_intent", 10, &EgoPlannerDriverNode::onNeighborIntent, this);
+  own_bias_sub_ = nh_.subscribe("gps_bias", 1, &EgoPlannerDriverNode::onOwnBias, this);
   hold_sub_ = nh_.subscribe("hold", 1, &EgoPlannerDriverNode::onHold, this);
   mavros_state_sub_ = nh_.subscribe("/mavros/state", 1, &EgoPlannerDriverNode::onMavrosState, this);
   direct_control_sub_ = nh_.subscribe("direct_control_active", 1,
@@ -176,6 +180,27 @@ bool EgoPlannerDriverNode::injectNeighborIntent(
 {
   std::lock_guard<std::mutex> lock(mutex_);
   return acceptNeighborIntentLocked(intent, nowFunc());
+}
+
+void EgoPlannerDriverNode::injectOwnBias(double bias)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  own_bias_s_ = bias;
+  own_bias_received_ = nowFunc();
+}
+
+void EgoPlannerDriverNode::injectPeerBias(const std::string& uav_id, double bias)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  peer_bias_[uav_id] = std::make_pair(bias, nowFunc());
+}
+
+double EgoPlannerDriverNode::neighborStartTimeForTest(
+    const std::string& uav_id) const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = inbox_.find(uav_id);
+  return it == inbox_.end() ? -1.0 : it->second.first.start_time;
 }
 
 void EgoPlannerDriverNode::injectMavrosState(bool armed, bool offboard)
@@ -563,6 +588,43 @@ void EgoPlannerDriverNode::onNeighborIntent(
   acceptNeighborIntentLocked(*msg, nowFunc());
 }
 
+void EgoPlannerDriverNode::onOwnBias(const std_msgs::Float64::ConstPtr& msg)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  own_bias_s_ = msg->data;
+  own_bias_received_ = nowFunc();
+}
+
+void EgoPlannerDriverNode::onNeighborBias(const std_msgs::Float64::ConstPtr& msg,
+                                          const std::string& uav_id)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  peer_bias_[uav_id] = std::make_pair(msg->data, nowFunc());
+}
+
+void EgoPlannerDriverNode::ensureNeighborBiasSubscribed(const std::string& uav_id)
+{
+  if (neighbor_bias_subs_.count(uav_id))
+    return;
+  // 本机 master 上邻机 gps_bias 由 topology bridge 转发为 /UAVn/gps_bias。
+  neighbor_bias_subs_[uav_id] = nh_.subscribe<std_msgs::Float64>(
+      "/" + uav_id + "/gps_bias", 1,
+      boost::bind(&EgoPlannerDriverNode::onNeighborBias, this, _1, uav_id));
+}
+
+double EgoPlannerDriverNode::timeCorrectionFor(const std::string& uav_id) const
+{
+  const ros::Time now = nowFunc();
+  if (own_bias_received_.isZero() ||
+      (now - own_bias_received_).toSec() > bias_valid_s_)
+    return 0.0;
+  const auto it = peer_bias_.find(uav_id);
+  if (it == peer_bias_.end() ||
+      (now - it->second.second).toSec() > bias_valid_s_)
+    return 0.0;
+  return own_bias_s_ - it->second.first;
+}
+
 bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
     const swarm_uav_interfaces::UavTrajectoryIntent& msg, const ros::Time& now)
 {
@@ -582,7 +644,13 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
   // A trajectory epoch is its activation time. Reject already stale epochs and
   // implausibly future epochs rather than retaining unusable or unsynchronised
   // trajectories in the reciprocal planner.
-  const double age = now.toSec() - msg.stamp;
+  // GPS 时钟偏置修正：把邻机意图激活时刻修正到本机时间轴
+  //   T_own = T_other - bias_other + bias_own（本机与邻机 bias 均新鲜时）
+  // 修正后的 epoch 用于 stale 检查、版本比较、start_time 与 data_age 对齐。
+  const double correction = timeCorrectionFor(msg.uav_id);
+  const double epoch = msg.stamp + correction;
+  ensureNeighborBiasSubscribed(msg.uav_id);
+  const double age = now.toSec() - epoch;
   if (age > kNeighborStaleS || age < -kNeighborStaleS)
     return false;
 
@@ -602,15 +670,15 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
   if (version != latest_neighbor_version_.end())
   {
     const double previous_epoch = version->second.first;
-    if (msg.stamp < previous_epoch - kTimeEpsilon ||
-        (std::abs(msg.stamp - previous_epoch) <= kTimeEpsilon &&
+    if (epoch < previous_epoch - kTimeEpsilon ||
+        (std::abs(epoch - previous_epoch) <= kTimeEpsilon &&
          msg.traj_id <= version->second.second))
       return false;
   }
 
   const size_t n = msg.t.size();
   NeighborTrajectory nb;
-  nb.start_time = msg.stamp;  // absolute epoch; converted at planning snapshot
+  nb.start_time = epoch;  // absolute epoch (own time axis); converted at planning snapshot
   nb.clearance = msg.clearance;
   nb.duration = msg.t.back();
   nb.t.reserve(n);
@@ -625,7 +693,7 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
   inbox_[msg.uav_id] = std::make_pair(nb, now);
   neighbor_phase_[msg.uav_id] = legacy
       ? swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE : msg.phase;
-  latest_neighbor_version_[msg.uav_id] = std::make_pair(msg.stamp, msg.traj_id);
+  latest_neighbor_version_[msg.uav_id] = std::make_pair(epoch, msg.traj_id);
   // Avoid reciprocal intent ping-pong: a new version only requests replanning
   // when it invalidates the trajectory currently being executed. With no
   // active trajectory it is simply retained for the next requested plan.

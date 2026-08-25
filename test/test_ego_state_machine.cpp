@@ -272,6 +272,28 @@ TEST(EgoStateMachine, IntentPhaseProtocolKeepsLegacyActiveOnly)
   EXPECT_TRUE(node.injectNeighborIntent(active));
 }
 
+TEST(EgoStateMachine, GpsBiasCorrectsNeighborIntentEpoch)
+{
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  // 本机 bias=2.0s、邻机 bias=3.0s → 修正量 own-peer = -1.0s：
+  // 邻机激活时刻 100.0（邻机时间轴）修正到本机时间轴 99.0。
+  node.injectOwnBias(2.0);
+  node.injectPeerBias("A02", 3.0);
+  ASSERT_TRUE(node.injectNeighborIntent(makeIntent(100.0, 1, "A02")));
+  EXPECT_NEAR(node.neighborStartTimeForTest("A02"), 99.0, 1e-6);
+
+  // bias 过期（> bias_valid_s_=30s）→ 回退不修正（epoch = 原始 stamp）。
+  clock.advance(31.0);  // now = 131.0
+  ASSERT_TRUE(node.injectNeighborIntent(makeIntent(131.0, 2, "A02")));
+  EXPECT_NEAR(node.neighborStartTimeForTest("A02"), 131.0, 1e-6);
+}
+
 TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
 {
   FakeClock clock;
