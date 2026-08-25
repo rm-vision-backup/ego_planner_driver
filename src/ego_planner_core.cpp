@@ -1,5 +1,6 @@
 #include "ego_planner_driver/ego_planner_core.h"
 #include "ego_planner_driver/polynomial_traj.h"
+#include "ego_planner_driver/safety_predictor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -163,12 +164,14 @@ double EgoPlannerCore::computeSafeClearance(
   const double r_norm = r.norm();
   const double closing = r_norm > 1e-9
       ? std::max(0.0, -r.dot(v_rel) / r_norm) : 0.0;
+  // 与 SafetyPredictor::evaluatePair 同一动态距离公式（shared dynamicMargin），
+  // 含 peer_data_age_cap 限幅——避免 age 无限增长导致门槛爆炸。
+  const double age = std::min(std::max(0.0, neighbor.data_age_s),
+      std::max(0.0, config.safety_peer_data_age_cap_s));
   const double reaction = std::max(0.0, config.safety_control_delay_s) +
-      std::max(0.0, config.safety_compute_budget_s) +
-      std::max(0.0, neighbor.data_age_s);
-  const double decel = std::max(1e-6, config.safety_emergency_decel_mps2);
-  const double margin = closing * reaction +
-      closing * closing / (2.0 * decel);
+      std::max(0.0, config.safety_compute_budget_s) + age;
+  const double margin = SafetyPredictor::dynamicMargin(
+      closing, reaction, config.safety_emergency_decel_mps2);
   return config.safety_protected_distance_m + margin +
       std::max(0.0, config.safety_emergency_buffer_m);
 }

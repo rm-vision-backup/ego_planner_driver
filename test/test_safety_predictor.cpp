@@ -43,9 +43,6 @@ TEST(SafetyIdentity, ParsesNumericSuffixAndDeterminesRole)
   EXPECT_TRUE(SafetyPredictor::parseNumericId("UAV10", id)); EXPECT_EQ(id, 10);
   EXPECT_FALSE(SafetyPredictor::parseNumericId("UAV", id));
   EXPECT_FALSE(SafetyPredictor::parseNumericId("bad/name2", id));
-  EXPECT_EQ(SafetyPredictor::determineRole("A01", "UAV2"), PairRole::STAND_ON);
-  EXPECT_EQ(SafetyPredictor::determineRole("UAV10", "A2"), PairRole::YIELD);
-  EXPECT_EQ(SafetyPredictor::determineRole("A2", "UAV2"), PairRole::UNKNOWN);
 }
 
 TEST(SafetyPredictor, ComputesHeadOnCpaTtcAndDynamicThresholds)
@@ -70,7 +67,6 @@ TEST(SafetyPredictor, ComputesHeadOnCpaTtcAndDynamicThresholds)
   EXPECT_NEAR(pair.cpa_distance_m, 0.0, 1e-6);
   EXPECT_NEAR(pair.ttc_s, 2.0, 0.06);
   EXPECT_GT(pair.warning_distance_m, pair.emergency_distance_m);
-  EXPECT_EQ(pair.role, PairRole::STAND_ON);
   EXPECT_EQ(pair.level, SafetyLevel::EMERGENCY);
 }
 
@@ -86,7 +82,6 @@ TEST(SafetyPredictor, UsesCommonAbsoluteEpochAndDetectsOrthogonalCrossing)
       linear(Eigen::Vector3d::Zero(), Eigen::Vector3d(1, 0, 0), 6.0),
       100.0, "UAV2", {peer}, 101.0));
   EXPECT_NEAR(pair.min_distance_m, 0.0, 0.08);
-  EXPECT_EQ(pair.role, PairRole::YIELD);
   EXPECT_TRUE(pair.level == SafetyLevel::WARNING ||
               pair.level == SafetyLevel::EMERGENCY);
 }
@@ -135,7 +130,7 @@ TEST(ConflictEpisode, LatchesPeerAndReleasesAfterHysteresis)
   SafetyPrediction warning;
   warning.level = SafetyLevel::WARNING;
   warning.primary_peer_id = "UAV2";
-  PairPrediction pair; pair.peer_id = "UAV2"; pair.role = PairRole::STAND_ON;
+  PairPrediction pair; pair.peer_id = "UAV2";
   warning.pairs.push_back(pair);
   episode.update(warning, 1.0, 0.5);
   ASSERT_TRUE(episode.active());

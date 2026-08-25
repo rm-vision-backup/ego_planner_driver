@@ -51,6 +51,10 @@ struct EgoPlannerConfig
   double safety_emergency_decel_mps2 = 2.0;
   double safety_emergency_buffer_m = 0.10;
   double safety_protected_distance_m = 1.0;
+  // Intent age cap shared with SafetyPredictorConfig::peer_data_age_cap_s:
+  // keeps the dynamic distance margin bounded when a peer intent stops
+  // refreshing (computed via SafetyPredictor::dynamicMargin).
+  double safety_peer_data_age_cap_s = 2.0;
   // Soft-penalty overshoot for predictive avoidance: the optimizer converges
   // slightly short of the requested gate (measured ~0.1 m under), so the swarm
   // cost targets safe_clearance + this margin while the hard gate stays at

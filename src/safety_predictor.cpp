@@ -82,15 +82,6 @@ bool SafetyPredictor::parseNumericId(const std::string& identity, int& numeric_i
   }
 }
 
-PairRole SafetyPredictor::determineRole(const std::string& self_id,
-                                        const std::string& peer_id)
-{
-  int self = -1, peer = -1;
-  if (!parseNumericId(self_id, self) || !parseNumericId(peer_id, peer) || self == peer)
-    return PairRole::UNKNOWN;
-  return self < peer ? PairRole::STAND_ON : PairRole::YIELD;
-}
-
 PairPrediction SafetyPredictor::evaluatePair(
     const TimedTrajectory& self, double self_activation_epoch_s,
     const std::string& self_id, const PeerTrajectoryInput& peer,
@@ -99,7 +90,6 @@ PairPrediction SafetyPredictor::evaluatePair(
   PairPrediction out;
   out.peer_id = peer.uav_id.empty() ? peer.exec_target : peer.uav_id;
   out.peer_traj_id = peer.traj_id;
-  out.role = determineRole(self_id, out.peer_id);
   out.data_age_s = std::max(0.0, now_epoch_s - peer.receive_epoch_s);
   out.peer_activation_epoch_s = peer.activation_epoch_s;
 
@@ -139,9 +129,8 @@ PairPrediction SafetyPredictor::evaluatePair(
       std::max(0.0, config_.peer_data_age_cap_s));
   const double reaction = std::max(0.0, config_.control_delay_s) +
       std::max(0.0, config_.local_compute_budget_s) + age;
-  const double decel = std::max(1e-6, config_.emergency_decel_mps2);
-  const double margin = out.closing_speed_mps * reaction +
-      out.closing_speed_mps * out.closing_speed_mps / (2.0 * decel);
+  const double margin = SafetyPredictor::dynamicMargin(
+      out.closing_speed_mps, reaction, config_.emergency_decel_mps2);
   out.warning_distance_m = config_.protected_distance_m + margin +
       std::max(0.0, config_.warning_buffer_m);
   out.emergency_distance_m = config_.protected_distance_m + margin +
@@ -211,15 +200,12 @@ const char* SafetyPredictor::levelName(SafetyLevel level)
   return "UNKNOWN";
 }
 
-const char* SafetyPredictor::roleName(PairRole role)
+double SafetyPredictor::dynamicMargin(double closing_mps, double reaction_s,
+                                      double decel_mps2)
 {
-  switch (role)
-  {
-    case PairRole::STAND_ON: return "STAND_ON";
-    case PairRole::YIELD: return "YIELD";
-    case PairRole::UNKNOWN: return "UNKNOWN";
-  }
-  return "UNKNOWN";
+  const double decel = std::max(1e-6, decel_mps2);
+  return closing_mps * std::max(0.0, reaction_s) +
+      closing_mps * closing_mps / (2.0 * decel);
 }
 
 void ConflictEpisode::update(const SafetyPrediction& prediction, double now_s,
@@ -232,9 +218,6 @@ void ConflictEpisode::update(const SafetyPrediction& prediction, double now_s,
     {
       active_ = true;
       peer_id_ = prediction.primary_peer_id;
-      const auto it = std::find_if(prediction.pairs.begin(), prediction.pairs.end(),
-          [this](const PairPrediction& pair) { return pair.peer_id == peer_id_; });
-      role_ = it == prediction.pairs.end() ? PairRole::UNKNOWN : it->role;
     }
     safe_since_s_ = -1.0;
     return;
@@ -245,7 +228,6 @@ void ConflictEpisode::update(const SafetyPrediction& prediction, double now_s,
   {
     active_ = false;
     peer_id_.clear();
-    role_ = PairRole::UNKNOWN;
     safe_since_s_ = -1.0;
   }
 }

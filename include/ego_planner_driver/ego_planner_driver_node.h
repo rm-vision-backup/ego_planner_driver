@@ -25,7 +25,6 @@
 #include "ego_planner_driver/emergency_brake.h"
 #include "ego_planner_driver/safety_logger.h"
 #include "ego_planner_driver/safety_predictor.h"
-#include "ego_planner_driver/yield_candidates.h"
 
 using ego_planner_driver::EgoPlannerConfig;
 using ego_planner_driver::EgoPlannerCore;
@@ -47,7 +46,6 @@ static constexpr const char* kStateExecTimeout = "EGO_EXEC_TIMEOUT";
 static constexpr const char* kStateTakeoff = "TAKEOFF";
 static constexpr const char* kStateEmergencyBrake = "EMERGENCY_BRAKE";
 static constexpr const char* kStateBrakeHold = "BRAKE_HOLD";
-static constexpr const char* kStateNegotiating = "NEGOTIATING";
 
 constexpr double kSetpointRateHz = 30.0;
 // Intent freshness bound: peers keep their intent within [now-30s, now+30s]
@@ -106,11 +104,9 @@ public:
   void publishSetpointTick();
   void safetySupervisorTick();
   void setSafetySupervisorModeForTest(const std::string& mode);
-  void setIntentNegotiationWaitForTest(double seconds);
   void setIdentityForTest(const std::string& uav_id,
                           const std::string& exec_target);
   SafetyPrediction lastSafetyPrediction() const;
-  bool yieldCommittedForTest() const;
   std::string execState() const;
   boost::optional<HoldTarget> steadyTarget() const;
   mavros_msgs::PositionTarget lastSetpoint() const;
@@ -185,18 +181,13 @@ private:
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base);
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base,
                      uint8_t phase);
-  bool activateTentativeLocked(const ros::Time& now);
-  static void appendSample(swarm_uav_interfaces::UavTrajectoryIntent& msg,
-                           const TimedTrajectory& traj, size_t i);
+  void appendSample(swarm_uav_interfaces::UavTrajectoryIntent& msg,
+                    const TimedTrajectory& traj, size_t i);
   void replanLoop();
   std::vector<PeerTrajectoryInput> safetyPeersLocked() const;
   std::string formatSafetyLog(const SafetyPrediction& prediction,
                               const ros::Time& now,
                               double self_odom_dev_m) const;
-  // 缺陷 2：已提交让路候选后，仅当邻机 intent 版本有更新或当前候选已恶化到
-  // emergency 边界内时才重新评估；否则保持以避免 25Hz 重复切轨迹。
-  bool peerVersionsUnchangedLocked() const;
-  std::map<std::string, int32_t> peerVersionsSnapshotLocked() const;
 
   std::unique_ptr<EgoPlannerCore> core_;
   std::string frame_id_;
@@ -219,22 +210,11 @@ private:
   SafetyPredictorConfig safety_config_;
   std::unique_ptr<SafetyPredictor> safety_predictor_;
   std::unique_ptr<EmergencyBrakeGenerator> emergency_brake_generator_;
-  std::unique_ptr<YieldCandidateGenerator> yield_candidate_generator_;
-  bool enable_yield_candidates_ = true;
-  boost::optional<YieldManeuver> episode_maneuver_;
-  bool yield_committed_ = false;
-  // 提交让路候选时记录的邻机 intent 版本（uav_id -> traj_id），用于缺陷 2
-  // 的"peer 更新才重新评估"判断。
-  std::map<std::string, int32_t> yield_peer_versions_;
   SafetyLogger safety_logger_;
   ConflictEpisode conflict_episode_;
   SafetyPrediction last_safety_prediction_;
   uint64_t safety_generation_ = 0;
   bool emergency_braking_ = false;
-  double intent_negotiation_wait_s_ = 1.0;
-  std::shared_ptr<TimedTrajectory> tentative_;
-  ros::Time tentative_created_;
-  uint64_t tentative_generation_ = 0;
 
   bool armed_ = false;
   bool offboard_ = false;

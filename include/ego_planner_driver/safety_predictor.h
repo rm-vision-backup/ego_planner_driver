@@ -12,7 +12,6 @@ namespace ego_planner_driver
 {
 
 enum class SafetyLevel { SAFE, WARNING, EMERGENCY, INSUFFICIENT_DATA };
-enum class PairRole { UNKNOWN, STAND_ON, YIELD };
 
 struct SafetyPredictorConfig
 {
@@ -45,7 +44,6 @@ struct PairPrediction
   std::string peer_id;
   int32_t peer_traj_id = 0;
   SafetyLevel level = SafetyLevel::SAFE;
-  PairRole role = PairRole::UNKNOWN;
   double data_age_s = 0.0;
   double peer_activation_epoch_s = 0.0;
   double common_window_s = 0.0;
@@ -78,10 +76,12 @@ public:
                             double now_epoch_s) const;
 
   static bool parseNumericId(const std::string& identity, int& numeric_id);
-  static PairRole determineRole(const std::string& self_id,
-                                const std::string& peer_id);
   static const char* levelName(SafetyLevel level);
-  static const char* roleName(PairRole role);
+  // 共享的动态距离制动余量：margin = closing*reaction + closing²/(2*decel)。
+  // 监督门槛（evaluatePair）与规划软惩罚（EgoPlannerCore::computeSafeClearance）
+  // 共用此函数，避免公式漂移（历史上出现过 age cap 与实际 age 不一致）。
+  static double dynamicMargin(double closing_mps, double reaction_s,
+                              double decel_mps2);
 
 private:
   PairPrediction evaluatePair(const TimedTrajectory& self,
@@ -100,12 +100,10 @@ public:
               double release_hysteresis_s);
   bool active() const { return active_; }
   const std::string& peerId() const { return peer_id_; }
-  PairRole role() const { return role_; }
 
 private:
   bool active_ = false;
   std::string peer_id_;
-  PairRole role_ = PairRole::UNKNOWN;
   double safe_since_s_ = -1.0;
 };
 
