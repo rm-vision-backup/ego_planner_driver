@@ -239,71 +239,54 @@ TEST(EgoPlannerCore, ReciprocalNominalIntentBlocksUnsafeDefaultEnablement)
   EXPECT_NEAR(nominal_a.pts.back().x(), 10.0, 1e-3);
 }
 
-// 预测式避碰（方向 A）：节点把 SafetyPredictor 公式的动态安全距离注入
-// neighbor.safe_clearance_m，规划必须把同刻交叉段当"冲突区域"局部绕开，
-// 而不是只在固定 1 m clearance 内推开。正交交叉下 self 沿 y 轴前进、peer
-// 沿 x 轴前进且同时到达交点。
-TEST(EgoPlannerCore, PredictiveAvoidanceDeviatesAroundCrossingPeer)
+// 固定 clearance 避碰（implementation_plan_26082602）：规划层门槛回固定
+// swarm_clearance×2=1m，不再使用 data_age 动态安全距离。固定 1m 硬门拒绝
+// 侵入轨迹（checkClearance 不变）：peer 平行同行且距离 < 1m 时 planOnce 失败；
+// 距离 > 1m 时无影响，轨迹与无 peer 基线一致。
+TEST(EgoPlannerCore, FixedClearanceHardGateRejectsIntrudingNeighbor)
 {
   EgoPlannerConfig config = makeConfig();
-  config.cruise_velocity = 1.5;
+  config.cruise_velocity = 1.0;
   config.lambda_swarm = 1.0;
-  config.safety_control_delay_s = 0.20;
-  config.safety_compute_budget_s = 0.05;
-  config.safety_emergency_decel_mps2 = 2.0;
-  config.safety_emergency_buffer_m = 0.10;
-  config.safety_protected_distance_m = 1.0;
   EgoPlannerCore core(config);
 
-  // self（UAV2）沿 y 轴从 (0,-4) 到 (0,4)，v=1.5；crossing 点在 y=0。
-  const GoalPoint start{Eigen::Vector3d(0.0, -4.0, 15.0), 0.0};
+  const GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
   const std::vector<WayPoint> waypoints{
-      WayPoint{Eigen::Vector3d(0.0, 4.0, 15.0), 0.0}};
-  const Eigen::Vector3d start_vel(0.0, 1.5, 0.0);
+      WayPoint{Eigen::Vector3d(8.0, 0.0, 15.0), 0.0}};
+  const Eigen::Vector3d start_vel(1.0, 0.0, 0.0);
 
-  // peer（UAV1）沿 x 轴从 (-4,0) 到 (4,0)，v=1 m/s，start_time=-2s（已激活
-  // 2s，self 当前时刻 peer 位于 x≈-2，正对接近）。
-  NeighborTrajectory peer;
-  peer.clearance = 0.5;
-  peer.start_time = -2.0;
-  peer.duration = 8.0;
-  peer.data_age_s = 0.0;
+  // peer 与本机同刻激活、同速同行，恒定横向距离 0.5m < 1m 硬门。
+  NeighborTrajectory intruding;
+  intruding.clearance = 0.5;
+  intruding.start_time = 0.0;
+  intruding.duration = 8.0;
+  intruding.data_age_s = 0.0;
   for (int i = 0; i < 100; ++i)
   {
     const double a = static_cast<double>(i) / 99.0;
-    peer.t.push_back(a * 8.0);
-    peer.pts.emplace_back(-4.0 + 8.0 * a, 0.0, 15.0);
+    intruding.t.push_back(a * 8.0);
+    intruding.pts.emplace_back(8.0 * a, 0.5, 15.0);
   }
 
-  // 动态安全距离：closing≈1.79 m/s → reaction 0.25s + 制动余量 → safe≈2.35m，
-  // 明显大于固定 swarm_clearance*2=1m。
-  const double safe = EgoPlannerCore::computeSafeClearance(
-      config, peer, -peer.start_time, start.position, start_vel);
-  EXPECT_GT(safe, 1.8);
-  peer.safe_clearance_m = safe;
+  // 距离 1.5m > 1m 的平行邻机：无侵入。
+  NeighborTrajectory clear = intruding;
+  for (auto& p : clear.pts)
+    p.y() = 1.5;
 
-  TimedTrajectory baseline, avoided;
+  TimedTrajectory baseline, traj;
   double cost = 0.0;
   ASSERT_TRUE(core.planOnce(start, waypoints, {}, baseline, cost, start_vel));
-  ASSERT_TRUE(core.planOnce(start, waypoints, {peer}, avoided, cost, start_vel));
+  ASSERT_TRUE(core.planOnce(start, waypoints, {clear}, traj, cost, start_vel));
+  // 1.5m 平行邻机在固定 1m 门禁外：轨迹应与无 peer 一致（无软惩罚绕开）。
+  ASSERT_EQ(baseline.pts.size(), traj.pts.size());
+  for (size_t i = 0; i < baseline.pts.size(); ++i)
+    EXPECT_LT((baseline.pts[i] - traj.pts[i]).norm(), 1e-6);
 
-  // 无 peer 时轨迹基本贴直线（x≈0）；有动态 clearance 时必须在交叉点局部
-  // 产生明显 x 方向偏移。
-  double max_dev_baseline = 0.0, max_dev_avoided = 0.0;
-  for (const auto& p : baseline.pts)
-    max_dev_baseline = std::max(max_dev_baseline, std::fabs(p.x()));
-  for (const auto& p : avoided.pts)
-    max_dev_avoided = std::max(max_dev_avoided, std::fabs(p.x()));
-  EXPECT_GT(max_dev_avoided, max_dev_baseline + 0.15);
-  std::cout << "[predictive_avoidance] safe=" << safe
-            << " max_dev_baseline=" << max_dev_baseline
-            << " max_dev_avoided=" << max_dev_avoided
-            << " plan_once_ok=true" << std::endl;
-
-  // 分层安全（SITL 实测修正）：动态距离只做软惩罚绕开激励；硬校验保持
-  // 固定物理安全门（1m），否则正交交叉走廊内一切穿越轨迹都会被动态门
-  // 拒绝 → EGO_PLAN_FAILED。绕开轨迹必然满足 1m 硬门。
-  EXPECT_TRUE(core.checkClearance(avoided, {peer}, config.swarm_clearance * 2.0));
+  // 0.5m 侵入邻机：直线轨迹穿 1m 硬门 → planOnce 必须失败（固定 clearance 硬门）。
+  EXPECT_FALSE(core.planOnce(start, waypoints, {intruding}, traj, cost, start_vel));
+  // 硬门校验本身按固定 swarm_clearance×2 拒绝侵入轨迹。
+  EXPECT_FALSE(core.checkClearance(baseline, {intruding},
+                                   config.swarm_clearance * 2.0));
 }
 
 TEST(EgoPlannerCore, TimedTrajectorySamplesPvaConsistently)

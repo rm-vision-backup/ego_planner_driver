@@ -41,16 +41,6 @@ Eigen::Vector3d sampleNeighbor(const NeighborTrajectory& traj, double t_rel)
   return traj.pts.back();
 }
 
-Eigen::Vector3d sampleNeighborVelocity(const NeighborTrajectory& traj, double t_rel)
-{
-  if (traj.pts.size() < 2 || traj.t.size() != traj.pts.size())
-    return Eigen::Vector3d::Zero();
-  const double dt = std::max(1e-6, (traj.t.back() - traj.t.front()) /
-      static_cast<double>(traj.pts.size() - 1));
-  return (sampleNeighbor(traj, t_rel + dt) - sampleNeighbor(traj, t_rel - dt)) /
-         (2.0 * dt);
-}
-
 // Uniform densification moved to the Python EgoSwarmDriver layer (plan B):
 // the driver builds command-specific layered keypoints and densifies them to
 // 2 m before publishing waypoints.  This core only parameterizes whatever
@@ -146,34 +136,6 @@ EgoPlannerCore::EgoPlannerCore(const EgoPlannerConfig& config)
   , bspline_interval_(config.ts)
   , order_(config.order)
 {
-}
-
-double EgoPlannerCore::computeSafeClearance(
-    const EgoPlannerConfig& config, const NeighborTrajectory& neighbor,
-    double peer_t_rel, const Eigen::Vector3d& self_pos,
-    const Eigen::Vector3d& self_vel)
-{
-  if (neighbor.pts.size() < 2 || neighbor.t.size() != neighbor.pts.size())
-    return config.swarm_clearance * 2.0;
-  if (peer_t_rel < neighbor.t.front() || peer_t_rel > neighbor.t.back())
-    return config.swarm_clearance * 2.0;
-  const Eigen::Vector3d peer_pos = sampleNeighbor(neighbor, peer_t_rel);
-  const Eigen::Vector3d peer_vel = sampleNeighborVelocity(neighbor, peer_t_rel);
-  const Eigen::Vector3d r = peer_pos - self_pos;
-  const Eigen::Vector3d v_rel = peer_vel - self_vel;
-  const double r_norm = r.norm();
-  const double closing = r_norm > 1e-9
-      ? std::max(0.0, -r.dot(v_rel) / r_norm) : 0.0;
-  // 与 SafetyPredictor::evaluatePair 同一动态距离公式（shared dynamicMargin），
-  // 含 peer_data_age_cap 限幅——避免 age 无限增长导致门槛爆炸。
-  const double age = std::min(std::max(0.0, neighbor.data_age_s),
-      std::max(0.0, config.safety_peer_data_age_cap_s));
-  const double reaction = std::max(0.0, config.safety_control_delay_s) +
-      std::max(0.0, config.safety_compute_budget_s) + age;
-  const double margin = SafetyPredictor::dynamicMargin(
-      closing, reaction, config.safety_emergency_decel_mps2);
-  return config.safety_protected_distance_m + margin +
-      std::max(0.0, config.safety_emergency_buffer_m);
 }
 
 void EgoPlannerCore::combineCost(const double* x, double* grad, double& cost,
@@ -370,14 +332,10 @@ void EgoPlannerCore::calcSwarmCost(const Eigen::MatrixXd& q, double& cost,
       const double ellip_dist = std::sqrt(
           dist_vec(2) * dist_vec(2) * kInvA2 +
           (dist_vec(0) * dist_vec(0) + dist_vec(1) * dist_vec(1)) * kInvB2);
-      // 预测式避碰：使用节点按 SafetyPredictor 公式计算的动态安全距离，
-      // 使规划在 peer 进入预测冲突区域（同刻交点局部）时提前绕开，而非只
-      // 在固定 1m clearance 内才推开。软惩罚目标对动态距离带超调余量
-      // （swarm_soft_margin），因为 L-BFGS 收敛总比请求 gate 短约 0.1m；
-      // 固定 clearance 场景不加 margin，保持原行为。
-      const double gate = neighbor.safe_clearance_m > 0.0
-          ? neighbor.safe_clearance_m + config_.swarm_soft_margin
-          : clearance;
+      // 固定 clearance（swarm_clearance×2=1m）：预测能力来自同刻采样 + GPS bias
+      // 时间戳修正（implementation_plan_26082602），不再用 data_age 动态安全距离
+      // 激励绕开。软惩罚目标是固定 gate，硬校验（checkClearance）同 gate。
+      const double gate = clearance;
       const double dist_err = gate - ellip_dist;
       if (dist_err >= 0.0)
       {
@@ -812,11 +770,9 @@ bool EgoPlannerCore::checkClearance(const TimedTrajectory& trajectory,
       const double ellip_dist = std::sqrt(
           dist_vec(2) * dist_vec(2) * kInvA2 +
           (dist_vec(0) * dist_vec(0) + dist_vec(1) * dist_vec(1)) * kInvB2);
-      // 硬校验保持固定 swarm clearance（物理安全门，1 m），不随监督动态
-      // 距离收紧：SITL 实测动态距离（含反应+制动余量，正交交叉时 ≈4 m）
-      // 作为硬门会让规划在交叉走廊内拒绝一切穿越轨迹 → EGO_PLAN_FAILED
-      // （比监督制动兜底更差）。动态距离只用于 calcSwarmCost 软惩罚激励
-      // 绕开，运行时由 SafetyPredictor/监督层兜底。
+      // 硬校验保持固定 swarm clearance（物理安全门，1 m），与 calcSwarmCost
+      // 软惩罚同 gate。动态安全距离已解耦（implementation_plan_26082602）：
+      // 规划层与监督层解耦，运行时由 SafetyPredictor/监督层 EMERGENCY 兜底。
       if (ellip_dist < clearance)
         return false;
     }
