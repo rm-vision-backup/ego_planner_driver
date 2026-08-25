@@ -200,6 +200,32 @@ TimedTrajectory selectYield(const TimedTrajectory& nominal,
   if (maneuver) *maneuver = selected.maneuver;
   return selected.trajectory;
 }
+
+// 从轨迹的 elapsed 时刻切出剩余部分，t 重基准为 0（同 node remainingTrajectory）。
+TimedTrajectory sliceFrom(const TimedTrajectory& source, double elapsed)
+{
+  TimedTrajectory out;
+  if (source.t.empty()) return out;
+  const double begin = std::max(0.0, std::min(elapsed, source.duration));
+  TrajectorySample first;
+  if (!source.samplePVA(begin, first)) return out;
+  out.t.push_back(0.0);
+  out.pts.push_back(first.pos);
+  out.vel.push_back(first.vel);
+  out.acc.push_back(first.acc);
+  out.yaw.push_back(first.yaw);
+  for (size_t i = 0; i < source.t.size(); ++i)
+  {
+    if (source.t[i] <= begin + 1e-9) continue;
+    out.t.push_back(source.t[i] - begin);
+    out.pts.push_back(source.pts[i]);
+    out.vel.push_back(source.vel[i]);
+    out.acc.push_back(source.acc[i]);
+    out.yaw.push_back(source.yaw[i]);
+  }
+  out.duration = source.duration - begin;
+  return out;
+}
 }  // namespace
 
 TEST(StageEClosedLoop, OrthogonalYieldMaintainsActualProtectedDistance)
@@ -324,6 +350,118 @@ TEST(StageEClosedLoop, ConflictEpisodeLatchesYieldRoleAcrossSafeGap)
   EXPECT_EQ(episode.role(), PairRole::YIELD);
   episode.update(safe, 1.81, 1.0);
   EXPECT_FALSE(episode.active());
+}
+
+TEST(StageEClosedLoop, DualNodeActiveAvoidanceMaintainsDistance)
+{
+  const ClosedLoopConfig config;
+  const double peer_delay_s = 0.8;   // 跨 master intent 延迟注入
+  const double decision_dt = 1.0 / 25.0;  // supervisor 25Hz
+  const double dt = 0.01;
+
+  // 正交近失（3m 初始中心距，nominal CPA 在 warning 内）：
+  // A01 = STAND_ON 沿 x；A02 = YIELD 沿 +y 进入 A01 路径。
+  const double peer_x = 1.49;
+  const double peer_y = -std::sqrt(9.0 - std::pow(peer_x + 1.5, 2.0));
+  const TimedTrajectory nominal_a01 = linearTrajectory(
+      Eigen::Vector3d(-1.5, 0.0, 0.0), Eigen::Vector3d(1.5, 0.0, 0.0), 6.0);
+  const TimedTrajectory nominal_a02 = linearTrajectory(
+      Eigen::Vector3d(peer_x, peer_y, 0.0),
+      Eigen::Vector3d(peer_x, peer_y + 3.0, 0.0), 6.0);
+
+  SafetyPredictor predictor = makePredictor(config);
+  YieldCandidateGenerator yield_generator = makeYieldGenerator();
+  EmergencyBrakeGenerator brake_generator = makeBrakeGenerator();
+
+  TimedTrajectory current_a01 = nominal_a01;
+  TimedTrajectory current_a02 = nominal_a02;
+  double activation_a01 = 0.0;
+  double activation_a02 = 0.0;
+  Plant plant_a01, plant_a02;
+  initializePlant(current_a01, plant_a01);
+  initializePlant(current_a02, plant_a02);
+
+  double min_dist = (plant_a01.pos - plant_a02.pos).norm();
+  int a02_commits = 0;
+  bool a01_emergency = false;
+
+  const double end = 9.0;
+  for (double now = 0.0; now <= end; now += dt)
+  {
+    if (std::fmod(now, decision_dt) < dt * 0.5)
+    {
+      // A02 (YIELD)：用延迟到达的 A01 intent 评估当前轨迹并决策。
+      if (now >= peer_delay_s)
+      {
+        PeerTrajectoryInput peer_a01;
+        peer_a01.uav_id = "A01";
+        peer_a01.exec_target = "UAV1";
+        peer_a01.traj_id = 1;
+        peer_a01.trajectory = current_a01;
+        peer_a01.activation_epoch_s = activation_a01;
+        peer_a01.receive_epoch_s = now - peer_delay_s;
+        const SafetyPrediction prediction = predictor.evaluate(
+            current_a02, activation_a02, "A02", {peer_a01}, now);
+        const SafetyLevel level = prediction.level;
+        const PairRole role = prediction.pairs.empty()
+            ? PairRole::UNKNOWN : prediction.pairs.front().role;
+        if (level == SafetyLevel::EMERGENCY)
+        {
+          TrajectorySample start;
+          if (current_a02.samplePVA(now - activation_a02, start))
+          {
+            TimedTrajectory braking;
+            if (brake_generator.generate(start, braking))
+            {
+              current_a02 = braking;
+              activation_a02 = now;
+              ++a02_commits;
+            }
+          }
+        }
+        else if (level == SafetyLevel::WARNING && role == PairRole::YIELD &&
+                 a02_commits == 0)
+        {
+          const TimedTrajectory remaining = sliceFrom(
+              current_a02, now - activation_a02);
+          NeighborTrajectory peer = asNeighbor(current_a01);
+          peer.start_time = activation_a01 - now;  // rebase 到候选激活 now
+          const auto candidates = yield_generator.generate(remaining, {peer});
+          YieldCandidate selected;
+          if (yield_generator.chooseBest(candidates, selected))
+          {
+            current_a02 = selected.trajectory;
+            activation_a02 = now;
+            ++a02_commits;
+          }
+        }
+      }
+      // A01 (STAND_ON)：应保持 nominal，不应进入 emergency（A02 让路应消除冲突）。
+      if (now >= peer_delay_s && !a01_emergency)
+      {
+        PeerTrajectoryInput peer_a02;
+        peer_a02.uav_id = "A02";
+        peer_a02.exec_target = "UAV2";
+        peer_a02.traj_id = 1;
+        peer_a02.trajectory = current_a02;
+        peer_a02.activation_epoch_s = activation_a02;
+        peer_a02.receive_epoch_s = now - peer_delay_s;
+        const SafetyPrediction prediction = predictor.evaluate(
+            current_a01, activation_a01, "A01", {peer_a02}, now);
+        a01_emergency = prediction.level == SafetyLevel::EMERGENCY;
+      }
+    }
+    stepPlant(current_a01, now - activation_a01, config, plant_a01);
+    stepPlant(current_a02, now - activation_a02, config, plant_a02);
+    min_dist = std::min(min_dist, (plant_a01.pos - plant_a02.pos).norm());
+  }
+  EXPECT_GE(min_dist, kProtectedDistanceM);
+  EXPECT_GT(a02_commits, 0) << "A02 (YIELD) should commit a yield maneuver";
+  EXPECT_FALSE(a01_emergency)
+      << "STAND_ON A01 must not enter EMERGENCY when A02 yields";
+  std::cout << "[dual_node] min_center_distance_m=" << min_dist
+            << " a02_commits=" << a02_commits
+            << " intent_delay_s=" << peer_delay_s << std::endl;
 }
 
 int main(int argc, char** argv)
