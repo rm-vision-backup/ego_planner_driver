@@ -32,6 +32,36 @@ double clamp(double v, double lo, double hi)
 {
   return std::max(lo, std::min(hi, v));
 }
+
+// plateau 包络：过渡区 [s-T, s] 0→1（C2），plateau [s, e] 保持 1，
+// 过渡区 [e, e+T] 1→0（C2），外为 0。w/dw/d2w 解析。
+void plateauWeight(double t, double s, double e, double T,
+                   double& w, double& dw, double& d2w)
+{
+  w = 0.0;
+  dw = 0.0;
+  d2w = 0.0;
+  if (t < s - T || t > e + T)
+    return;
+  if (t < s)
+  {
+    const double tau = (t - (s - T)) / T;  // [0,1]
+    w = 0.5 * (1.0 - std::cos(M_PI * tau));
+    dw = 0.5 * M_PI * std::sin(M_PI * tau) / T;
+    d2w = 0.5 * M_PI * M_PI * std::cos(M_PI * tau) / (T * T);
+  }
+  else if (t <= e)
+  {
+    w = 1.0;
+  }
+  else
+  {
+    const double tau = (t - e) / T;  // [0,1]
+    w = 0.5 * (1.0 + std::cos(M_PI * tau));
+    dw = -0.5 * M_PI * std::sin(M_PI * tau) / T;
+    d2w = -0.5 * M_PI * M_PI * std::cos(M_PI * tau) / (T * T);
+  }
+}
 }  // namespace
 
 YieldCandidateGenerator::YieldCandidateGenerator(const YieldCandidateConfig& config)
@@ -41,12 +71,16 @@ YieldCandidateGenerator::YieldCandidateGenerator(const YieldCandidateConfig& con
 
 bool YieldCandidateGenerator::computeMinClearance(
     const TimedTrajectory& traj, const std::vector<NeighborTrajectory>& neighbors,
-    double& min_clear, double& conflict_center) const
+    double& min_clear, double& conflict_center,
+    double& overlap_start, double& overlap_end) const
 {
   min_clear = std::numeric_limits<double>::infinity();
   conflict_center = 0.0;
+  overlap_start = std::numeric_limits<double>::infinity();
+  overlap_end = -std::numeric_limits<double>::infinity();
   if (traj.pts.empty() || traj.pts.size() != traj.t.size())
     return false;
+  const double gate = config_.clearance_factor * 2.0 * 0.5;  // 1.3m 时空球
   for (size_t i = 0; i < traj.t.size(); ++i)
   {
     const double glb_time = traj.t[i];
@@ -63,8 +97,15 @@ bool YieldCandidateGenerator::computeMinClearance(
         min_clear = d;
         conflict_center = glb_time;
       }
+      if (d < gate)
+      {
+        overlap_start = std::min(overlap_start, glb_time);
+        overlap_end = std::max(overlap_end, glb_time);
+      }
     }
   }
+  if (overlap_start > overlap_end)
+    overlap_start = overlap_end = conflict_center;
   return std::isfinite(min_clear);
 }
 
@@ -72,15 +113,13 @@ bool YieldCandidateGenerator::validate(const TimedTrajectory& traj,
                                        const std::vector<NeighborTrajectory>& neighbors,
                                        double& min_clear) const
 {
-  double center = 0.0;
-  if (!computeMinClearance(traj, neighbors, min_clear, center))
+  double center = 0.0, os = 0.0, oe = 0.0;
+  if (!computeMinClearance(traj, neighbors, min_clear, center, os, oe))
     return false;
-  const double gate = config_.clearance_factor * 2.0 * 0.5;  // 1.3 × swarm_clearance×2
+  const double gate = config_.clearance_factor * 2.0 * 0.5;
   if (min_clear < gate)
     return false;
-  // 合法性：finite + 时间单调。动力学由候选构造保证（SLOW 缩放 / LEFT/RIGHT 的
-  // 横向机动速度预算 T=lateral·π/0.4），不重新限原轨迹绝对速度（replanOnce
-  // feasibility 负责；候选继承原轨迹速度 profile）。
+  // 合法性：finite + 时间单调。动力学由时间轴生成保证（速度 ≤1.5 驱动缩放）。
   for (size_t i = 0; i < traj.pts.size(); ++i)
   {
     if (!std::isfinite(traj.t[i]) || !traj.pts[i].allFinite() ||
@@ -91,6 +130,27 @@ bool YieldCandidateGenerator::validate(const TimedTrajectory& traj,
       return false;
   }
   return true;
+}
+
+void YieldCandidateGenerator::applyTimeScale(TimedTrajectory& traj, double factor)
+{
+  if (factor <= 0.0)
+    return;
+  const std::vector<double> old_t = traj.t;  // 用旧时间轴差分
+  double acc_time = 0.0;
+  for (size_t i = 0; i < traj.t.size(); ++i)
+  {
+    if (i == 0)
+      acc_time = 0.0;
+    else
+      acc_time += (old_t[i] - old_t[i - 1]) / factor;
+    traj.t[i] = acc_time;
+    if (i > 0 && i < traj.vel.size())
+      traj.vel[i] *= factor;
+    if (i > 0 && i < traj.acc.size())
+      traj.acc[i] *= factor * factor;
+  }
+  traj.duration = acc_time;
 }
 
 TimedTrajectory YieldCandidateGenerator::extractRemainder(const TimedTrajectory& current,
@@ -125,42 +185,25 @@ YieldCandidate YieldCandidateGenerator::makeSlow(
     const TimedTrajectory& remaining, double remaining_nominal,
     const std::vector<NeighborTrajectory>& neighbors) const
 {
-  // scale 档位从 slow_min_scale 到 1.0（离散尝试，首个可行）。起点速度保持原值
-  // （P/V 连续），后续点速度 ×scale。
-  for (double scale : {config_.slow_min_scale, 0.5, 0.7, 1.0})
+  // 时间缩放 scale ∈ {0.7, 0.5} → 穿越时刻后移错开 peer 时空轨迹；
+  // 速度 ≤1.5 驱动时间轴（v_max>1.5 时整体拉长）。
+  double v_max = 0.0;
+  for (const auto& v : remaining.vel)
+    v_max = std::max(v_max, v.norm());
+  const double scale_vel = v_max > config_.max_velocity_mps
+      ? config_.max_velocity_mps / v_max : 1.0;
+  for (double scale : {0.7, 0.5})
   {
     YieldCandidate cand;
     cand.type = YieldCandidate::Type::SLOW;
     cand.direction = YieldDirection::NONE;
     cand.trajectory = remaining;
-    cand.trajectory.t.clear();
-    cand.trajectory.duration = 0.0;
-    double acc_time = 0.0;
-    for (size_t i = 0; i < remaining.t.size(); ++i)
-    {
-      if (i == 0)
-      {
-        acc_time = 0.0;
-      }
-      else
-      {
-        acc_time += (remaining.t[i] - remaining.t[i - 1]) / scale;
-      }
-      cand.trajectory.t.push_back(acc_time);
-      if (i < remaining.vel.size())
-      {
-        Eigen::Vector3d v = remaining.vel[i];
-        if (i > 0)
-          v *= scale;  // 起点速度保持原值（连续）
-        cand.trajectory.vel[i] = v;
-      }
-      if (i < remaining.acc.size())
-        cand.trajectory.acc[i] *= (i > 0 ? scale * scale : 1.0);
-    }
-    cand.trajectory.duration = acc_time;
-    cand.time_extension_s = std::max(0.0, cand.trajectory.duration - remaining_nominal);
-    cand.cost = remaining_nominal > 1e-6 ? cand.time_extension_s / remaining_nominal
-                                         : std::numeric_limits<double>::infinity();
+    applyTimeScale(cand.trajectory, scale * scale_vel);
+    cand.time_extension_s = std::max(0.0,
+        cand.trajectory.duration - remaining_nominal);
+    cand.cost = remaining_nominal > 1e-6
+        ? cand.time_extension_s / remaining_nominal
+        : std::numeric_limits<double>::infinity();
     double min_clear = 0.0;
     if (validate(cand.trajectory, neighbors, min_clear))
     {
@@ -174,58 +217,98 @@ YieldCandidate YieldCandidateGenerator::makeSlow(
 
 YieldCandidate YieldCandidateGenerator::makeLateral(
     const TimedTrajectory& remaining, double remaining_nominal,
-    const std::vector<NeighborTrajectory>& neighbors, double conflict_center,
-    YieldDirection dir) const
+    const std::vector<NeighborTrajectory>& neighbors,
+    double overlap_start, double overlap_end, YieldDirection dir) const
 {
-  for (double lateral : {0.5, 1.0, 1.5, config_.lateral_max_m})
+  // 方向 n_avoid：重叠时段内"本机平均 - peer 平均"的水平方向（远离走廊）；
+  // 退化为 0 时用本机切线法向。
+  Eigen::Vector3d self_avg = Eigen::Vector3d::Zero();
+  Eigen::Vector3d peer_avg = Eigen::Vector3d::Zero();
+  int n = 0;
+  for (size_t i = 0; i < remaining.t.size(); ++i)
   {
-    // 窗口 T 自适应：横向机动速度 dw = lateral·π/T ≤ 0.4 m/s（预算，考虑本机轨迹
-    // 速度峰值可接近 max_vel，叠加后仍 ≤1.5）；窗口覆盖冲突区并 clamp 到轨迹内。
-    const double T = std::min(remaining.duration,
-                              std::max(2.0, lateral * M_PI / 0.4));
-    const double t0 = clamp(conflict_center - T / 2.0, 0.0,
-                            std::max(0.0, remaining.duration - T));
-    YieldCandidate cand;
-    cand.type = YieldCandidate::Type::LEFT;
-    cand.direction = dir;
-    cand.lateral_dev_m = lateral;
-    cand.trajectory = remaining;
-    const bool is_left = (dir == YieldDirection::LEFT);
-    for (size_t i = 0; i < remaining.t.size(); ++i)
+    if (remaining.t[i] < overlap_start || remaining.t[i] > overlap_end)
+      continue;
+    self_avg += remaining.pts[i];
+    for (const auto& nb : neighbors)
     {
-      const double t = remaining.t[i];
-      double w = 0.0, dw = 0.0, d2w = 0.0;
-      if (t > t0 && t < t0 + T)
-      {
-        const double tau = (t - t0) / T;
-        w = lateral * 0.5 * (1.0 - std::cos(2.0 * M_PI * tau));
-        dw = lateral * M_PI * std::sin(2.0 * M_PI * tau) / T;
-        d2w = lateral * 2.0 * M_PI * M_PI * std::cos(2.0 * M_PI * tau) / (T * T);
-      }
-      Eigen::Vector3d n(Eigen::Vector3d::Zero());
-      if (i < remaining.vel.size())
-      {
-        const Eigen::Vector3d tangent(remaining.vel[i].x(), remaining.vel[i].y(), 0.0);
-        if (tangent.norm() > 1e-6)
-        {
-          const Eigen::Vector3d t_hat = tangent / tangent.norm();
-          n = is_left ? Eigen::Vector3d(-t_hat.y(), t_hat.x(), 0.0)
-                      : Eigen::Vector3d(t_hat.y(), -t_hat.x(), 0.0);
-        }
-      }
-      cand.trajectory.pts[i] += n * w;
-      if (i < cand.trajectory.vel.size())
-        cand.trajectory.vel[i] += n * dw;
-      if (i < cand.trajectory.acc.size())
-        cand.trajectory.acc[i] += n * d2w;
+      if (nb.clearance <= 0.0)
+        continue;
+      const double t_abs = remaining.t[i] - nb.start_time;
+      if (t_abs < nb.t.front() || t_abs > nb.t.back())
+        continue;
+      peer_avg += samplePeer(nb, t_abs);
+      break;
     }
-    cand.time_extension_s = 0.0;
-    cand.cost = lateral / config_.lateral_max_m;  // dev/2.0（2.0 = 最大偏移）
-    double min_clear = 0.0;
-    if (validate(cand.trajectory, neighbors, min_clear))
+    ++n;
+  }
+  // 方向：self-peer 差在本机轨迹切线法向上的分量决定"远离"侧；法向分量≈0
+  // （peer 在正前/正后）时用切线法向兜底（横向绕开）。
+  Eigen::Vector3d d = (self_avg - peer_avg);
+  d.z() = 0.0;
+  Eigen::Vector3d tangent = Eigen::Vector3d::Zero();
+  for (const auto& v : remaining.vel)
+  {
+    const Eigen::Vector3d h(v.x(), v.y(), 0.0);
+    if (h.norm() > 1e-6)
     {
-      cand.min_clearance_m = min_clear;
-      return cand;
+      tangent += h;
+      break;
+    }
+  }
+  if (tangent.norm() > 1e-6)
+    tangent.normalize();
+  else
+    tangent = Eigen::Vector3d(1.0, 0.0, 0.0);
+  const Eigen::Vector3d normal_left(-tangent.y(), tangent.x(), 0.0);
+  const double along = d.dot(normal_left);  // self 相对 peer 在法向的位置
+  Eigen::Vector3d n_avoid = normal_left;
+  if (std::fabs(along) > 1e-3)
+    n_avoid = (along > 0.0 ? -1.0 : 1.0) * normal_left;  // 远离 peer 的法向侧
+  // LEFT/RIGHT 各自方向（RIGHT 为法向反侧）。
+  if (dir == YieldDirection::RIGHT)
+    n_avoid = -n_avoid;
+
+  const double span = std::max(0.0, overlap_end - overlap_start);
+  const double T_trans = clamp(span / 2.0, 0.5, 1.5);
+  for (double lateral : {1.0, 1.5, 2.0})
+  {
+    for (double scale_wait : {1.0, 0.7})
+    {
+      YieldCandidate cand;
+      cand.type = YieldCandidate::Type::LEFT;
+      cand.direction = dir;
+      cand.lateral_dev_m = lateral;
+      cand.trajectory = remaining;
+      double v_max = 0.0;
+      for (size_t i = 0; i < remaining.t.size(); ++i)
+      {
+        double w = 0.0, dw = 0.0, d2w = 0.0;
+        plateauWeight(remaining.t[i], overlap_start, overlap_end, T_trans,
+                      w, dw, d2w);
+        cand.trajectory.pts[i] += n_avoid * (lateral * w);
+        if (i < cand.trajectory.vel.size())
+        {
+          cand.trajectory.vel[i] += n_avoid * (lateral * dw);
+          v_max = std::max(v_max, cand.trajectory.vel[i].norm());
+        }
+        if (i < cand.trajectory.acc.size())
+          cand.trajectory.acc[i] += n_avoid * (lateral * d2w);
+      }
+      const double scale_vel = v_max > config_.max_velocity_mps
+          ? config_.max_velocity_mps / v_max : 1.0;
+      applyTimeScale(cand.trajectory, scale_wait * scale_vel);
+      cand.time_extension_s = std::max(0.0,
+          cand.trajectory.duration - remaining_nominal);
+      cand.cost = (remaining_nominal > 1e-6
+                       ? cand.time_extension_s / remaining_nominal : 0.0)
+                  + lateral / 1.5;  // dev 权重增大（/1.5）
+      double min_clear = 0.0;
+      if (validate(cand.trajectory, neighbors, min_clear))
+      {
+        cand.min_clearance_m = min_clear;
+        return cand;
+      }
     }
   }
   YieldCandidate none;
@@ -243,8 +326,10 @@ std::vector<YieldCandidate> YieldCandidateGenerator::generate(
   if (remaining.pts.size() < 2)
     return result;
   const double remaining_nominal = remaining.duration;
-  double conflict_center = 0.0, min_clear = 0.0;
-  computeMinClearance(remaining, neighbors, min_clear, conflict_center);
+  double min_clear = 0.0, conflict_center = 0.0;
+  double overlap_start = 0.0, overlap_end = 0.0;
+  computeMinClearance(remaining, neighbors, min_clear, conflict_center,
+                      overlap_start, overlap_end);
 
   if (!peer_hovering)
   {
@@ -253,14 +338,17 @@ std::vector<YieldCandidate> YieldCandidateGenerator::generate(
       result.push_back(slow);
   }
   const YieldCandidate left = makeLateral(remaining, remaining_nominal, neighbors,
-                                          conflict_center, YieldDirection::LEFT);
+                                          overlap_start, overlap_end,
+                                          YieldDirection::LEFT);
   if (left.cost < std::numeric_limits<double>::infinity())
     result.push_back(left);
   const YieldCandidate right = makeLateral(remaining, remaining_nominal, neighbors,
-                                           conflict_center, YieldDirection::RIGHT);
+                                           overlap_start, overlap_end,
+                                           YieldDirection::RIGHT);
   if (right.cost < std::numeric_limits<double>::infinity())
     result.push_back(right);
 
+  // cost 升序（SLOW 无 dev 项 → 自然偏向 SLOW，不强制）。
   std::sort(result.begin(), result.end(),
             [](const YieldCandidate& a, const YieldCandidate& b)
             { return a.cost < b.cost; });
@@ -268,3 +356,4 @@ std::vector<YieldCandidate> YieldCandidateGenerator::generate(
 }
 
 }  // namespace ego_planner_driver
+

@@ -56,23 +56,30 @@ public:
                                        bool peer_hovering) const;
 
 private:
-  // 轨迹 vs 邻机全时域同刻最小距离；conflict_center 记最近时刻（相对轨迹起点）。
+  // 轨迹 vs 邻机全时域同刻最小距离；conflict_center 记最近时刻；overlap 记
+  // 时空重叠时段包络（dist < gate 的 t 范围，plateau 偏移窗口）。
   bool computeMinClearance(const TimedTrajectory& traj,
                            const std::vector<NeighborTrajectory>& neighbors,
-                           double& min_clear, double& conflict_center) const;
-  // 全时域 min_clear >= 门槛 + 动力学 + finite 验证。
+                           double& min_clear, double& conflict_center,
+                           double& overlap_start, double& overlap_end) const;
+  // 全时域 min_clear >= 门槛 + 合法性（finite + 时间单调）。动力学由时间轴
+  // 生成保证（速度 ≤1.5 驱动时间缩放），不做分解校验。
   bool validate(const TimedTrajectory& traj,
                 const std::vector<NeighborTrajectory>& neighbors,
                 double& min_clear) const;
-  // 生成 SLOW 候选（scale 档位从 min 到 1.0 尝试，首个可行）。
+  // 生成 SLOW 候选（时间缩放 scale ∈ {0.7, 0.5}，叠加速度驱动时间轴）。
   YieldCandidate makeSlow(const TimedTrajectory& remaining, double remaining_nominal,
                           const std::vector<NeighborTrajectory>& neighbors) const;
-  // 生成 LEFT/RIGHT 候选（lateral 档位从 0.5 到 max 尝试，首个可行）。
+  // 生成 LEFT/RIGHT 候选：远离 peer 重叠时段平均位置的 plateau 偏移（覆盖时空
+  // 重叠全程 + C2 过渡），叠加 scale_wait 减速与速度驱动时间轴。
   YieldCandidate makeLateral(const TimedTrajectory& remaining, double remaining_nominal,
                              const std::vector<NeighborTrajectory>& neighbors,
-                             double conflict_center, YieldDirection dir) const;
+                             double overlap_start, double overlap_end,
+                             YieldDirection dir) const;
   // 从 current_ 截取 t>=t_elapsed 剩余段并重基准到 0。
   static TimedTrajectory extractRemainder(const TimedTrajectory& current, double t_elapsed);
+  // 整体时间缩放：t'=t/factor、vel'=vel·factor、acc'=acc·factor²；起点速度保持。
+  static void applyTimeScale(TimedTrajectory& traj, double factor);
 
   YieldCandidateConfig config_;
 };

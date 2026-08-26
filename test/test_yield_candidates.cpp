@@ -74,9 +74,9 @@ TEST(YieldCandidates, SlowScalesTimeAndPreservesGeometry)
     if (c.type != YieldCandidate::Type::SLOW)
       continue;
     saw_slow = true;
-    // pts 几何不变（x 等距推进，y 保持 0），时间轴 ×1/scale = ×2。
+    // pts 几何不变（x 等距推进，y 保持 0），时间轴 ×1/scale（scale=0.7 → ~1.43×）。
     ASSERT_EQ(c.trajectory.pts.size(), current.pts.size());
-    EXPECT_NEAR(c.trajectory.duration, 20.0, 0.5);
+    EXPECT_NEAR(c.trajectory.duration, 14.3, 0.5);
     for (size_t i = 0; i < current.pts.size(); ++i)
     {
       EXPECT_NEAR(c.trajectory.pts[i].x(), current.pts[i].x(), 1e-6);
@@ -117,7 +117,8 @@ TEST(YieldCandidates, LateralOffsetsConflictWindowOnly)
   {
     if (c.type == YieldCandidate::Type::SLOW)
       continue;
-    EXPECT_EQ(c.time_extension_s, 0.0);
+    // LEFT/RIGHT 可组合减速（速度驱动 + scale_wait）→ ΔT ≥ 0（时间轴可延长）。
+    EXPECT_GE(c.time_extension_s, 0.0);
     for (size_t i = 0; i < c.trajectory.t.size(); ++i)
     {
       // 起点 w(0)=0（P/V/A 连续）；冲突区（除首尾过渡）有横向偏移。
@@ -150,7 +151,7 @@ TEST(YieldCandidates, CostPrefersLateralOverLongSlow)
     if (c.type == YieldCandidate::Type::SLOW)
       EXPECT_GT(c.time_extension_s, 0.0);
     else
-      EXPECT_EQ(c.time_extension_s, 0.0);
+      EXPECT_GE(c.time_extension_s, 0.0);
   }
 }
 
