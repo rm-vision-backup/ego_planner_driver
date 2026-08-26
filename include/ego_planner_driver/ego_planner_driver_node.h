@@ -123,6 +123,10 @@ public:
   // 测试/外部注入接口：执行一次周期碰撞检查（等价 collision_check_rate_hz tick），
   // 本机 current_ 与 fresh 邻机轨迹 < 固定 clearance → planning_requested_。
   void runCollisionCheckTick();
+  // 首轮排序（SEQUENTIAL_START）测试接口：设置等待超时 / 判定首轮是否就绪
+  // （等价 replanLoop 首轮检查，leader/已收前驱/超时 → true）。
+  void setFirstPlanWaitTimeoutForTest(double timeout_s);
+  bool firstPlanReadyForTest();
   // 测试用：禁用 replanLoop 线程（单测手动 replanOnce 驱动时避免线程抢占）。
   void setReplanLoopEnabled(bool enabled);
 
@@ -257,6 +261,14 @@ private:
   bool takeoff_active_ = false;
   double takeoff_start_z_ = 0.0;
   ros::Time takeoff_start_time_;
+
+  // 对齐原版 SEQUENTIAL_START：首轮（current_ 为空）规划前等待前驱无人机
+  // intent（drone_id 顺序，前机轨迹到达才首轮规划）。leader(id<=1) 或已收到
+  // 前驱或超时 first_plan_wait_timeout_s 后放行；否则 replanLoop 跳过本轮。
+  double first_plan_wait_timeout_s_ = 10.0;
+  bool prev_intent_received_ = false;
+  ros::Time first_plan_requested_at_;
+  bool firstPlanReadyLocked(const ros::Time& now) const;
 
   ros::NodeHandle nh_;
   ros::NodeHandle pnh_;

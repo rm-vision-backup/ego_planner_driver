@@ -51,7 +51,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   // Identity parameters live in the public namespace (/UAV1/*) so the
   // Python driver and topology can discover them; planner tuning stays
   // private.
-  uav_id_ = nh_.param("uav_id", std::string("A01"));
+  uav_id_ = nh_.param("uav_id", std::string("UAV1"));
   exec_target_ = nh_.param("exec_target", std::string("UAV1"));
   setpoint_rate_ = pnh_.param("setpoint_rate_hz", kSetpointRateHz);
   pose_timeout_ = pnh_.param("local_pose_timeout_s", 1.0);
@@ -80,6 +80,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   episode_release_hysteresis_s_ = pnh_.param(
       "safety_episode_release_s", 1.0);
   emergency_replan_time_s_ = pnh_.param("emergency_replan_time_s", 1.0);
+  first_plan_wait_timeout_s_ = pnh_.param("first_plan_wait_timeout_s", 10.0);
   safety_predictor_.reset(new SafetyPredictor(safety_config_));
   EmergencyBrakeConfig brake_config;
   brake_config.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
@@ -692,6 +693,16 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
   neighbor_phase_[msg.uav_id] = legacy
       ? swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE : msg.phase;
   latest_neighbor_version_[msg.uav_id] = std::make_pair(epoch, msg.traj_id);
+  // 对齐原版 SEQUENTIAL_START：记录前驱（drone_id-1）intent 已收到 → 首轮
+  // 规划可放行（leader 立即，后机按 drone_id 顺序等待前机轨迹）。
+  {
+    int my_id = 0, peer_id = 0;
+    if (SafetyPredictor::parseNumericId(
+            !uav_id_.empty() ? uav_id_ : exec_target_, my_id) &&
+        my_id > 1 && SafetyPredictor::parseNumericId(msg.uav_id, peer_id) &&
+        peer_id == my_id - 1)
+      prev_intent_received_ = true;
+  }
   // 事件驱动 replan 已删除（implementation_plan_26082602 §2.3/§5）：与 10Hz
   // 周期碰撞检查作用重复，周期检查用最新缓冲轨迹，邻机更新后 ≤100ms 即检测
   // 同一碰撞；新 intent 只更新缓冲，由 collisionCheckTick 统一触发 replan。
@@ -1271,6 +1282,39 @@ void EgoPlannerDriverNode::runCollisionCheckTick()
     planning_requested_ = true;
 }
 
+bool EgoPlannerDriverNode::firstPlanReadyLocked(const ros::Time& now) const
+{
+  int my_id = 0;
+  // leader（id<=1）或无法解析身份：立即首轮规划（原版 SEQUENTIAL_START
+  // `drone_id <= 0` 分支）。
+  if (!SafetyPredictor::parseNumericId(
+          !uav_id_.empty() ? uav_id_ : exec_target_, my_id) ||
+      my_id <= 1)
+    return true;
+  // 前驱（drone_id-1）intent 已收到 → 放行（基于前机轨迹规划首轮）。
+  if (prev_intent_received_)
+    return true;
+  // 超时兜底：前驱缺失/失联时不永久阻塞首轮规划。
+  if (!first_plan_requested_at_.isZero() &&
+      (now - first_plan_requested_at_).toSec() >= first_plan_wait_timeout_s_)
+    return true;
+  return false;
+}
+
+void EgoPlannerDriverNode::setFirstPlanWaitTimeoutForTest(double timeout_s)
+{
+  first_plan_wait_timeout_s_ = timeout_s;
+}
+
+bool EgoPlannerDriverNode::firstPlanReadyForTest()
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  const ros::Time now = nowFunc();
+  if (first_plan_requested_at_.isZero())
+    first_plan_requested_at_ = now;
+  return firstPlanReadyLocked(now);
+}
+
 void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros::Time& base)
 {
   publishIntent(traj, base, swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
@@ -1376,6 +1420,17 @@ void EgoPlannerDriverNode::replanLoop()
           (now - *local_pose_stamp_).toSec() > pose_timeout_)
       {
         setState(kStatePoseStale);
+        continue;
+      }
+      // 对齐原版 SEQUENTIAL_START：首轮（current_ 空 = 新任务未规划）规划前
+      // 等待前驱无人机 intent（drone_id 顺序，前机轨迹到达才首轮规划，避免
+      // 多机同时盲规划初始轨迹冲突）。leader(id<=1) / 已收到前驱 / 超时
+      // first_plan_wait_timeout_s 后放行；否则保持待规划并跳过本轮重试。
+      if (!current_ && !firstPlanReadyLocked(now))
+      {
+        if (first_plan_requested_at_.isZero())
+          first_plan_requested_at_ = now;
+        planning_requested_ = true;
         continue;
       }
       Snapshot data;

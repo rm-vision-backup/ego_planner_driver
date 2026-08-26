@@ -2,7 +2,9 @@
   <!-- 机载/仿真统一形态：本机无 namespace 前缀（与 MAVROS /mavros/* 一致），
        机间区分交给 swarm_topology_bridge 的源前缀（/<邻居>/trajectory_intent）。
        单 Master 多 UAV 场景由每机独立 ROS Master 承担隔离（见 uav_offboard_sim.launch）。 -->
-  <arg name="uav_id" default="A01"/>
+  <!-- 身份参数：ROS 内统一 UAVn（也是实机 hostname）；GCS/runtime 对接层
+       （backend 任务协议 / identity map）使用 A01-A15，由 executor 层映射。 -->
+  <arg name="uav_id" default="UAV1"/>
   <arg name="exec_target" default="UAV1"/>
 
   <!-- 身份参数放全局（/uav_id、/exec_target），供 EgoSwarmDriver 与 bridge 发现。 -->
@@ -74,6 +76,9 @@
     <!-- 对齐原版 fsm/emergency_time=1.0s：EMERGENCY 先尝试重规划，预测越界
          (ttc) 小于该值才立即受约束制动，否则交常规 replanLoop。 -->
     <param name="emergency_replan_time_s" value="1.0"/>
+    <!-- 对齐原版 SEQUENTIAL_START：首轮规划前等待前驱无人机 intent 超时（防
+         前驱缺失/失联时永久阻塞）；默认 10s。 -->
+    <param name="first_plan_wait_timeout_s" value="10.0"/>
     <param name="neighbor_stale_policy" value="diagnose_only"/>
     <param name="neighbor_intent_stale_s" value="2.0"/>
     <param name="neighbor_missing_policy" value="continue_after_barrier"/>

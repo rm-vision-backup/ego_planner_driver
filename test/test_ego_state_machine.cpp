@@ -48,7 +48,7 @@ geometry_msgs::PoseStamped makePose(double x, double y, double z, double t)
 }
 
 swarm_uav_interfaces::UavTrajectoryIntent makeIntent(
-    double stamp, int32_t traj_id = 1, const std::string& uav_id = "A02")
+    double stamp, int32_t traj_id = 1, const std::string& uav_id = "UAV2")
 {
   swarm_uav_interfaces::UavTrajectoryIntent msg;
   msg.protocol_version = "1.0";
@@ -137,7 +137,7 @@ TEST(EgoStateMachine, ShadowSafetyTickDoesNotChangeFlightBehavior)
   node.sendGoal(5.0, 0.0, 5.0);
   ASSERT_TRUE(node.replanOnce());
 
-  auto peer = makeIntent(100.0, 1, "A02");
+  auto peer = makeIntent(100.0, 1, "UAV2");
   peer.sampled_traj[0].position.x = 5.0;
   peer.sampled_traj[0].position.y = 0.0;
   peer.sampled_traj[0].position.z = 5.0;
@@ -174,7 +174,7 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
   node.sendGoal(5.0, 0.0, 5.0);
   ASSERT_TRUE(node.replanOnce());
 
-  auto peer = makeIntent(100.0, 1, "A02");
+  auto peer = makeIntent(100.0, 1, "UAV2");
   // peer 与本机完全同轨迹（同刻、同位置）：任何本机轨迹均侵入固定 1m 硬门，
   // 立即重规划必然失败 → 触发受约束制动（EMERGENCY 先重规划再急停路径）。
   peer.t = {0.0, 5.0};
@@ -215,7 +215,7 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
   ASSERT_TRUE(node.replanOnce());
   ASSERT_EQ(node.execState(), kStateExecuting);
 
-  auto peer = makeIntent(100.0, 1, "A02");
+  auto peer = makeIntent(100.0, 1, "UAV2");
   // peer 与本机完全同轨迹：立即重规划失败 → 制动（先重规划再急停）。
   peer.t = {0.0, 5.0};
   peer.sampled_traj[0].position.x = 0.0;
@@ -252,6 +252,50 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
   EXPECT_LT((hold->pos - braking->pts.back()).norm(), 1e-8);
 }
 
+TEST(EgoStateMachine, FirstPlanReadyForLeaderImmediately)
+{
+  // SEQUENTIAL_START：leader(id<=1) 首轮规划立即放行。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setIdentityForTest("UAV1", "UAV1");
+  node.setClockSource([&clock]() { return clock.now(); });
+  EXPECT_TRUE(node.firstPlanReadyForTest());
+}
+
+TEST(EgoStateMachine, FirstPlanWaitsForPredecessorIntent)
+{
+  // SEQUENTIAL_START：非 leader（UAV2）首轮规划等待前驱（UAV1）intent。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setIdentityForTest("UAV2", "UAV2");
+  node.setClockSource([&clock]() { return clock.now(); });
+  EXPECT_FALSE(node.firstPlanReadyForTest());
+
+  // 前驱 UAV1 intent 到达 → 放行。
+  auto prev = makeIntent(100.0, 1, "UAV1");
+  prev.t = {0.0, 5.0};
+  prev.sampled_traj[0].position.x = 0.0;
+  prev.sampled_traj[0].position.z = 5.0;
+  prev.sampled_traj[1].position.x = 5.0;
+  prev.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(prev));
+  EXPECT_TRUE(node.firstPlanReadyForTest());
+}
+
+TEST(EgoStateMachine, FirstPlanTimeoutReleasesWithoutPredecessor)
+{
+  // SEQUENTIAL_START 超时兜底：前驱缺失时不永久阻塞首轮规划。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setIdentityForTest("UAV2", "UAV2");
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setFirstPlanWaitTimeoutForTest(0.0);
+  EXPECT_TRUE(node.firstPlanReadyForTest());
+}
+
 TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
 {
   // 对齐原版 planFromCurrentTraj 优先：EMERGENCY 时先尝试立即重规划，成功则不
@@ -270,7 +314,7 @@ TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
   // 对向交叉 peer：与本机直线轨迹在 x=2.5 交叉（<1m），但存在横向（y）绕开解，
   // 预测越界时间 ttc≈2.5s > emergency_replan_time_s(1.0) → 立即重规划/等待，
   // 不触发制动轨迹。
-  auto peer = makeIntent(100.0, 1, "A02");
+  auto peer = makeIntent(100.0, 1, "UAV2");
   peer.t = {0.0, 5.0};
   peer.sampled_traj[0].position.x = 5.0;
   peer.sampled_traj[0].position.z = 5.0;
@@ -320,14 +364,14 @@ TEST(EgoStateMachine, GpsBiasCorrectsNeighborIntentEpoch)
   // 本机 bias=2.0s、邻机 bias=3.0s → 修正量 own-peer = -1.0s：
   // 邻机激活时刻 100.0（邻机时间轴）修正到本机时间轴 99.0。
   node.injectOwnBias(2.0);
-  node.injectPeerBias("A02", 3.0);
-  ASSERT_TRUE(node.injectNeighborIntent(makeIntent(100.0, 1, "A02")));
-  EXPECT_NEAR(node.neighborStartTimeForTest("A02"), 99.0, 1e-6);
+  node.injectPeerBias("UAV2", 3.0);
+  ASSERT_TRUE(node.injectNeighborIntent(makeIntent(100.0, 1, "UAV2")));
+  EXPECT_NEAR(node.neighborStartTimeForTest("UAV2"), 99.0, 1e-6);
 
   // bias 过期（> bias_valid_s_=120s）→ 回退不修正（epoch = 原始 stamp）。
   clock.advance(121.0);  // now = 221.0
-  ASSERT_TRUE(node.injectNeighborIntent(makeIntent(221.0, 2, "A02")));
-  EXPECT_NEAR(node.neighborStartTimeForTest("A02"), 221.0, 1e-6);
+  ASSERT_TRUE(node.injectNeighborIntent(makeIntent(221.0, 2, "UAV2")));
+  EXPECT_NEAR(node.neighborStartTimeForTest("UAV2"), 221.0, 1e-6);
 }
 
 TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
@@ -383,7 +427,7 @@ TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
 
 TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)
 {
-  ros::param::set("/uav_id", "A02");
+  ros::param::set("/uav_id", "UAV2");
   ros::param::set("/exec_target", "UAV2");
   FakeClock clock;
   clock.set(100.0);
@@ -401,7 +445,7 @@ TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)
   const boost::optional<ego_planner_driver::TimedTrajectory> own =
       node.currentTrajectory();
   ASSERT_TRUE(static_cast<bool>(own));
-  auto conflict = makeIntent(100.0, 1, "A01");
+  auto conflict = makeIntent(100.0, 1, "UAV1");
   conflict.t = own->t;
   conflict.sampled_traj.clear();
   for (const auto& point : own->pts)
@@ -420,7 +464,7 @@ TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)
   node.runCollisionCheckTick();
   EXPECT_TRUE(node.planningRequested());
 
-  ros::param::set("/uav_id", "A01");
+  ros::param::set("/uav_id", "UAV1");
   ros::param::set("/exec_target", "UAV1");
 }
 

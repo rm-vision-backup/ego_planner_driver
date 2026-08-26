@@ -38,6 +38,9 @@ PairPrediction onlyPair(const SafetyPrediction& prediction)
 TEST(SafetyIdentity, ParsesNumericSuffixAndDeterminesRole)
 {
   int id = -1;
+  // ROS 内统一 UAVn；GCS/runtime 对接层 A0n 也保持兼容。
+  EXPECT_TRUE(SafetyPredictor::parseNumericId("UAV1", id)); EXPECT_EQ(id, 1);
+  EXPECT_TRUE(SafetyPredictor::parseNumericId("UAV2", id)); EXPECT_EQ(id, 2);
   EXPECT_TRUE(SafetyPredictor::parseNumericId("A01", id)); EXPECT_EQ(id, 1);
   EXPECT_TRUE(SafetyPredictor::parseNumericId("A2", id)); EXPECT_EQ(id, 2);
   EXPECT_TRUE(SafetyPredictor::parseNumericId("UAV10", id)); EXPECT_EQ(id, 10);
@@ -54,14 +57,14 @@ TEST(SafetyPredictor, ComputesHeadOnCpaTtcAndDynamicThresholds)
   config.emergency_decel_mps2 = 2.0;
   SafetyPredictor predictor(config);
   PeerTrajectoryInput peer;
-  peer.uav_id = "A02";
+  peer.uav_id = "UAV2";
   peer.traj_id = 7;
   peer.activation_epoch_s = 100.0;
   peer.receive_epoch_s = 99.6;
   peer.trajectory = linear(Eigen::Vector3d(5, 0, 0), Eigen::Vector3d(-1, 0, 0));
   const PairPrediction pair = onlyPair(predictor.evaluate(
       linear(Eigen::Vector3d::Zero(), Eigen::Vector3d(1, 0, 0)),
-      100.0, "A01", {peer}, 100.0));
+      100.0, "UAV1", {peer}, 100.0));
   EXPECT_NEAR(pair.closing_speed_mps, 2.0, 1e-6);
   EXPECT_NEAR(pair.t_cpa_s, 2.5, 0.05);
   EXPECT_NEAR(pair.cpa_distance_m, 0.0, 1e-6);
