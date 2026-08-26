@@ -102,7 +102,7 @@ public:
   void sendGoal(double x, double y, double z);
   void sendWaypoints(const std::vector<geometry_msgs::Point32>& points);
   void sendHold();
-  bool replanOnce();
+  bool replanOnce(bool timed_trigger = false);
   void advanceHoldHandling();
   void publishSetpointTick();
   void safetySupervisorTick();
@@ -132,6 +132,8 @@ public:
   bool yieldCommittedForTest() const;
   // 测试用：禁用 replanLoop 线程（单测手动 replanOnce 驱动时避免线程抢占）。
   void setReplanLoopEnabled(bool enabled);
+  // 软着陆测试：查询首次失败时刻（isZero = 未在软着陆失败中）。
+  ros::Time planFailSinceForTest() const;
 
 private:
   void onGoal(const geometry_msgs::PointStamped::ConstPtr& msg);
@@ -278,6 +280,12 @@ private:
   double emergency_peer_ttc_ = std::numeric_limits<double>::infinity();
   // replanOnce 失败时是否置 PLAN_FAILED+HOLD 收口（常规 replan 为 true）；
   bool replan_failure_fatal_ = true;
+  // 软着陆（26082700 EGO_PLAN_FAILED 修复）：常规 replan 失败不立即 PLAN_FAILED，
+  // 保持当前轨迹（执行完自然悬停），由 1s 定时/事件继续重试；连续失败超过
+  // plan_fail_timeout_s_（10s）才 EGO_PLAN_FAILED 收口（executor 收口后经
+  // backend 对全组活动机发 HOLD）。
+  double plan_fail_timeout_s_ = 10.0;
+  ros::Time plan_fail_since_;  // 首次失败时刻（isZero = 当前不在软着陆失败中）
   // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，implementation_plan_26082602 §10）：
   // collisionCheckTick 检测冲突（min_clear < 1.3×clearance）→ 本机 YIELD（ID 小于
   // primary peer）生成候选，cost 最小者提交发布；STAND_ON 交常规 replan。

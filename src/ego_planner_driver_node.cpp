@@ -291,7 +291,7 @@ void EgoPlannerDriverNode::sendWaypoints(
   onWaypoints(boost::make_shared<geometry_msgs::PolygonStamped>(msg));
 }
 
-bool EgoPlannerDriverNode::replanOnce()
+bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
 {
   boost::optional<ReplanSnapshot> snap;
   ros::Time completed_at;
@@ -308,8 +308,12 @@ bool EgoPlannerDriverNode::replanOnce()
       return false;
     // 单一 replan 入口（方案 A）：planning_requested_（1s 定时/10Hz 冲突/推进）
     // 或 emergency_pending_（监督 EMERGENCY 事件）任一置位即执行一轮。
-    if ((!planning_requested_ && !emergency_pending_) || !pending_goal_ ||
-        steady_target_)
+    // timed_trigger=true：replanLoop 1s 定时超时（软着陆失败重试的固定节奏）。
+    // steady_target_ 拦截例外：软着陆失败中（plan_fail_since_ 非零）即使 HOLD 捕获
+    // 已锁存 steady_target_ 也放行定时重试（否则 HOLD 状态首轮失败无法恢复/无法
+    // 在 10s 超时后收口）；成功提交后 plan_fail_since_ 清空恢复拦截语义。
+    if ((!timed_trigger && !planning_requested_ && !emergency_pending_) ||
+        !pending_goal_ || (steady_target_ && plan_fail_since_.isZero()))
       return false;
     planning_requested_ = false;
     const ros::Time now = nowFunc();
@@ -402,10 +406,33 @@ bool EgoPlannerDriverNode::replanOnce()
     if (snap && tryYieldReplan(*snap))
       return true;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (replan_failure_fatal_)
+    // 软着陆（26082700）：常规 replan 全失败不立即 PLAN_FAILED。保持当前轨迹
+    // （继续执行到末端自然悬停），由 replanLoop 1s 定时/冲突事件继续重试；
+    // 连续失败超过 plan_fail_timeout_s_（10s）才收口 EGO_PLAN_FAILED（executor
+    // 收口后经 backend 对全组活动机发 HOLD）。EMERGENCY 分支保持立即收口
+    // （安全关键路径不变）。
+    const ros::Time now = nowFunc();
+    if (plan_fail_since_.isZero())
+      plan_fail_since_ = now;
+    if (replan_failure_fatal_ &&
+        (now - plan_fail_since_).toSec() >= plan_fail_timeout_s_)
     {
-      captureHoldTargetLocked(nowFunc());
+      captureHoldTargetLocked(now);
       setState(kStatePlanFailed);
+      plan_fail_since_ = ros::Time();
+      ROS_WARN("[%s] replan failed for %.1fs, closing as EGO_PLAN_FAILED",
+               uav_id_.c_str(), plan_fail_timeout_s_);
+    }
+    else
+    {
+      ROS_WARN_THROTTLE(1.0,
+                        "[%s] replan failed, soft-landing (retry on 1s timer/event, "
+                        "%.1fs until EGO_PLAN_FAILED)",
+                        uav_id_.c_str(),
+                        plan_fail_since_.isZero()
+                            ? plan_fail_timeout_s_
+                            : (plan_fail_timeout_s_ -
+                               (now - plan_fail_since_).toSec()));
     }
     return false;
   }
@@ -447,6 +474,7 @@ bool EgoPlannerDriverNode::replanOnce()
     plan_start_ = completed_at;
     arrival_since_.reset();
     steady_target_.reset();
+    plan_fail_since_ = ros::Time();  // 常规 replan 提交 = 软着陆恢复（退出失败计时）
     // 常规 replan 成功 → 清除 EMERGENCY 事件（监督层对提交后新轨迹重新评估）。
     emergency_pending_ = false;
     emergency_peer_id_.clear();
@@ -510,6 +538,7 @@ bool EgoPlannerDriverNode::tryEmergencyBrakeLocked()
       arrival_since_.reset();
       steady_target_.reset();
       emergency_braking_ = true;
+      plan_fail_since_ = ros::Time();  // 制动提交 = 软着陆结束
       setState(kStateEmergencyBrake);
       publishIntent(braking, plan_start_,
                     swarm_uav_interfaces::UavTrajectoryIntent::PHASE_BRAKING);
@@ -522,6 +551,7 @@ bool EgoPlannerDriverNode::tryEmergencyBrakeLocked()
     current_.reset();
     plan_start_ = ros::Time(0);
     emergency_braking_ = false;
+    plan_fail_since_ = ros::Time();  // fallback BRAKE_HOLD = 软着陆结束
     steady_target_ = HoldTarget{start.pos, start.yaw};
     setState(kStateBrakeHold);
     ROS_ERROR("[%s] emergency brake generation failed; nominal aborted to "
@@ -1363,6 +1393,7 @@ void EgoPlannerDriverNode::commitYieldCandidate(const YieldCandidate& cand)
   current_.reset(new TimedTrajectory(cand.trajectory));
   plan_start_ = nowFunc();
   arrival_since_.reset();
+  plan_fail_since_ = ros::Time();  // 候选提交 = 软着陆恢复（退出失败计时）
   steady_target_.reset();
   emergency_braking_ = false;
   setState(kStateExecuting);
@@ -1593,6 +1624,12 @@ void EgoPlannerDriverNode::setReplanLoopEnabled(bool enabled)
   replan_loop_enabled_ = enabled;
 }
 
+ros::Time EgoPlannerDriverNode::planFailSinceForTest() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return plan_fail_since_;
+}
+
 void EgoPlannerDriverNode::replanLoop()
 {
   // 单一 replan 入口（方案 A）：replanLoop 是唯一轨迹提交者。常态 replan_period_s
@@ -1602,11 +1639,10 @@ void EgoPlannerDriverNode::replanLoop()
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stop_ && replan_loop_enabled_)
   {
-    replan_cv_.wait_for(lock, std::chrono::duration<double>(replan_period_s_),
-        [this]() {
-          return stop_ || !replan_loop_enabled_ || planning_requested_ ||
-                 emergency_pending_;
-        });
+    const bool timed_out =
+        replan_cv_.wait_for(lock,
+                            std::chrono::duration<double>(replan_period_s_)) ==
+        std::cv_status::timeout;
     if (stop_ || !replan_loop_enabled_)
       break;
     if (hold_requested_)
@@ -1634,11 +1670,15 @@ void EgoPlannerDriverNode::replanLoop()
         continue;
       }
     }
-    if (!planning_requested_ && !emergency_pending_)
+    // 事件置位或 1s 定时超时（timed_out）都执行一轮 replan。定时超时是软着陆
+    // 失败重试的固定节奏（保持悬停，每 1s 尝试恢复）。
+    if (!timed_out && !planning_requested_ && !emergency_pending_)
       continue;
     lock.unlock();
-    replanOnce();  // 唯一提交者：常规 replan / 候选 / EMERGENCY 制动都在这
+    const bool committed = replanOnce(timed_out);  // 唯一提交者
     lock.lock();
+    if (committed)
+      plan_fail_since_ = ros::Time();  // 成功提交（含 HOLD/制动/候选）→ 退出软着陆
   }
 }
 

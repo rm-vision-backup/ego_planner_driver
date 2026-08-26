@@ -409,8 +409,18 @@ TEST(EgoStateMachine, YieldLowIdStandOnRequestsReplan)
   node.runCollisionCheckTick();
   EXPECT_FALSE(node.yieldCommittedForTest());
   EXPECT_TRUE(node.planningRequested());
-  EXPECT_FALSE(node.replanOnce());  // STAND_ON 只 SLOW，悬停 peer 下无效 → PLAN_FAILED
-  EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
+  // 软着陆（26082700）：第一次失败不立即 PLAN_FAILED，保持 EXECUTING 重试，
+  // 软着陆计时开始（plan_fail_since_ 非零）。
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  EXPECT_TRUE(!node.planFailSinceForTest().isZero());
+  // 1s 定时重试（timed_trigger，短步进避免重试起点与悬停 peer 重合）：仍失败
+  // 且 <10s 累计 → 继续软着陆不收口（10s 累计收口由
+  // YieldReplanStandOnFailsToPlan 覆盖）。
+  clock.advance(0.5);
+  node.injectLocalPose(makePose(0.0, 0.0, 5.0, clock.get()));
+  EXPECT_FALSE(node.replanOnce(true));
+  EXPECT_EQ(node.execState(), kStateExecuting);
 }
 
 TEST(EgoStateMachine, YieldEpisodeLocksCommit)
@@ -512,8 +522,58 @@ TEST(EgoStateMachine, YieldReplanStandOnFailsToPlan)
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
 
+  // 软着陆（26082700）：首败保持 HOLD（未进入 EXECUTING，不立即收口），
+  // 连续失败累计 >10s 才收口 EGO_PLAN_FAILED。
   EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateHold);
+  clock.advance(11.0);
+  node.injectLocalPose(makePose(0.0, 0.0, 5.0, clock.get()));
+  EXPECT_FALSE(node.replanOnce(true));
   EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
+}
+
+TEST(EgoStateMachine, ReplanFailSoftLandingResetsOnCommit)
+{
+  // 软着陆恢复（26082700）：失败后成功提交（定时 replan 恢复）→ plan_fail_since_
+  // 清空重新计时，避免恢复后旧失败累计直接收口。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIdentityForTest("UAV1", "UAV1");
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(10.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());  // 首轮成功
+  ASSERT_EQ(node.execState(), kStateExecuting);
+
+  // 注入悬停 peer 挡路 → 常规 replan 失败（STAND_ON 只 SLOW，悬停无解）→ 软着陆。
+  auto peer = makeIntent(100.0, 1, "UAV2");
+  peer.t = {0.0, 20.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+  node.runCollisionCheckTick();
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  EXPECT_TRUE(!node.planFailSinceForTest().isZero());  // 计时开始
+
+  // peer 挪开（新轨迹版本）→ 定时 replan 成功 → 计时清空。
+  auto peer_away = makeIntent(100.0, 2, "UAV2");
+  peer_away.t = {0.0, 20.0};
+  peer_away.sampled_traj[0].position.x = 5.0;
+  peer_away.sampled_traj[0].position.z = 5.0;
+  peer_away.sampled_traj[1].position.x = 5.0;
+  peer_away.sampled_traj[1].position.y = -8.0;
+  peer_away.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer_away));
+  clock.advance(1.0);
+  node.injectLocalPose(makePose(0.0, 0.0, 5.0, clock.get()));
+  ASSERT_TRUE(node.replanOnce(true));
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  EXPECT_TRUE(node.planFailSinceForTest().isZero());  // 已重置
 }
 
 

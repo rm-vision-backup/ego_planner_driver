@@ -306,7 +306,7 @@ YieldCandidate YieldCandidateGenerator::makeLateral(
           cand.trajectory.duration - remaining_nominal);
       cand.cost = (remaining_nominal > 1e-6
                        ? cand.time_extension_s / remaining_nominal : 0.0)
-                  + lateral / 2.0;  // dev 权重回 /2.0（26082621 迭代）
+                  + lateral / 5.0;  // dev 权重降低（26082700：dev/2.0→dev/5.0，横向让路代价更小）
       double min_clear = 0.0;
       if (validate(cand.trajectory, neighbors, min_clear))
       {
