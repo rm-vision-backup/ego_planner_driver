@@ -206,6 +206,21 @@ private:
   void commitYieldCandidate(const YieldCandidate& cand);
   // 判定 primary peer 是否近似悬停（末段速度 < hovering_velocity_mps）。
   bool isPeerHovering(const NeighborTrajectory& nb) const;
+  // 方案 A（§10 扩展）：replanOnce 规划失败（safe_candidate=false）时尝试让路候选：
+  // SLOW 降 cruise_velocity / LEFT/RIGHT waypoints 横向偏移后重试 planOnce，
+  // 验证 min_clear ≥ 1.3×clearance，cost 最小者提交。成功返回 true。
+  struct ReplanSnapshot
+  {
+    GoalPoint start;
+    std::vector<WayPoint> waypoints;
+    std::vector<NeighborTrajectory> neighbors;
+    ros::Time now;
+    Eigen::Vector3d start_vel = Eigen::Vector3d::Zero();
+    Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
+    bool final_segment = false;
+    uint64_t safety_generation = 0;
+  };
+  bool tryYieldReplan(const ReplanSnapshot& snap);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   void processHoldLocked();
   void handleMavrosStateEdgeLocked();

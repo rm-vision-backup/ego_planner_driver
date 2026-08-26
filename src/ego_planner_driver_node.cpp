@@ -32,6 +32,38 @@ Eigen::Vector3d sampleNeighborForCollision(const NeighborTrajectory& nb, double 
   }
   return nb.pts.back();
 }
+
+// 轨迹 vs 邻机全时域同刻最小距离（候选验证 1.3m 门槛）。
+double minClearanceWith(const TimedTrajectory& traj,
+                        const std::vector<NeighborTrajectory>& neighbors)
+{
+  double mc = std::numeric_limits<double>::infinity();
+  if (traj.pts.empty() || traj.pts.size() != traj.t.size())
+    return mc;
+  for (size_t i = 0; i < traj.t.size(); ++i)
+    for (const auto& nb : neighbors)
+    {
+      if (nb.clearance <= 0.0 || nb.pts.size() < 2 || nb.t.size() != nb.pts.size())
+        continue;
+      const double t_abs = traj.t[i] - nb.start_time;
+      if (t_abs < nb.t.front() || t_abs > nb.t.back())
+        continue;
+      mc = std::min(mc, (traj.pts[i] - sampleNeighborForCollision(nb, t_abs)).norm());
+    }
+  return mc;
+}
+
+// 点 p 到线段 a-b 的最小距离。
+double pointSegmentDistance(const Eigen::Vector3d& p, const Eigen::Vector3d& a,
+                            const Eigen::Vector3d& b)
+{
+  const Eigen::Vector3d ab = b - a;
+  const double len2 = ab.squaredNorm();
+  if (len2 < 1e-12)
+    return (p - a).norm();
+  const double t = std::max(0.0, std::min(1.0, (p - a).dot(ab) / len2));
+  return (p - (a + ab * t)).norm();
+}
 }  // namespace
 
 EgoPlannerDriverNode::EgoPlannerDriverNode()
@@ -260,18 +292,7 @@ void EgoPlannerDriverNode::sendWaypoints(
 
 bool EgoPlannerDriverNode::replanOnce()
 {
-  struct Snapshot
-  {
-    GoalPoint start;
-    std::vector<WayPoint> waypoints;
-    std::vector<NeighborTrajectory> neighbors;
-    ros::Time now;
-    Eigen::Vector3d start_vel = Eigen::Vector3d::Zero();
-    Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
-    bool final_segment = false;
-    uint64_t safety_generation = 0;
-  };
-  boost::optional<Snapshot> snap;
+  boost::optional<ReplanSnapshot> snap;
   ros::Time completed_at;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -294,7 +315,7 @@ bool EgoPlannerDriverNode::replanOnce()
       setState(kStatePoseStale);
       return false;
     }
-    Snapshot data;
+    ReplanSnapshot data;
     data.now = now;
     data.safety_generation = safety_generation_;
     data.start.yaw = goal_yaw_;
@@ -347,7 +368,7 @@ bool EgoPlannerDriverNode::replanOnce()
     data.final_segment = near_final || planning_horizon_ <= 0.0 ||
         waypoint_consumed_ + 1 >= waypoints_.size();
     data.neighbors = freshAbsoluteNeighborsLocked(now);
-    snap = Snapshot(std::move(data));
+    snap = ReplanSnapshot(std::move(data));
   }
   if (!snap)
     return false;
@@ -383,6 +404,10 @@ bool EgoPlannerDriverNode::replanOnce()
   }
   if (!safe_candidate)
   {
+    // 方案 A（§10 扩展）：规划失败 → 先尝试让路候选（SLOW/LEFT/RIGHT），
+    // 候选提交成功则本轮 replan 视为成功（新轨迹已绕开邻机）。
+    if (snap && tryYieldReplan(*snap))
+      return true;
     std::lock_guard<std::mutex> lock(mutex_);
     if (replan_failure_fatal_)
     {
@@ -1400,6 +1425,81 @@ void EgoPlannerDriverNode::commitYieldCandidate(const YieldCandidate& cand)
                      : cand.direction == YieldDirection::LEFT ? "LEFT" : "RIGHT";
   ROS_WARN("[%s] yield committed: %s min_clear=%.2f cost=%.3f",
            uav_id_.c_str(), type, cand.min_clearance_m, cand.cost);
+}
+
+bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
+{
+  if (!enable_yield_candidates_ || !yield_generator_)
+    return false;
+
+  // 1. right-of-way：找 primary peer（邻机轨迹到 start→goal 线段最近者）。
+  std::string primary_peer;
+  double best_dist = std::numeric_limits<double>::infinity();
+  const Eigen::Vector3d goal = snap.waypoints.empty()
+      ? snap.start.position : snap.waypoints.back().position;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const ros::Time now = nowFunc();
+    for (const auto& item : inbox_)
+    {
+      if ((now - item.second.second).toSec() > kNeighborStaleS)
+        continue;
+      const NeighborTrajectory& nb = item.second.first;
+      for (const auto& p : nb.pts)
+      {
+        const double d = pointSegmentDistance(p, snap.start.position, goal);
+        if (d < best_dist)
+        {
+          best_dist = d;
+          primary_peer = item.first;
+        }
+      }
+    }
+  }
+  int my_id = 0, peer_id = 0;
+  const std::string my_identity = !uav_id_.empty() ? uav_id_ : exec_target_;
+  if (!SafetyPredictor::parseNumericId(my_identity, my_id) ||
+      !SafetyPredictor::parseNumericId(primary_peer, peer_id) || my_id <= peer_id)
+    return false;  // STAND_ON 或无法解析：不生成候选。
+
+  // 2. 生成候选：基于 nominal（无邻居规划）轨迹由生成器统一产出
+  //    SLOW（时间缩放错开）/ LEFT/RIGHT（横向 C2 偏移），验证 1.3m 门槛。
+  std::vector<YieldCandidate> candidates;
+  TimedTrajectory nominal, traj;
+  double plan_cost = 0.0;
+  if (core_->planOnce(snap.start, snap.waypoints, {}, nominal, plan_cost,
+                      snap.start_vel, snap.start_acc, snap.final_segment))
+  {
+    bool peer_hovering = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const ros::Time now = nowFunc();
+      const auto it = inbox_.find(primary_peer);
+      if (it != inbox_.end())
+      {
+        NeighborTrajectory nb = it->second.first;
+        nb.start_time -= snap.now.toSec();
+        peer_hovering = isPeerHovering(nb);
+      }
+    }
+    // neighbors 是绝对 epoch，需 rebase 到 nominal 轨迹时间轴（snap.now）。
+    std::vector<NeighborTrajectory> neighbors = snap.neighbors;
+    for (auto& nb : neighbors)
+      nb.start_time -= snap.now.toSec();
+    candidates = yield_generator_->generate(nominal, 0.0, neighbors, peer_hovering);
+  }
+
+  if (candidates.empty())
+    return false;
+  std::sort(candidates.begin(), candidates.end(),
+            [](const YieldCandidate& a, const YieldCandidate& b)
+            { return a.cost < b.cost; });
+  commitYieldCandidate(candidates.front());
+  yield_committed_ = true;
+  yield_direction_ = candidates.front().direction;
+  ROS_WARN("[%s] yield replan committed (peer=%s)", uav_id_.c_str(),
+           primary_peer.c_str());
+  return true;
 }
 
 bool EgoPlannerDriverNode::isPeerHovering(const NeighborTrajectory& nb) const

@@ -429,6 +429,65 @@ TEST(EgoStateMachine, YieldEpisodeLocksCommit)
     EXPECT_TRUE(traj1->pts[i].isApprox(traj2->pts[i]));
 }
 
+TEST(EgoStateMachine, YieldReplanOnPlanFailureCommitsCandidate)
+{
+  // 方案 A：首轮规划穿越失败（UAV1 悬停挡路）→ tryYieldReplan 生成 LEFT/RIGHT
+  // 候选并提交（replanOnce 经候选成功，exec_state 保持 EXECUTING，轨迹绕行）。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIdentityForTest("UAV2", "UAV2");
+  node.setYieldCandidatesEnabledForTest(true);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(10.0, 0.0, 5.0);
+
+  auto peer = makeIntent(100.0, 1, "UAV1");
+  peer.t = {0.0, 20.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+
+  // 首轮 replan 因硬门失败 → tryYieldReplan 提交让路候选。
+  EXPECT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  const auto traj = node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj));
+  double max_dev = 0.0;
+  for (size_t i = 0; i < traj->t.size(); ++i)
+    if (std::fabs(traj->t[i] - 5.0) < 1.0)
+      max_dev = std::max(max_dev, std::fabs(traj->pts[i].y()));
+  EXPECT_GT(max_dev, 0.3);
+}
+
+TEST(EgoStateMachine, YieldReplanStandOnFailsToPlan)
+{
+  // 本机 UAV1（ID 1 < peer UAV2 2）→ STAND_ON：规划失败不生成候选 → PLAN_FAILED。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIdentityForTest("UAV1", "UAV1");
+  node.setYieldCandidatesEnabledForTest(true);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(10.0, 0.0, 5.0);
+
+  auto peer = makeIntent(100.0, 1, "UAV2");
+  peer.t = {0.0, 20.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
+}
+
 
 
 

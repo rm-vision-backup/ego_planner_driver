@@ -227,6 +227,8 @@ public:
                       double clearance) const;
 
   EgoPlannerConfig config() const { return config_; }
+  // 规划失败时让路候选（SLOW）临时降低巡航速度重试规划。
+  void setCruiseVelocity(double v) { config_.cruise_velocity = v; }
 
   static std::vector<NeighborTrajectory> filterByRange(
       const std::vector<NeighborTrajectory>& neighbors,
