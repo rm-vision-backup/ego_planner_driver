@@ -79,6 +79,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
       "minimum_prediction_window_s", 0.25);
   episode_release_hysteresis_s_ = pnh_.param(
       "safety_episode_release_s", 1.0);
+  emergency_replan_time_s_ = pnh_.param("emergency_replan_time_s", 1.0);
   safety_predictor_.reset(new SafetyPredictor(safety_config_));
   EmergencyBrakeConfig brake_config;
   brake_config.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
@@ -355,8 +356,11 @@ bool EgoPlannerDriverNode::replanOnce()
   if (!safe_candidate)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    captureHoldTargetLocked(nowFunc());
-    setState(kStatePlanFailed);
+    if (replan_failure_fatal_)
+    {
+      captureHoldTargetLocked(nowFunc());
+      setState(kStatePlanFailed);
+    }
     return false;
   }
   {
@@ -1099,6 +1103,43 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
   // YIELD/STAND_ON 角色判定已删除——SITL 实证正交交叉场景单机让路几何不足。
   if (prediction.level != SafetyLevel::EMERGENCY)
     return;
+
+  // 对齐原版 EGOReplanFSM::checkCollisionCallback（planFromCurrentTraj 优先）：
+  // EMERGENCY 先尝试立即重规划（replan_failure_fatal_=false，失败不收口），
+  // 成功则继续执行；失败再按预测越界时间（primary peer 的 ttc）决定急停或
+  // 交常规 replanLoop（≤1s）兜底。data_age 不再放大门槛（邻机时间戳已修正）。
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (emergency_braking_ || !current_ || plan_start_ != activation || hold_requested_)
+      return;
+    planning_requested_ = true;
+    replan_failure_fatal_ = false;
+  }
+  const bool replanned = replanOnce();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    replan_failure_fatal_ = true;
+  }
+  if (replanned)
+  {
+    ROS_WARN("[%s] EMERGENCY mitigated by immediate replan (peer=%s)",
+             uav_id_.c_str(), prediction.primary_peer_id.c_str());
+    return;
+  }
+  double primary_ttc_s = std::numeric_limits<double>::infinity();
+  for (const auto& pair : prediction.pairs)
+    if (pair.peer_id == prediction.primary_peer_id)
+      primary_ttc_s = pair.ttc_s;
+  if (!std::isfinite(primary_ttc_s) || primary_ttc_s > emergency_replan_time_s_)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    planning_requested_ = true;  // 常规 replanLoop 兜底（≤1s 重试）
+    ROS_WARN("[%s] EMERGENCY replan failed; ttc=%.2fs > %.2fs, waiting replanLoop",
+             uav_id_.c_str(), primary_ttc_s, emergency_replan_time_s_);
+    return;
+  }
+  ROS_WARN("[%s] EMERGENCY replan failed; ttc=%.2fs <= %.2fs, braking",
+           uav_id_.c_str(), primary_ttc_s, emergency_replan_time_s_);
 
   TrajectorySample start;
   if (!self->samplePVA(std::max(0.0, now.toSec() - activation.toSec()), start))

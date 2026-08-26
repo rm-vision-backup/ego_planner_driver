@@ -109,7 +109,7 @@ TEST(SafetyPredictor, ReportsSafeDivergingAndInsufficientWindow)
   EXPECT_EQ(pair.level, SafetyLevel::INSUFFICIENT_DATA);
 }
 
-TEST(SafetyPredictor, ThresholdsGrowWithAgeAndClosingSpeed)
+TEST(SafetyPredictor, ThresholdsGrowWithClosingButNotDataAge)
 {
   SafetyPredictor predictor{SafetyPredictorConfig()};
   PeerTrajectoryInput peer;
@@ -119,9 +119,16 @@ TEST(SafetyPredictor, ThresholdsGrowWithAgeAndClosingSpeed)
   peer.trajectory = linear(Eigen::Vector3d(10, 0, 0), Eigen::Vector3d(-0.5, 0, 0));
   const TimedTrajectory self = linear(Eigen::Vector3d::Zero(), Eigen::Vector3d(0.5, 0, 0));
   const double fresh = onlyPair(predictor.evaluate(self, 10.0, "UAV1", {peer}, 10.0)).warning_distance_m;
-  peer.receive_epoch_s = 9.0;
+  // data_age 不再进入反应时间（邻机轨迹时间戳已由 GPS bias 修正，同刻采样即
+  // 预测，implementation_plan_26082602）→ 门槛与 intent 发布时间无关。
+  peer.receive_epoch_s = 9.0;  // age=1s
   const double aged = onlyPair(predictor.evaluate(self, 10.0, "UAV1", {peer}, 10.0)).warning_distance_m;
-  EXPECT_GT(aged, fresh);
+  EXPECT_DOUBLE_EQ(aged, fresh);
+  // closing speed 仍放大动态门槛（反应+制动余量）。
+  peer.receive_epoch_s = 10.0;
+  peer.trajectory = linear(Eigen::Vector3d(10, 0, 0), Eigen::Vector3d(-2.0, 0, 0));
+  const double faster = onlyPair(predictor.evaluate(self, 10.0, "UAV1", {peer}, 10.0)).warning_distance_m;
+  EXPECT_GT(faster, fresh);
 }
 
 TEST(ConflictEpisode, LatchesPeerAndReleasesAfterHysteresis)

@@ -175,10 +175,12 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
   ASSERT_TRUE(node.replanOnce());
 
   auto peer = makeIntent(100.0, 1, "A02");
+  // peer 与本机完全同轨迹（同刻、同位置）：任何本机轨迹均侵入固定 1m 硬门，
+  // 立即重规划必然失败 → 触发受约束制动（EMERGENCY 先重规划再急停路径）。
   peer.t = {0.0, 5.0};
-  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.x = 0.0;
   peer.sampled_traj[0].position.z = 5.0;
-  peer.sampled_traj[1].position.x = 0.0;
+  peer.sampled_traj[1].position.x = 5.0;
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
   node.safetySupervisorTick();
@@ -214,10 +216,11 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
   ASSERT_EQ(node.execState(), kStateExecuting);
 
   auto peer = makeIntent(100.0, 1, "A02");
+  // peer 与本机完全同轨迹：立即重规划失败 → 制动（先重规划再急停）。
   peer.t = {0.0, 5.0};
-  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.x = 0.0;
   peer.sampled_traj[0].position.z = 5.0;
-  peer.sampled_traj[1].position.x = 0.0;
+  peer.sampled_traj[1].position.x = 5.0;
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
   node.safetySupervisorTick();
@@ -247,6 +250,39 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
   const auto hold = node.steadyTarget();
   ASSERT_TRUE(hold);
   EXPECT_LT((hold->pos - braking->pts.back()).norm(), 1e-8);
+}
+
+TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
+{
+  // 对齐原版 planFromCurrentTraj 优先：EMERGENCY 时先尝试立即重规划，成功则不
+  // 触发受约束制动（监督层只保留"先重规划再急停"兜底，26082602 修订）。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setSafetySupervisorModeForTest("active");
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), kStateExecuting);
+
+  // 对向交叉 peer：与本机直线轨迹在 x=2.5 交叉（<1m），但存在横向（y）绕开解，
+  // 预测越界时间 ttc≈2.5s > emergency_replan_time_s(1.0) → 立即重规划/等待，
+  // 不触发制动轨迹。
+  auto peer = makeIntent(100.0, 1, "A02");
+  peer.t = {0.0, 5.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 0.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+  node.safetySupervisorTick();
+  EXPECT_NE(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+  EXPECT_NE(node.execState(), ego_planner_driver::kStateBrakeHold);
+  // 要么重规划成功（继续执行），要么至少未因 EMERGENCY 直接制动。
+  EXPECT_TRUE(node.execState() == kStateExecuting ||
+              node.execState() == ego_planner_driver::kStateHold);
 }
 
 

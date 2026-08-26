@@ -50,8 +50,11 @@
 ## 预测安全监督（26082500 阶段 A）
 
 - `SafetyPredictor` 对本机执行轨迹和邻机 intent 取共同绝对时间窗，计算相对状态、closing speed、
-  CPA、首次越过 1m 的 TTC、数据年龄及动态两级距离门槛；预测窗不足显式输出
-  `INSUFFICIENT_DATA`。
+  CPA、首次越过 1m 的 TTC 及动态两级距离门槛（反应时间**不含 data_age**——邻机轨迹激活时刻已由
+  GPS bias 修正到本机时间轴，同刻采样即预测；age 仅诊断，防止发布频率降低后门槛被放大误触发）；
+  预测窗不足显式输出 `INSUFFICIENT_DATA`。
+- EMERGENCY 处理对齐原版 `planFromCurrentTraj` 优先：先尝试立即重规划（成功则继续执行），失败且
+  预测越界时间 `ttc < emergency_replan_time_s`(1.0s) 才触发受约束制动，否则交常规 replanLoop。
 - 数字身份取末尾数字；低 ID=`STAND_ON`、高 ID=`YIELD`，非法或重复数字=`UNKNOWN`。
 - `SafetyLogger` 使用有界队列和单写线程。默认覆盖写
   `/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner/UAVn-ego-planner.log`；安全 timer

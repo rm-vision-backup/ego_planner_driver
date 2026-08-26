@@ -234,6 +234,13 @@ private:
   SafetyPrediction last_safety_prediction_;
   uint64_t safety_generation_ = 0;
   bool emergency_braking_ = false;
+  // 对齐原版 EGOReplanFSM：EMERGENCY 时先尝试立即重规划（planFromCurrentTraj
+  // 语义）；重规划失败且预测越界时间 < emergency_replan_time_s 才触发受约束
+  // 制动，否则交常规 replanLoop 兜底（对齐原版 emergency_time=1.0s）。
+  double emergency_replan_time_s_ = 1.0;
+  // replanOnce 失败时是否置 PLAN_FAILED+HOLD 收口（常规 replan 为 true）；
+  // EMERGENCY 尝试路径置 false——失败不收口，由监督层决定急停或继续等待。
+  bool replan_failure_fatal_ = true;
   // GPS 时钟偏置（秒）：own = 本机 /gps_bias，peer = 邻机 /UAVn/gps_bias。
   // 新鲜度由各自接收时刻判定；超 bias_valid_s_ 视为失效回退相对时钟。
   double own_bias_s_ = 0.0;

@@ -125,10 +125,12 @@ PairPrediction SafetyPredictor::evaluatePair(
       ? std::max(0.0, std::min(out.common_window_s, -r.dot(v_rel) / rel_speed_sq)) : 0.0;
   out.cpa_distance_m = (r + v_rel * out.t_cpa_s).norm();
 
-  const double age = std::min(out.data_age_s,
-      std::max(0.0, config_.peer_data_age_cap_s));
+  // 邻机轨迹激活时刻已由 GPS bias 修正到本机时间轴，同刻采样即预测其未来
+  // 位置（implementation_plan_26082602 §2.1）；data_age 只反映 intent 发布时间，
+  // 不代表位置不确定性 → 不再进入反应时间（对齐原版固定 CLEARANCE 语义，
+  // 避免 age 放大动态门槛导致正交交叉误触发 EMERGENCY）。age 仅作诊断/日志。
   const double reaction = std::max(0.0, config_.control_delay_s) +
-      std::max(0.0, config_.local_compute_budget_s) + age;
+      std::max(0.0, config_.local_compute_budget_s);
   const double margin = SafetyPredictor::dynamicMargin(
       out.closing_speed_mps, reaction, config_.emergency_decel_mps2);
   out.warning_distance_m = config_.protected_distance_m + margin +
