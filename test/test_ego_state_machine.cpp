@@ -329,6 +329,106 @@ TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
               node.execState() == ego_planner_driver::kStateHold);
 }
 
+TEST(EgoStateMachine, YieldHighIdCommitsLateralCandidate)
+{
+  // 本机 UAV2（ID 2 > peer UAV1 1）→ YIELD：collisionCheckTick 检测悬停冲突 →
+  // 生成 LEFT/RIGHT 候选并提交（exec_state 保持 EXECUTING，冲突区横向偏移）。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIdentityForTest("UAV2", "UAV2");
+  node.setYieldCandidatesEnabledForTest(true);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(10.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), kStateExecuting);
+
+  // peer UAV1 悬停在本机路径中点 (5,0,5)。
+  auto peer = makeIntent(100.0, 1, "UAV1");
+  peer.t = {0.0, 20.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+
+  node.runCollisionCheckTick();
+  EXPECT_TRUE(node.yieldCommittedForTest());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  const auto traj = node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj));
+  double max_dev = 0.0;
+  for (size_t i = 0; i < traj->t.size(); ++i)
+    if (std::fabs(traj->t[i] - 5.0) < 1.0)
+      max_dev = std::max(max_dev, std::fabs(traj->pts[i].y()));
+  EXPECT_GT(max_dev, 0.3);
+}
+
+TEST(EgoStateMachine, YieldLowIdStandOnRequestsReplan)
+{
+  // 本机 UAV1（ID 1 < peer UAV2 2）→ STAND_ON：不生成候选，交常规 replan 兜底。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIdentityForTest("UAV1", "UAV1");
+  node.setYieldCandidatesEnabledForTest(true);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(10.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), kStateExecuting);
+
+  auto peer = makeIntent(100.0, 1, "UAV2");
+  peer.t = {0.0, 20.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+
+  node.runCollisionCheckTick();
+  EXPECT_FALSE(node.yieldCommittedForTest());
+  EXPECT_TRUE(node.planningRequested());
+}
+
+TEST(EgoStateMachine, YieldEpisodeLocksCommit)
+{
+  // 已提交候选且 primary peer 版本未变 → episode 锁存，不重复提交（轨迹不变）。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIdentityForTest("UAV2", "UAV2");
+  node.setYieldCandidatesEnabledForTest(true);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(10.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+
+  auto peer = makeIntent(100.0, 1, "UAV1");
+  peer.t = {0.0, 20.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+
+  node.runCollisionCheckTick();
+  EXPECT_TRUE(node.yieldCommittedForTest());
+  const auto traj1 = node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj1));
+
+  node.runCollisionCheckTick();  // peer 版本未变 → 锁存保持
+  const auto traj2 = node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj2));
+  ASSERT_EQ(traj1->pts.size(), traj2->pts.size());
+  for (size_t i = 0; i < traj1->pts.size(); ++i)
+    EXPECT_TRUE(traj1->pts[i].isApprox(traj2->pts[i]));
+}
+
 
 
 

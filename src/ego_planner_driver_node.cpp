@@ -13,6 +13,25 @@ namespace ego_planner_driver
 {
 namespace
 {
+// 邻机轨迹线性插值采样（同刻采样，node 内复用于碰撞检测）。
+Eigen::Vector3d sampleNeighborForCollision(const NeighborTrajectory& nb, double t_abs)
+{
+  if (nb.pts.empty())
+    return Eigen::Vector3d::Zero();
+  if (t_abs <= nb.t.front())
+    return nb.pts.front();
+  if (t_abs >= nb.t.back())
+    return nb.pts.back();
+  for (size_t i = 0; i + 1 < nb.t.size(); ++i)
+  {
+    if (t_abs < nb.t[i + 1])
+    {
+      const double a = (t_abs - nb.t[i]) / (nb.t[i + 1] - nb.t[i]);
+      return nb.pts[i] * (1.0 - a) + nb.pts[i + 1] * a;
+    }
+  }
+  return nb.pts.back();
+}
 }  // namespace
 
 EgoPlannerDriverNode::EgoPlannerDriverNode()
@@ -81,6 +100,14 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
       "safety_episode_release_s", 1.0);
   emergency_replan_time_s_ = pnh_.param("emergency_replan_time_s", 1.0);
   first_plan_wait_timeout_s_ = pnh_.param("first_plan_wait_timeout_s", 10.0);
+  // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，§10）。
+  enable_yield_candidates_ = pnh_.param("enable_yield_candidates", false);
+  yield_config_.clearance_factor = pnh_.param("yield_clearance_factor", 1.3);
+  yield_config_.lateral_max_m = pnh_.param("yield_lateral_max_m", 2.0);
+  yield_config_.slow_min_scale = pnh_.param("yield_slow_min_scale", 0.3);
+  yield_config_.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
+  yield_config_.max_acceleration_mps2 = config.max_acc;
+  yield_generator_.reset(new YieldCandidateGenerator(yield_config_));
   safety_predictor_.reset(new SafetyPredictor(safety_config_));
   EmergencyBrakeConfig brake_config;
   brake_config.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
@@ -1266,20 +1293,125 @@ void EgoPlannerDriverNode::collisionCheckTick(const ros::TimerEvent&)
 void EgoPlannerDriverNode::runCollisionCheckTick()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!current_ || plan_start_.isZero() || hold_requested_)
+  if (!current_ || plan_start_.isZero() || hold_requested_ || emergency_braking_)
     return;
   const ros::Time now = nowFunc();
-  // 周期碰撞检查（implementation_plan_26082602 §3.3）：本机执行轨迹 vs 全部
-  // fresh 邻机轨迹，同刻距离 < 固定 clearance → planning_requested_，由
-  // replanLoop 定时合并执行。邻机 start_time 是绝对 epoch（GPS bias 修正），
-  // rebase 到本机轨迹激活时刻。邻机 intent 停发时仍依赖缓冲轨迹检出碰撞。
-  std::vector<NeighborTrajectory> neighbors = freshAbsoluteNeighborsLocked(now);
   const double base = plan_start_.toSec();
-  for (auto& neighbor : neighbors)
-    neighbor.start_time -= base;
-  if (!core_->checkClearance(*current_, neighbors,
-                             core_->config().swarm_clearance * 2.0))
+
+  // 1. 冲突检测：current_ vs 全部 fresh 邻机同刻最小距离（门槛 1.3×clearance）。
+  std::string primary_peer;
+  int32_t primary_traj = -1;
+  double min_clear = std::numeric_limits<double>::infinity();
+  const double gate =
+      yield_config_.clearance_factor * core_->config().swarm_clearance * 2.0;
+  for (const auto& item : inbox_)
+  {
+    if ((now - item.second.second).toSec() > kNeighborStaleS)
+      continue;
+    NeighborTrajectory nb = item.second.first;
+    nb.start_time -= base;
+    if (nb.clearance <= 0.0 || nb.pts.size() < 2 || nb.t.size() != nb.pts.size())
+      continue;
+    for (size_t i = 0; i < current_->t.size(); ++i)
+    {
+      const double t_abs = current_->t[i] - nb.start_time;
+      if (t_abs < nb.t.front() || t_abs > nb.t.back())
+        continue;
+      const double d = (current_->pts[i] - sampleNeighborForCollision(nb, t_abs)).norm();
+      if (d < min_clear)
+      {
+        min_clear = d;
+        primary_peer = item.first;
+      }
+    }
+  }
+  if (min_clear >= gate)
+  {
+    yield_committed_ = false;  // 已脱离冲突区，解除锁存
+    return;
+  }
+  const auto ver = latest_neighbor_version_.find(primary_peer);
+  if (ver != latest_neighbor_version_.end())
+    primary_traj = ver->second.second;
+
+  // 2. right-of-way：低 ID 保持（STAND_ON），高 ID 让路（YIELD）。
+  int my_id = 0, peer_id = 0;
+  const std::string my_identity = !uav_id_.empty() ? uav_id_ : exec_target_;
+  const bool my_ok = SafetyPredictor::parseNumericId(my_identity, my_id);
+  const bool peer_ok = SafetyPredictor::parseNumericId(primary_peer, peer_id);
+  if (!my_ok || !peer_ok || my_id <= peer_id)
+  {
+    // 本机 STAND_ON（ID 数字小于等于 primary peer）：保持 nominal，交常规 replan 兜底。
     planning_requested_ = true;
+    return;
+  }
+  // 本机 YIELD。
+  if (!enable_yield_candidates_ || !yield_generator_)
+  {
+    planning_requested_ = true;
+    return;
+  }
+
+  // 3. episode 锁存：已提交且 primary peer 版本未变 → 保持（不重复生成/提交）。
+  if (yield_committed_ && yield_peer_traj_id_ == primary_traj)
+    return;
+
+  // 4. 悬停前机判定（跳过 SLOW）。
+  bool peer_hovering = false;
+  const auto it = inbox_.find(primary_peer);
+  if (it != inbox_.end())
+  {
+    NeighborTrajectory nb = it->second.first;
+    nb.start_time -= base;
+    peer_hovering = isPeerHovering(nb);
+  }
+
+  // 5. 生成候选 + cost 最优 + 提交发布。
+  const double t_elapsed = std::max(0.0, (now - plan_start_).toSec());
+  const std::vector<NeighborTrajectory> neighbors = rebaseNeighbors(
+      freshAbsoluteNeighborsLocked(now), plan_start_);
+  const std::vector<YieldCandidate> candidates =
+      yield_generator_->generate(*current_, t_elapsed, neighbors, peer_hovering);
+  if (candidates.empty())
+  {
+    planning_requested_ = true;  // 全失败 → 常规 replan。
+    return;
+  }
+  const YieldCandidate& best = candidates.front();
+  commitYieldCandidate(best);
+  yield_committed_ = true;
+  yield_direction_ = best.direction;
+  yield_peer_traj_id_ = primary_traj;
+}
+
+void EgoPlannerDriverNode::commitYieldCandidate(const YieldCandidate& cand)
+{
+  ++safety_generation_;
+  planning_requested_ = false;
+  current_.reset(new TimedTrajectory(cand.trajectory));
+  plan_start_ = nowFunc();
+  arrival_since_.reset();
+  steady_target_.reset();
+  emergency_braking_ = false;
+  setState(kStateExecuting);
+  publishIntent(*current_, plan_start_,
+                swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
+  const char* type = cand.type == YieldCandidate::Type::SLOW ? "SLOW"
+                     : cand.direction == YieldDirection::LEFT ? "LEFT" : "RIGHT";
+  ROS_WARN("[%s] yield committed: %s min_clear=%.2f cost=%.3f",
+           uav_id_.c_str(), type, cand.min_clearance_m, cand.cost);
+}
+
+bool EgoPlannerDriverNode::isPeerHovering(const NeighborTrajectory& nb) const
+{
+  if (nb.pts.size() < 2 || nb.t.size() != nb.pts.size())
+    return false;
+  const size_t n = nb.pts.size();
+  const double dt = nb.t.back() - nb.t[n - 2];
+  if (dt <= 1e-6)
+    return false;
+  const double v = (nb.pts.back() - nb.pts[n - 2]).norm() / dt;
+  return v < yield_config_.hovering_velocity_mps;
 }
 
 bool EgoPlannerDriverNode::firstPlanReadyLocked(const ros::Time& now) const
@@ -1313,6 +1445,16 @@ bool EgoPlannerDriverNode::firstPlanReadyForTest()
   if (first_plan_requested_at_.isZero())
     first_plan_requested_at_ = now;
   return firstPlanReadyLocked(now);
+}
+
+void EgoPlannerDriverNode::setYieldCandidatesEnabledForTest(bool enabled)
+{
+  enable_yield_candidates_ = enabled;
+}
+
+bool EgoPlannerDriverNode::yieldCommittedForTest() const
+{
+  return yield_committed_;
 }
 
 void EgoPlannerDriverNode::publishIntent(const TimedTrajectory& traj, const ros::Time& base)

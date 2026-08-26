@@ -25,6 +25,7 @@
 #include "ego_planner_driver/emergency_brake.h"
 #include "ego_planner_driver/safety_logger.h"
 #include "ego_planner_driver/safety_predictor.h"
+#include "ego_planner_driver/yield_candidates.h"
 
 using ego_planner_driver::EgoPlannerConfig;
 using ego_planner_driver::EgoPlannerCore;
@@ -127,6 +128,9 @@ public:
   // （等价 replanLoop 首轮检查，leader/已收前驱/超时 → true）。
   void setFirstPlanWaitTimeoutForTest(double timeout_s);
   bool firstPlanReadyForTest();
+  // 让路候选测试接口：启用 / 查询提交状态。
+  void setYieldCandidatesEnabledForTest(bool enabled);
+  bool yieldCommittedForTest() const;
   // 测试用：禁用 replanLoop 线程（单测手动 replanOnce 驱动时避免线程抢占）。
   void setReplanLoopEnabled(bool enabled);
 
@@ -198,6 +202,10 @@ private:
   // 周期碰撞检查（collision_check_rate_hz）：本机 current_ 与全部 fresh 邻机
   // 轨迹同刻距离 < 固定 clearance → planning_requested_（implementation_plan_26082602）。
   void collisionCheckTick(const ros::TimerEvent& event);
+  // 提交候选让路轨迹（替换 current_ + 发布 intent）。调用方持 mutex_。
+  void commitYieldCandidate(const YieldCandidate& cand);
+  // 判定 primary peer 是否近似悬停（末段速度 < hovering_velocity_mps）。
+  bool isPeerHovering(const NeighborTrajectory& nb) const;
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   void processHoldLocked();
   void handleMavrosStateEdgeLocked();
@@ -245,6 +253,15 @@ private:
   // replanOnce 失败时是否置 PLAN_FAILED+HOLD 收口（常规 replan 为 true）；
   // EMERGENCY 尝试路径置 false——失败不收口，由监督层决定急停或继续等待。
   bool replan_failure_fatal_ = true;
+  // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，implementation_plan_26082602 §10）：
+  // collisionCheckTick 检测冲突（min_clear < 1.3×clearance）→ 本机 YIELD（ID 小于
+  // primary peer）生成候选，cost 最小者提交发布；STAND_ON 交常规 replan。
+  YieldCandidateConfig yield_config_;
+  std::unique_ptr<YieldCandidateGenerator> yield_generator_;
+  bool enable_yield_candidates_ = false;
+  bool yield_committed_ = false;
+  YieldDirection yield_direction_ = YieldDirection::NONE;
+  int32_t yield_peer_traj_id_ = -1;  // 锁存的 primary peer 轨迹版本（防重复提交）
   // GPS 时钟偏置（秒）：own = 本机 /gps_bias，peer = 邻机 /UAVn/gps_bias。
   // 新鲜度由各自接收时刻判定；超 bias_valid_s_ 视为失效回退相对时钟。
   double own_bias_s_ = 0.0;

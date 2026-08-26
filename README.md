@@ -46,6 +46,11 @@
   `collisionCheckTick`（本机 `current_` vs fresh 邻机轨迹 <1m → 请求 replan），接收邻机 intent
   的事件驱动 replan 已删除（作用重复，备用记录见计划 §5）。监督层 `SafetyPredictor` 动态
   EMERGENCY 门槛、GPS bias 修正与旧 1m 门禁保留。
+- 机间让路候选（26082602 §10）：`collisionCheckTick` 检测冲突（min_clear < 1.3×clearance）→
+  right-of-way（低 ID STAND_ON 保持、高 ID YIELD）→ YIELD 生成 **SLOW/LEFT/RIGHT** 候选，
+  cost = ΔT/T_nominal + dev/2.0 最小者提交发布；SLOW 时间缩放 `[0.3,1.0]`（悬停前机跳过）、
+  LEFT/RIGHT 横向 C2 偏移（峰值 ≤2.0m，时间轴不变，横向机动速度 ≤0.4m/s）。SafetyPredictor
+  只留 EMERGENCY（先重规划再急停）。
 
 ## 预测安全监督（26082500 阶段 A）
 
