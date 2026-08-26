@@ -383,8 +383,9 @@ TEST(EgoStateMachine, YieldHighIdCommitsLateralCandidate)
 
 TEST(EgoStateMachine, YieldLowIdStandOnRequestsReplan)
 {
-  // 本机 UAV1（ID 1 < peer UAV2 2）→ STAND_ON：collisionCheckTick 只置位，
-  // replanOnce 常规规划失败后 tryYieldReplan 不生成候选 → PLAN_FAILED 收口。
+  // 本机 UAV1（ID 1 < peer UAV2 2）→ STAND_ON：collisionCheckTick 只置位；
+  // replanOnce 常规规划失败后 STAND_ON 只尝试 SLOW 变速候选（26082621 迭代），
+  // 悬停 peer 下 SLOW 无效（减速撞悬停点）→ 无候选 → PLAN_FAILED 收口。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -408,7 +409,7 @@ TEST(EgoStateMachine, YieldLowIdStandOnRequestsReplan)
   node.runCollisionCheckTick();
   EXPECT_FALSE(node.yieldCommittedForTest());
   EXPECT_TRUE(node.planningRequested());
-  EXPECT_FALSE(node.replanOnce());  // STAND_ON：无候选 → PLAN_FAILED
+  EXPECT_FALSE(node.replanOnce());  // STAND_ON 只 SLOW，悬停 peer 下无效 → PLAN_FAILED
   EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
 }
 
@@ -515,6 +516,51 @@ TEST(EgoStateMachine, YieldReplanStandOnFailsToPlan)
   EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
 }
 
+
+
+TEST(EgoStateMachine, ReplanWithLowClearanceMarginCommitsCandidate)
+{
+  // B（26082621 迭代）：常规规划通过 1m 硬门但裕度不足（min_clear < clearance_
+  // factor×1m=1.2）→ 也生成候选替换成更安全轨迹（防"规划通过但实际间距偏小"）。
+  // UAV2（YIELD）直线到 (10,0,5)，peer UAV1 悬停在路径侧面 (5,1.05,5)：常规轨迹
+  // 在 x=5 处距 peer 1.05m（>1m 硬门通过，但 <1.2m 裕度）→ 候选 LEFT/RIGHT 提交。
+  FakeClock clock;
+  clock.set(100.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setIdentityForTest("UAV2", "UAV2");
+  node.setYieldCandidatesEnabledForTest(true);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  node.sendGoal(10.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), kStateExecuting);
+
+  auto peer = makeIntent(100.0, 1, "UAV1");
+  peer.t = {0.0, 20.0};
+  peer.sampled_traj[0].position.x = 5.0;
+  peer.sampled_traj[0].position.y = 1.05;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.y = 1.05;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+
+  // 周期碰撞检查置位（冲突 gate 1.2m：本机轨迹在 x=5 处距 peer 1.05m < 1.2m）。
+  node.runCollisionCheckTick();
+  ASSERT_TRUE(node.planningRequested());
+
+  // 常规 replan 通过 1m 硬门（1.05m），但 B 裕度门槛 1.2m 触发候选。
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_TRUE(node.yieldCommittedForTest());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  const auto traj = node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj));
+  double max_dev = 0.0;
+  for (size_t i = 0; i < traj->t.size(); ++i)
+    max_dev = std::max(max_dev, std::fabs(traj->pts[i].y()));
+  EXPECT_GT(max_dev, 0.5);  // 候选横向偏移 ≥1.3
+}
 
 
 

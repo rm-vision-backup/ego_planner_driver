@@ -138,21 +138,69 @@ TEST(YieldCandidates, CostPrefersLateralOverLongSlow)
 {
   YieldCandidateConfig cfg;
   cfg.slow_min_scale = 0.5;
-  cfg.lateral_max_m = 2.0;
+  cfg.lateral_max_m = 2.2;
   YieldCandidateGenerator gen(cfg);
   const TimedTrajectory current = makeLine(10.0, 1.0);
   const NeighborTrajectory hover = makeHoverPeer(Eigen::Vector3d(5.0, 0.0, 5.0));
   const auto candidates = gen.generate(current, 0.0, {hover}, false);
   ASSERT_FALSE(candidates.empty());
-  // 所有候选通过 1.3m 门槛；SLOW 有 ΔT、LEFT/RIGHT 有 dev（时间轴不变）。
+  // 所有候选通过 1.2m 门槛（26082621 迭代由 1.3 放宽）；SLOW 有 ΔT、LEFT/RIGHT 有 dev。
   for (const auto& c : candidates)
   {
-    EXPECT_GE(c.min_clearance_m, 1.3);
+    EXPECT_GE(c.min_clearance_m, 1.2);
     EXPECT_GT(c.cost, 0.0);
     if (c.type == YieldCandidate::Type::SLOW)
       EXPECT_GT(c.time_extension_s, 0.0);
     else
       EXPECT_GE(c.time_extension_s, 0.0);
+  }
+}
+
+TEST(YieldCandidates, SlowOnlyGeneratesOnlySlowForStandOn)
+{
+  // 非对称（26082621 迭代）：STAND_ON 侧 slow_only=true 只生成 SLOW 变速候选，
+  // 不生成 LEFT/RIGHT 横向偏移；ΔT 取绝对值计入 cost。
+  YieldCandidateConfig cfg;
+  cfg.slow_min_scale = 0.5;
+  cfg.lateral_max_m = 2.2;
+  YieldCandidateGenerator gen(cfg);
+  const TimedTrajectory current = makeLine(10.0, 1.0);
+  const NeighborTrajectory peer = makeCrossingPeer(-2.0);
+  const auto candidates = gen.generate(current, 0.0, {peer}, false, true);
+  ASSERT_FALSE(candidates.empty());
+  bool saw_slow = false;
+  for (const auto& c : candidates)
+  {
+    EXPECT_EQ(c.type, YieldCandidate::Type::SLOW);  // 无 LEFT/RIGHT
+    EXPECT_NEAR(c.time_extension_s,
+                std::fabs(c.trajectory.duration - 10.0), 1e-6);  // ΔT 绝对值
+    EXPECT_GT(c.cost, 0.0);
+    saw_slow = true;
+  }
+  EXPECT_TRUE(saw_slow);
+}
+
+TEST(YieldCandidates, SlowAccelerateGearDoesNotExceedSpeedLimit)
+{
+  // 加速档 1.2（26082621 迭代）：时间轴缩短（duration < nominal）且速度受
+  // max_velocity_mps(1.5) 约束。用快速直线（1.3 m/s）验证 1.2 档被 clamp 后
+  // 轨迹速度不超 1.5。
+  YieldCandidateConfig cfg;
+  cfg.slow_min_scale = 0.1;
+  cfg.max_velocity_mps = 1.5;
+  YieldCandidateGenerator gen(cfg);
+  const TimedTrajectory current = makeLine(10.0, 1.3);
+  // peer 悬停在本机路径 x=5（减速/保持速度档都撞，加速先过也不能避让悬停点）——
+  // 本用例只验证加速档的动力学合法性：构造一个 peer 使 0.5/0.8 档有效即可，
+  // 加速档由代码路径覆盖（因子 clamp 逻辑）。
+  const NeighborTrajectory peer = makeCrossingPeer(-2.0);
+  const auto candidates = gen.generate(current, 0.0, {peer}, false, true);
+  ASSERT_FALSE(candidates.empty());
+  for (const auto& c : candidates)
+  {
+    ASSERT_TRUE(c.type == YieldCandidate::Type::SLOW);
+    for (size_t i = 0; i < c.trajectory.vel.size(); ++i)
+      EXPECT_LE(c.trajectory.vel[i].norm(), 1.5 + 1e-6);
   }
 }
 

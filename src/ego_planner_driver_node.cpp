@@ -132,10 +132,10 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
       "safety_episode_release_s", 1.0);
   emergency_replan_time_s_ = pnh_.param("emergency_replan_time_s", 1.0);
   first_plan_wait_timeout_s_ = pnh_.param("first_plan_wait_timeout_s", 10.0);
-  // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，§10）。
+  // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，26082621 迭代）。
   enable_yield_candidates_ = pnh_.param("enable_yield_candidates", false);
-  yield_config_.clearance_factor = pnh_.param("yield_clearance_factor", 1.3);
-  yield_config_.lateral_max_m = pnh_.param("yield_lateral_max_m", 2.0);
+  yield_config_.clearance_factor = pnh_.param("yield_clearance_factor", 1.2);
+  yield_config_.lateral_max_m = pnh_.param("yield_lateral_max_m", 2.2);
   yield_config_.slow_min_scale = pnh_.param("yield_slow_min_scale", 0.3);
   yield_config_.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
   yield_config_.max_acceleration_mps2 = config.max_acc;
@@ -354,6 +354,7 @@ bool EgoPlannerDriverNode::replanOnce()
   double cost = 0.0;
   bool safe_candidate = false;
   ros::Time assumed_activation = snap->now;
+  std::vector<NeighborTrajectory> activation_neighbors;
   for (int attempt = 0; attempt < activation_replan_attempts_; ++attempt)
   {
     std::vector<NeighborTrajectory> absolute_neighbors;
@@ -370,8 +371,7 @@ bool EgoPlannerDriverNode::replanOnce()
       continue;
     }
     completed_at = nowFunc();
-    const std::vector<NeighborTrajectory> activation_neighbors =
-        rebaseNeighbors(absolute_neighbors, completed_at);
+    activation_neighbors = rebaseNeighbors(absolute_neighbors, completed_at);
     if (core_->checkClearance(traj, activation_neighbors,
                               core_->config().swarm_clearance * 2.0))
     {
@@ -405,6 +405,19 @@ bool EgoPlannerDriverNode::replanOnce()
       setState(kStatePlanFailed);
     }
     return false;
+  }
+  // B（26082621 迭代）：常规规划"成功"但裕度不足（min_clear < clearance_factor×1m）
+  // → 也生成候选替换成更安全的轨迹（防止"规划通过但实际间距偏小"——SITL Run5 类
+  // min_3d 0.605m）。候选失败则保持原轨迹（仍有 1m 硬门裕度），不 PLAN_FAILED。
+  if (snap)
+  {
+    const double gate =
+        yield_config_.clearance_factor * core_->config().swarm_clearance * 2.0;
+    if (minClearanceWith(traj, activation_neighbors) < gate)
+    {
+      if (tryYieldReplan(*snap))
+        return true;
+    }
   }
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1390,8 +1403,13 @@ bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
   int my_id = 0, peer_id = 0;
   const std::string my_identity = !uav_id_.empty() ? uav_id_ : exec_target_;
   if (!SafetyPredictor::parseNumericId(my_identity, my_id) ||
-      !SafetyPredictor::parseNumericId(primary_peer, peer_id) || my_id <= peer_id)
-    return false;  // STAND_ON 或无法解析：不生成候选。
+      !SafetyPredictor::parseNumericId(primary_peer, peer_id))
+    return false;  // UNKNOWN：不生成候选。
+
+  // 非对称（26082621 迭代）：低 ID STAND_ON 只生成 SLOW 变速候选（减速等待/加速
+  // 提前错开，不横向偏移——保持 nominal 语义）；高 ID YIELD 生成 SLOW/LEFT/RIGHT
+  // 全候选。episode 内锁存角色与方向。
+  const bool stand_on = my_id <= peer_id;
 
   // episode 锁存：已提交候选且 primary peer 轨迹版本未变 → 保持（不重复提交）。
   int32_t primary_traj = -1;
@@ -1405,14 +1423,16 @@ bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
   }
 
   // 2. 生成候选：基于 nominal（无邻居规划）轨迹由生成器统一产出
-  //    SLOW（时间缩放错开）/ LEFT/RIGHT（横向 C2 偏移），验证 1.3m 门槛。
+  //    SLOW（时间缩放错开）/ LEFT/RIGHT（横向 C2 偏移），验证 1.2m 门槛。
   std::vector<YieldCandidate> candidates;
   TimedTrajectory nominal, traj;
   double plan_cost = 0.0;
+  bool nominal_ok = false;
+  bool peer_hovering = false;
   if (core_->planOnce(snap.start, snap.waypoints, {}, nominal, plan_cost,
                       snap.start_vel, snap.start_acc, snap.final_segment))
   {
-    bool peer_hovering = false;
+    nominal_ok = true;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       const ros::Time now = nowFunc();
@@ -1428,11 +1448,19 @@ bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
     std::vector<NeighborTrajectory> neighbors = snap.neighbors;
     for (auto& nb : neighbors)
       nb.start_time -= snap.now.toSec();
-    candidates = yield_generator_->generate(nominal, 0.0, neighbors, peer_hovering);
+    candidates = yield_generator_->generate(nominal, 0.0, neighbors,
+                                            peer_hovering, stand_on);
   }
 
   if (candidates.empty())
+  {
+    // 诊断（26082621 迭代）：STAND_ON/YIELD 候选全无效时记录原因。
+    ROS_WARN("[%s] yield replan: no valid candidate (peer=%s stand_on=%d "
+             "nominal_ok=%d peer_hovering=%d)", uav_id_.c_str(),
+             primary_peer.c_str(), stand_on ? 1 : 0, nominal_ok ? 1 : 0,
+             peer_hovering ? 1 : 0);
     return false;
+  }
   std::sort(candidates.begin(), candidates.end(),
             [](const YieldCandidate& a, const YieldCandidate& b)
             { return a.cost < b.cost; });

@@ -14,12 +14,13 @@ namespace ego_planner_driver
 struct YieldCandidateConfig
 {
   // 安全门槛：候选 min_clear >= clearance_factor * 2 * swarm_clearance。
-  // 1.3 提供轨迹规划通过后的机间距离抖动缓冲，防止触达 1m 硬门后 BRAKE_HOLD。
-  double clearance_factor = 1.3;
-  double lateral_max_m = 2.0;   // LEFT/RIGHT 峰值横向偏移上限
+  // 1.2（26082621 迭代由 1.3 放宽）：提供机间距离抖动缓冲，同时让更多候选通过
+  // （lateral 1.3 档 ≥1.2 可用）；也作为"常规规划裕度不足"的候选触发阈值（replanOnce B）。
+  double clearance_factor = 1.2;
+  double lateral_max_m = 2.2;   // LEFT/RIGHT 峰值横向偏移上限
   double slow_min_scale = 0.3;  // SLOW 最低时间缩放（速度 ×scale，时长 ÷scale）
-  // 档位（implementation_plan_26082621 §6）：
-  //   SLOW：scale {0.5, 0.3}；LEFT/RIGHT：lateral {1.0, 1.5, 2.0} × scale {0.7, 0.5}。
+  // 档位（26082621 迭代）：SLOW {0.5, 0.8, 1.2}（0.8/1.2 微调与加速）；
+  //   LEFT/RIGHT lateral {1.3, 1.8, 2.2} × scale {0.7, 0.5}。
   double max_velocity_mps = 1.5;
   double max_acceleration_mps2 = 6.0;
   double hovering_velocity_mps = 0.1;  // 邻机末速 < 该值判"近似悬停"→ 跳过 SLOW
@@ -51,11 +52,13 @@ public:
   // 基于本机执行轨迹 current_（相对激活时刻）在 t_elapsed 时刻生成候选。
   // neighbors 已 rebase 到 current_ 时间轴（start_time 相对 current_ 激活）。
   // peer_hovering：primary peer 近似悬停 → 跳过 SLOW。
+  // slow_only（26082621 迭代）：仅生成 SLOW 变速候选（STAND_ON 侧用，不横向偏移）。
   // 返回按 cost 升序的可行候选（空 = 无解）。
   std::vector<YieldCandidate> generate(const TimedTrajectory& current,
                                        double t_elapsed,
                                        const std::vector<NeighborTrajectory>& neighbors,
-                                       bool peer_hovering) const;
+                                       bool peer_hovering,
+                                       bool slow_only = false) const;
 
 private:
   // 轨迹 vs 邻机全时域同刻最小距离；conflict_center 记最近时刻；overlap 记

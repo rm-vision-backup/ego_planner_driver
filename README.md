@@ -58,10 +58,11 @@
   `emergency_pending_`（记录 primary peer + ttc）；replan 线程在"常规 replan 失败且
   ttc < `emergency_replan_time_s`(1.0s)"时提交受约束制动（EMERGENCY_BRAKE → BRAKE_HOLD），
   否则收口 PLAN_FAILED。监督回调不再直接改轨迹。
-- **机间让路候选（26082621 §6，replan 失败分支）**：right-of-way（低 ID STAND_ON 保持、高 ID
-  YIELD 生成候选）+ **SLOW scale {0.5,0.3} / LEFT-RIGHT lateral {1.0,1.5,2.0}×scale {0.7,0.5}**
-  （plateau 偏移覆盖重叠全程 + C2 过渡），min_clear ≥1.3×clearance，cost=ΔT/T+dev/1.5；
-  候选**只**在 `replanOnce()` 常规规划失败分支生成（10Hz 独立提交已删除）。
+- **机间让路候选（26082621 迭代，replan 失败分支 + 裕度不足分支）**：right-of-way
+  （低 ID STAND_ON 只生成 **SLOW 变速**候选、高 ID YIELD 生成 SLOW/LEFT/RIGHT）+ **SLOW
+  {0.5, 0.8, 1.2}（含加速）** / LEFT-RIGHT lateral {1.3, 1.8, 2.2}×scale {0.7,0.5}，
+  min_clear ≥1.2×clearance，cost=ΔT/T（绝对值）+dev/2.0；常规规划**成功但裕度 <1.2m**
+  也生成候选替换（B）。候选**只**在 `replanOnce()` 内提交（10Hz 独立提交已删除）。
 
 ## 预测安全监督（26082500 阶段 A）
 

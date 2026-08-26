@@ -185,24 +185,25 @@ YieldCandidate YieldCandidateGenerator::makeSlow(
     const TimedTrajectory& remaining, double remaining_nominal,
     const std::vector<NeighborTrajectory>& neighbors) const
 {
-  // 时间缩放 scale ∈ {0.5, 0.3}（implementation_plan_26082621 档位）→ 穿越
-  // 时刻后移错开 peer 时空轨迹；速度 ≤1.5 驱动时间轴（v_max>1.5 时整体拉长）。
+  // 变速档位 {0.5, 0.8, 1.2}（26082621 迭代）：0.5/0.8 减速等待错开、1.2 加速先过；
+  // 穿越时刻相对 peer 移动轨迹错开。最终速度 v_max×factor ≤ max_velocity_mps。
   double v_max = 0.0;
   for (const auto& v : remaining.vel)
     v_max = std::max(v_max, v.norm());
-  const double scale_vel = v_max > config_.max_velocity_mps
-      ? config_.max_velocity_mps / v_max : 1.0;
   const double slow_min = std::max(0.05, config_.slow_min_scale);
-  for (double scale : {0.5, 0.3})
+  for (double scale : {0.5, 0.8, 1.2})
   {
-    const double applied = std::max(scale, slow_min);
+    double factor = std::max(scale, slow_min);
+    // 速度约束（含加速档）：加速后不得超 max_velocity_mps。
+    if (v_max > 1e-9 && v_max * factor > config_.max_velocity_mps)
+      factor = config_.max_velocity_mps / v_max;
     YieldCandidate cand;
     cand.type = YieldCandidate::Type::SLOW;
     cand.direction = YieldDirection::NONE;
     cand.trajectory = remaining;
-    applyTimeScale(cand.trajectory, applied * scale_vel);
-    cand.time_extension_s = std::max(0.0,
-        cand.trajectory.duration - remaining_nominal);
+    applyTimeScale(cand.trajectory, factor);
+    // ΔT 取绝对值（减速等待与加速提前都计入代价，26082621 迭代）。
+    cand.time_extension_s = std::fabs(cand.trajectory.duration - remaining_nominal);
     cand.cost = remaining_nominal > 1e-6
         ? cand.time_extension_s / remaining_nominal
         : std::numeric_limits<double>::infinity();
@@ -273,7 +274,7 @@ YieldCandidate YieldCandidateGenerator::makeLateral(
 
   const double span = std::max(0.0, overlap_end - overlap_start);
   const double T_trans = clamp(span / 2.0, 0.5, 1.5);
-  for (double lateral : {1.0, 1.5, 2.0})
+  for (double lateral : {1.3, 1.8, 2.2})
   {
     for (double scale_wait : {0.7, 0.5})
     {
@@ -300,11 +301,12 @@ YieldCandidate YieldCandidateGenerator::makeLateral(
       const double scale_vel = v_max > config_.max_velocity_mps
           ? config_.max_velocity_mps / v_max : 1.0;
       applyTimeScale(cand.trajectory, scale_wait * scale_vel);
-      cand.time_extension_s = std::max(0.0,
+      // ΔT 取绝对值（26082621 迭代）：变速（含加速）时间差计入代价。
+      cand.time_extension_s = std::fabs(
           cand.trajectory.duration - remaining_nominal);
       cand.cost = (remaining_nominal > 1e-6
                        ? cand.time_extension_s / remaining_nominal : 0.0)
-                  + lateral / 1.5;  // dev 权重增大（/1.5）
+                  + lateral / 2.0;  // dev 权重回 /2.0（26082621 迭代）
       double min_clear = 0.0;
       if (validate(cand.trajectory, neighbors, min_clear))
       {
@@ -319,7 +321,8 @@ YieldCandidate YieldCandidateGenerator::makeLateral(
 
 std::vector<YieldCandidate> YieldCandidateGenerator::generate(
     const TimedTrajectory& current, double t_elapsed,
-    const std::vector<NeighborTrajectory>& neighbors, bool peer_hovering) const
+    const std::vector<NeighborTrajectory>& neighbors, bool peer_hovering,
+    bool slow_only) const
 {
   std::vector<YieldCandidate> result;
   if (current.pts.empty())
@@ -333,22 +336,26 @@ std::vector<YieldCandidate> YieldCandidateGenerator::generate(
   computeMinClearance(remaining, neighbors, min_clear, conflict_center,
                       overlap_start, overlap_end);
 
+  // slow_only（26082621 迭代）：STAND_ON 侧只变速（SLOW），不横向偏移。
   if (!peer_hovering)
   {
     const YieldCandidate slow = makeSlow(remaining, remaining_nominal, neighbors);
     if (slow.cost < std::numeric_limits<double>::infinity())
       result.push_back(slow);
   }
-  const YieldCandidate left = makeLateral(remaining, remaining_nominal, neighbors,
-                                          overlap_start, overlap_end,
-                                          YieldDirection::LEFT);
-  if (left.cost < std::numeric_limits<double>::infinity())
-    result.push_back(left);
-  const YieldCandidate right = makeLateral(remaining, remaining_nominal, neighbors,
-                                           overlap_start, overlap_end,
-                                           YieldDirection::RIGHT);
-  if (right.cost < std::numeric_limits<double>::infinity())
-    result.push_back(right);
+  if (!slow_only)
+  {
+    const YieldCandidate left = makeLateral(remaining, remaining_nominal, neighbors,
+                                            overlap_start, overlap_end,
+                                            YieldDirection::LEFT);
+    if (left.cost < std::numeric_limits<double>::infinity())
+      result.push_back(left);
+    const YieldCandidate right = makeLateral(remaining, remaining_nominal, neighbors,
+                                             overlap_start, overlap_end,
+                                             YieldDirection::RIGHT);
+    if (right.cost < std::numeric_limits<double>::infinity())
+      result.push_back(right);
+  }
 
   // cost 升序（SLOW 无 dev 项 → 自然偏向 SLOW，不强制）。
   std::sort(result.begin(), result.end(),
