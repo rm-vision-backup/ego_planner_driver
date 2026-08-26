@@ -151,7 +151,11 @@ PairPrediction SafetyPredictor::evaluatePair(
     if (!std::isfinite(out.ttc_s) && distance <= config_.protected_distance_m)
       out.ttc_s = relative_t;
     warning = warning || distance <= out.warning_distance_m;
-    emergency = emergency || distance <= out.emergency_distance_m;
+    // 对齐原版 checkCollisionCallback：EMERGENCY 以固定物理 protected_distance
+    // （1m）为准，动态 emergency_d 只作 WARNING 缓冲（含 closing/制动余量）。
+    // 否则规划层固定 1m 硬门与监督层 1.96m 门槛不一致，UAV2 绕开 cpa_d≈1.2m
+    // 时永续 EMERGENCY→重规划 ping-pong（SITL 2026-08-26 复测观测）。
+    emergency = emergency || distance <= config_.protected_distance_m;
   }
   warning = warning || (std::isfinite(out.ttc_s) && out.ttc_s <= config_.warning_ttc_s);
   emergency = emergency || (std::isfinite(out.ttc_s) && out.ttc_s <= config_.emergency_ttc_s);
