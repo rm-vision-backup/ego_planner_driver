@@ -49,7 +49,8 @@
 - **plan-exec 循环重构（26082621）**：上层 `EgoSwarmDriver` 把分层关键点按 **3m 间距**密化后
   发布 `/waypoints`；C++ 任务航点 = **相邻下一个 keypoints(n+1)**（替换 horizon 窗口滚动）。
   执行循环每 tick 三分支：①推进（距当前目标 <0.5m → 切下一关键点，<0.5m 丢弃、3.5m 上限）、
-  ②到达（距最终关键点 <0.1m → COMPLETED）、③定时 replan（elapsed ≥1.0s → 置位唤醒）。
+  ②到达（距最终关键点 <0.2m → COMPLETED；26082621 复盘由 0.1m 放宽——PX4 SITL 稳态偏差
+  实测 0.13-0.17m，0.1m 太紧导致末段 HOLD）、③定时 replan（elapsed ≥1.0s → 置位唤醒）。
 - **单一 replan 入口（26082621 方案 A）**：1s 定时 / 10Hz 冲突 / 推进 / EMERGENCY 事件**全部
   只置位**（`planning_requested_`/`emergency_pending_`）并唤醒 replanLoop（条件变量，1s 超时
   兜底）；replanLoop → `replanOnce()` 是**唯一轨迹提交者**（常规 replan / 候选 / 制动）。

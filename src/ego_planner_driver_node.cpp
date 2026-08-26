@@ -95,7 +95,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   no_replan_thresh_m_ = pnh_.param("no_replan_thresh_m", 1.0);
   reach_thresh_m_ = pnh_.param("reach_thresh_m", 0.5);
   max_advance_dist_m_ = pnh_.param("max_advance_dist_m", 3.5);
-  arrival_reach_thresh_m_ = pnh_.param("arrival_reach_thresh_m", 0.1);
+  arrival_reach_thresh_m_ = pnh_.param("arrival_reach_thresh_m", 0.2);
   activation_replan_attempts_ = std::max(
       1, pnh_.param("activation_replan_attempts", 3));
   setpoint_topic_ = pnh_.param("setpoint_out_topic", std::string("setpoint/ego"));

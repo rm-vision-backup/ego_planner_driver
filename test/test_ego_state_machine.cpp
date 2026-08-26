@@ -917,7 +917,9 @@ TEST(EgoStateMachine, PlanExecAdvanceDiscardsTooCloseTargets)
 
 TEST(EgoStateMachine, PlanExecArrivalCompletesAtFinalKeypoint)
 {
-  // plan-exec 分支 B：距最终关键点 <0.1m（稳定窗口后）→ COMPLETED，冻结目标位姿。
+  // plan-exec 分支 B：距最终关键点 < arrival_reach_thresh_m_（0.2m，稳定窗口后）
+  // → COMPLETED，冻结目标位姿。0.15m 在旧 0.1m 阈值外、新 0.2m 阈值内（PX4 SITL
+  // 稳态偏差实测 0.13-0.17m，26082621 复盘放宽）。
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
@@ -936,12 +938,12 @@ TEST(EgoStateMachine, PlanExecArrivalCompletesAtFinalKeypoint)
   ASSERT_TRUE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateExecuting);
 
-  // 飞到最终关键点 (9,0,5)：0.05m < 0.1m 到达阈值。
-  node.injectLocalPose(makePose(8.95, 0.0, 5.0, clock.get()));
+  // 飞到最终关键点 (9,0,5)：0.15m 偏差 < 0.2m 到达阈值（> 0.1m 旧阈值）。
+  node.injectLocalPose(makePose(8.85, 0.0, 5.0, clock.get()));
   node.arrivalCheckTick();  // 到达窗口开始（稳定未满）
   EXPECT_EQ(node.execState(), kStateExecuting);
   clock.advance(1.1);  // > arrival_stable_s
-  node.injectLocalPose(makePose(8.95, 0.0, 5.0, clock.get()));  // pose 保持新鲜
+  node.injectLocalPose(makePose(8.85, 0.0, 5.0, clock.get()));  // pose 保持新鲜
   node.arrivalCheckTick();
   EXPECT_EQ(node.execState(), kStateCompleted);
   ASSERT_TRUE(static_cast<bool>(node.steadyTarget()));
@@ -992,7 +994,7 @@ TEST(EgoStateMachine, RollingSegmentsReachCompleted)
 
 TEST(EgoStateMachine, RollingSegmentsReachCompletedWithTrackingLag)
 {
-  // 模拟 SITL 跟踪滞后 0.05m（< arrival_reach_thresh_m 0.1m）：推进/到达判定
+  // 模拟 SITL 跟踪滞后 0.05m（< arrival_reach_thresh_m 0.2m）：推进/到达判定
   // 仍收敛到 COMPLETED。
   usleep(600 * 1000);
   FakeClock clock;
