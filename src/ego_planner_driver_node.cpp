@@ -137,7 +137,10 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   yield_config_.clearance_factor = pnh_.param("yield_clearance_factor", 1.2);
   yield_config_.lateral_max_m = pnh_.param("yield_lateral_max_m", 2.2);
   yield_config_.slow_min_scale = pnh_.param("yield_slow_min_scale", 0.3);
-  yield_config_.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
+  // 最大速度限制（26082621 迭代）：候选/加速档允许的轨迹速度上限，独立于制动
+  // （emergency_max_velocity_mps 1.5 保持）。SLOW 1.2 加速档 + PX4 执行超调实测
+  // 1.49-1.54，原 1.5 上限过紧；上限 2.5 与测试判定一致（写在本驱动，不靠验证脚本）。
+  yield_config_.max_velocity_mps = pnh_.param("yield_max_velocity_mps", 2.5);
   yield_config_.max_acceleration_mps2 = config.max_acc;
   yield_generator_.reset(new YieldCandidateGenerator(yield_config_));
   safety_predictor_.reset(new SafetyPredictor(safety_config_));

@@ -85,6 +85,9 @@
     <param name="yield_clearance_factor" value="1.2"/>
     <param name="yield_lateral_max_m" value="2.2"/>
     <param name="yield_slow_min_scale" value="0.3"/>
+    <!-- 候选/加速档最大速度上限（26082621 迭代）：2.5 写在本驱动，独立于制动
+         （emergency_max_velocity_mps=1.5 保持）；与测试判定一致。 -->
+    <param name="yield_max_velocity_mps" value="2.5"/>
     <!-- 对齐原版 SEQUENTIAL_START：首轮规划前等待前驱无人机 intent 超时（防
          前驱缺失/失联时永久阻塞）；默认 10s。 -->
     <param name="first_plan_wait_timeout_s" value="10.0"/>

@@ -21,7 +21,7 @@ struct YieldCandidateConfig
   double slow_min_scale = 0.3;  // SLOW 最低时间缩放（速度 ×scale，时长 ÷scale）
   // 档位（26082621 迭代）：SLOW {0.5, 0.8, 1.2}（0.8/1.2 微调与加速）；
   //   LEFT/RIGHT lateral {1.3, 1.8, 2.2} × scale {0.7, 0.5}。
-  double max_velocity_mps = 1.5;
+  double max_velocity_mps = 2.5;  // 候选/加速档允许的轨迹速度上限（26082621 迭代，独立于制动）
   double max_acceleration_mps2 = 6.0;
   double hovering_velocity_mps = 0.1;  // 邻机末速 < 该值判"近似悬停"→ 跳过 SLOW
 };
