@@ -185,20 +185,22 @@ YieldCandidate YieldCandidateGenerator::makeSlow(
     const TimedTrajectory& remaining, double remaining_nominal,
     const std::vector<NeighborTrajectory>& neighbors) const
 {
-  // 时间缩放 scale ∈ {0.7, 0.5} → 穿越时刻后移错开 peer 时空轨迹；
-  // 速度 ≤1.5 驱动时间轴（v_max>1.5 时整体拉长）。
+  // 时间缩放 scale ∈ {0.5, 0.3}（implementation_plan_26082621 档位）→ 穿越
+  // 时刻后移错开 peer 时空轨迹；速度 ≤1.5 驱动时间轴（v_max>1.5 时整体拉长）。
   double v_max = 0.0;
   for (const auto& v : remaining.vel)
     v_max = std::max(v_max, v.norm());
   const double scale_vel = v_max > config_.max_velocity_mps
       ? config_.max_velocity_mps / v_max : 1.0;
-  for (double scale : {0.7, 0.5})
+  const double slow_min = std::max(0.05, config_.slow_min_scale);
+  for (double scale : {0.5, 0.3})
   {
+    const double applied = std::max(scale, slow_min);
     YieldCandidate cand;
     cand.type = YieldCandidate::Type::SLOW;
     cand.direction = YieldDirection::NONE;
     cand.trajectory = remaining;
-    applyTimeScale(cand.trajectory, scale * scale_vel);
+    applyTimeScale(cand.trajectory, applied * scale_vel);
     cand.time_extension_s = std::max(0.0,
         cand.trajectory.duration - remaining_nominal);
     cand.cost = remaining_nominal > 1e-6
@@ -273,7 +275,7 @@ YieldCandidate YieldCandidateGenerator::makeLateral(
   const double T_trans = clamp(span / 2.0, 0.5, 1.5);
   for (double lateral : {1.0, 1.5, 2.0})
   {
-    for (double scale_wait : {1.0, 0.7})
+    for (double scale_wait : {0.7, 0.5})
     {
       YieldCandidate cand;
       cand.type = YieldCandidate::Type::LEFT;

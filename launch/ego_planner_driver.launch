@@ -17,10 +17,12 @@
     <param name="ts" value="0.4"/>
     <param name="max_vel" value="1.0"/>
     <param name="max_acc" value="6.0"/>
-    <!-- 滚动局部规划范围：waypoints 每次只取当前位置前方 horizon 内的点，
-         对齐原版 ego-planner-swarm receding-horizon；0 表示全局规划（退化）。 -->
-    <param name="planning_horizon" value="5.0"/>
     <param name="replan_period_s" value="1.0"/>
+    <!-- plan-exec A/B/C 分支阈值（implementation_plan_26082621）：到当前目标
+         <0.5m 切下一关键点、推进最远 3.5m、到达最终关键点 <0.1m → COMPLETED。 -->
+    <param name="reach_thresh_m" value="0.5"/>
+    <param name="max_advance_dist_m" value="3.5"/>
+    <param name="arrival_reach_thresh_m" value="0.1"/>
     <!-- Candidate activation-time reconciliation retries. Each retry advances
          neighbor intent epochs to the actual post-optimization activation. -->
     <param name="activation_replan_attempts" value="3"/>
@@ -44,7 +46,6 @@
     <param name="lambda_feasibility" value="0.5"/>
     <param name="setpoint_rate_hz" value="30.0"/>
     <param name="local_pose_timeout_s" value="1.0"/>
-    <param name="position_tolerance_m" value="0.6"/>
     <param name="arrival_stable_s" value="1.0"/>
     <param name="exec_timeout_margin_s" value="5.0"/>
     <param name="takeoff_height_m" value="5.0"/>

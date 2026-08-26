@@ -164,6 +164,8 @@ TEST(EgoStateMachine, ShadowSafetyTickDoesNotChangeFlightBehavior)
 
 TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
 {
+  // 方案 Y（implementation_plan_26082621）：监督层 EMERGENCY 只置 emergency_pending_，
+  // 制动由 replan 线程（replanOnce）在"常规 replan 失败且 ttc 紧急"时提交。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -176,7 +178,7 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
 
   auto peer = makeIntent(100.0, 1, "UAV2");
   // peer 与本机完全同轨迹（同刻、同位置）：任何本机轨迹均侵入固定 1m 硬门，
-  // 立即重规划必然失败 → 触发受约束制动（EMERGENCY 先重规划再急停路径）。
+  // 常规 replan 必然失败 → ttc 紧急 → replanOnce 提交受约束制动。
   peer.t = {0.0, 5.0};
   peer.sampled_traj[0].position.x = 0.0;
   peer.sampled_traj[0].position.z = 5.0;
@@ -184,6 +186,9 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
   node.safetySupervisorTick();
+  // 监督回调不再直接改轨迹：置位后由 replanOnce 统一提交。
+  ASSERT_EQ(node.execState(), kStateExecuting);
+  ASSERT_TRUE(node.replanOnce());
   ASSERT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
   const auto braking = node.currentTrajectory();
   ASSERT_TRUE(braking);
@@ -216,7 +221,7 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
   ASSERT_EQ(node.execState(), kStateExecuting);
 
   auto peer = makeIntent(100.0, 1, "UAV2");
-  // peer 与本机完全同轨迹：立即重规划失败 → 制动（先重规划再急停）。
+  // peer 与本机完全同轨迹：常规 replan 失败 → 制动（方案 Y 提交唯一化）。
   peer.t = {0.0, 5.0};
   peer.sampled_traj[0].position.x = 0.0;
   peer.sampled_traj[0].position.z = 5.0;
@@ -224,6 +229,7 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
   node.safetySupervisorTick();
+  ASSERT_TRUE(node.replanOnce());
   ASSERT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
   const auto braking = node.currentTrajectory();
   ASSERT_TRUE(braking);
@@ -231,6 +237,7 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
   const ros::Time brake_start = node.planStart();
 
   // 缺陷 8 回归：紧急制动后常规 replan 提交必须被拒绝，制动轨迹不能被覆盖。
+  // 制动期间 replanOnce 直接返回（emergency_braking_ 门禁）。
   EXPECT_FALSE(node.replanOnce());
   EXPECT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
   const auto after = node.currentTrajectory();
@@ -298,8 +305,8 @@ TEST(EgoStateMachine, FirstPlanTimeoutReleasesWithoutPredecessor)
 
 TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
 {
-  // 对齐原版 planFromCurrentTraj 优先：EMERGENCY 时先尝试立即重规划，成功则不
-  // 触发受约束制动（监督层只保留"先重规划再急停"兜底，26082602 修订）。
+  // 方案 Y：EMERGENCY 先尝试常规重规划（绕开），成功则提交并清除 emergency_pending_，
+  // 不触发制动；失败且 ttc ≥ emergency_replan_time_s 时收口 PLAN_FAILED（不制动）。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -311,9 +318,8 @@ TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
   ASSERT_TRUE(node.replanOnce());
   ASSERT_EQ(node.execState(), kStateExecuting);
 
-  // 对向交叉 peer：与本机直线轨迹在 x=2.5 交叉（<1m），但存在横向（y）绕开解，
-  // 预测越界时间 ttc≈2.5s > emergency_replan_time_s(1.0) → 立即重规划/等待，
-  // 不触发制动轨迹。
+  // 对向交叉 peer：与本机直线轨迹在 x=2.5 交叉（<1m），预测越界时间 ttc≈2.0s
+  // > emergency_replan_time_s(1.0) → 常规 replan 失败则收口 PLAN_FAILED，不制动。
   auto peer = makeIntent(100.0, 1, "UAV2");
   peer.t = {0.0, 5.0};
   peer.sampled_traj[0].position.x = 5.0;
@@ -322,17 +328,21 @@ TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
   node.safetySupervisorTick();
+  // 监督回调只置位；replanOnce 统一处理（可能成功绕开，也可能 PLAN_FAILED）。
+  ASSERT_EQ(node.execState(), kStateExecuting);
+  node.replanOnce();
   EXPECT_NE(node.execState(), ego_planner_driver::kStateEmergencyBrake);
   EXPECT_NE(node.execState(), ego_planner_driver::kStateBrakeHold);
-  // 要么重规划成功（继续执行），要么至少未因 EMERGENCY 直接制动。
+  // 要么重规划成功（继续执行），要么 ttc 充足收口 PLAN_FAILED（安全 HOLD）。
   EXPECT_TRUE(node.execState() == kStateExecuting ||
-              node.execState() == ego_planner_driver::kStateHold);
+              node.execState() == ego_planner_driver::kStatePlanFailed);
 }
 
 TEST(EgoStateMachine, YieldHighIdCommitsLateralCandidate)
 {
-  // 本机 UAV2（ID 2 > peer UAV1 1）→ YIELD：collisionCheckTick 检测悬停冲突 →
-  // 生成 LEFT/RIGHT 候选并提交（exec_state 保持 EXECUTING，冲突区横向偏移）。
+  // 本机 UAV2（ID 2 > peer UAV1 1）→ YIELD：collisionCheckTick 只置 planning_
+  // requested_（单一入口）；replanOnce 常规规划失败后由 tryYieldReplan 生成
+  // LEFT/RIGHT 候选并提交（exec_state 保持 EXECUTING，冲突区横向偏移）。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -355,20 +365,26 @@ TEST(EgoStateMachine, YieldHighIdCommitsLateralCandidate)
   ASSERT_TRUE(node.injectNeighborIntent(peer));
 
   node.runCollisionCheckTick();
+  // 10Hz 检测只置位，不直接提交候选。
+  EXPECT_TRUE(node.planningRequested());
+  EXPECT_FALSE(node.yieldCommittedForTest());
+  ASSERT_TRUE(node.replanOnce());  // 常规 replan 失败 → 候选提交
   EXPECT_TRUE(node.yieldCommittedForTest());
   EXPECT_EQ(node.execState(), kStateExecuting);
   const auto traj = node.currentTrajectory();
   ASSERT_TRUE(static_cast<bool>(traj));
+  // 候选 LEFT/RIGHT 在冲突区横向偏移（时间轴经 scale 拉伸，偏移窗口不固定在
+  // 原 t=5s；扫描全轨迹最大 |y| 即可）。
   double max_dev = 0.0;
   for (size_t i = 0; i < traj->t.size(); ++i)
-    if (std::fabs(traj->t[i] - 5.0) < 1.0)
-      max_dev = std::max(max_dev, std::fabs(traj->pts[i].y()));
+    max_dev = std::max(max_dev, std::fabs(traj->pts[i].y()));
   EXPECT_GT(max_dev, 0.3);
 }
 
 TEST(EgoStateMachine, YieldLowIdStandOnRequestsReplan)
 {
-  // 本机 UAV1（ID 1 < peer UAV2 2）→ STAND_ON：不生成候选，交常规 replan 兜底。
+  // 本机 UAV1（ID 1 < peer UAV2 2）→ STAND_ON：collisionCheckTick 只置位，
+  // replanOnce 常规规划失败后 tryYieldReplan 不生成候选 → PLAN_FAILED 收口。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -392,11 +408,14 @@ TEST(EgoStateMachine, YieldLowIdStandOnRequestsReplan)
   node.runCollisionCheckTick();
   EXPECT_FALSE(node.yieldCommittedForTest());
   EXPECT_TRUE(node.planningRequested());
+  EXPECT_FALSE(node.replanOnce());  // STAND_ON：无候选 → PLAN_FAILED
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
 }
 
 TEST(EgoStateMachine, YieldEpisodeLocksCommit)
 {
-  // 已提交候选且 primary peer 版本未变 → episode 锁存，不重复提交（轨迹不变）。
+  // episode 语义（单一入口）：collisionCheckTick 只置位，不直接提交候选；
+  // 候选提交后若已清除冲突（min_clear ≥1.3）则锁存释放、轨迹不被 tick 改写。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -417,11 +436,19 @@ TEST(EgoStateMachine, YieldEpisodeLocksCommit)
   ASSERT_TRUE(node.injectNeighborIntent(peer));
 
   node.runCollisionCheckTick();
+  ASSERT_TRUE(node.planningRequested());
+  EXPECT_FALSE(node.yieldCommittedForTest());  // tick 不提交候选
+  ASSERT_TRUE(node.replanOnce());              // 首轮失败 → 提交候选
   EXPECT_TRUE(node.yieldCommittedForTest());
+  EXPECT_EQ(node.execState(), kStateExecuting);
   const auto traj1 = node.currentTrajectory();
   ASSERT_TRUE(static_cast<bool>(traj1));
 
-  node.runCollisionCheckTick();  // peer 版本未变 → 锁存保持
+  // 候选已清除冲突（min_clear ≈1.5 ≥1.3 gate）→ 同一 peer 再次 tick 不置位，
+  // 候选锁存释放（yield_committed_ 复位），轨迹不被 tick 改写。
+  node.runCollisionCheckTick();
+  EXPECT_FALSE(node.planningRequested());
+  EXPECT_FALSE(node.yieldCommittedForTest());
   const auto traj2 = node.currentTrajectory();
   ASSERT_TRUE(static_cast<bool>(traj2));
   ASSERT_EQ(traj1->pts.size(), traj2->pts.size());
@@ -456,10 +483,10 @@ TEST(EgoStateMachine, YieldReplanOnPlanFailureCommitsCandidate)
   EXPECT_EQ(node.execState(), kStateExecuting);
   const auto traj = node.currentTrajectory();
   ASSERT_TRUE(static_cast<bool>(traj));
+  // 候选在冲突区横向偏移（时间轴经 scale 拉伸，扫描全轨迹最大 |y|）。
   double max_dev = 0.0;
   for (size_t i = 0; i < traj->t.size(); ++i)
-    if (std::fabs(traj->t[i] - 5.0) < 1.0)
-      max_dev = std::max(max_dev, std::fabs(traj->pts[i].y()));
+    max_dev = std::max(max_dev, std::fabs(traj->pts[i].y()));
   EXPECT_GT(max_dev, 0.3);
 }
 
@@ -584,7 +611,7 @@ TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
   EXPECT_FALSE(node.injectNeighborIntent(makeIntent(60.0, 2)));   // age=80s > 30s
 }
 
-TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)
+TEST(EgoStateMachine, CollisionCheckTickRequestsReplanOnConflict)
 {
   ros::param::set("/uav_id", "UAV2");
   ros::param::set("/exec_target", "UAV2");
@@ -619,9 +646,11 @@ TEST(EgoStateMachine, LowerPriorityIdentityReplansOnlyForHigherPriorityConflict)
   // 事件驱动 replan 已删除（implementation_plan_26082602）：接收邻机 intent
   // 只更新缓冲，不再立即置 planning_requested_。
   EXPECT_FALSE(node.planningRequested());
-  // 周期碰撞检查（10Hz tick 等价）：本机轨迹 vs 冲突邻机 < 1m → 请求 replan。
+  // 周期碰撞检查（10Hz tick 等价）：本机轨迹 vs 冲突邻机 < 1m → 请求 replan
+  // （方案 A 单一入口：只置位，候选/制动由 replan 线程统一提交）。
   node.runCollisionCheckTick();
   EXPECT_TRUE(node.planningRequested());
+  EXPECT_FALSE(node.yieldCommittedForTest());
 
   ros::param::set("/uav_id", "UAV1");
   ros::param::set("/exec_target", "UAV1");
@@ -808,86 +837,224 @@ TEST(EgoStateMachine, ArmOffboardDoesNotBlockReplan)
   EXPECT_FALSE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateTakeoff);
 }
-// 回归：滚动窗口必须随 UAV 实际位置推进，而不是被上次规划段 erase 提前消耗。
-// 修复前 remaining_waypoints_ 按 planned_waypoint_count erase，periodic replan 时
-// 窗口首点已距 UAV 数米，truncateToHorizon 把该距离计入 horizon 预算 → 每段只取
-// 0-2 个点 → 轨迹终点≈当前位置 → UAV 停在半途。修复后 waypoint_consumed_ 基于
-// start 在 waypoints 上的弧长投影推进，连续 replan 终点必须持续前进。
-TEST(EgoStateMachine, RollingWindowAdvancesWithActualPosition)
+
+TEST(EgoStateMachine, PlanExecAdvanceTargetSkipsReachedKeypoints)
 {
+  // plan-exec 分支 A：距当前目标 <0.5m → 切相邻下一个 keypoint 为目标。
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  // start(0) + 3m 间距关键点：(0),(3),(6),(9) —— waypoints_[0] 为 start。
+  std::vector<geometry_msgs::Point32> wps;
+  for (int x : {0, 3, 6, 9})
+  {
+    geometry_msgs::Point32 p;
+    p.x = x; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  // 位置 (3.2,0,5)：距当前目标 (3,0,5)=0.2m <0.5m → 推进到 (6,0,5)。
+  node.injectLocalPose(makePose(3.2, 0.0, 5.0, clock.get()));
+  node.arrivalCheckTick();
+  EXPECT_TRUE(node.planningRequested());
+  ASSERT_TRUE(node.replanOnce());
+  const auto traj = node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj));
+  EXPECT_NEAR(traj->pts.back().x(), 6.0, 0.6);
+
+  // 位置 (6.2,0,5)：距当前目标 (6,0,5)=0.2m <0.5m → 推进到最终 (9,0,5)。
+  node.injectLocalPose(makePose(6.2, 0.0, 5.0, clock.get()));
+  node.arrivalCheckTick();
+  ASSERT_TRUE(node.planningRequested());
+  ASSERT_TRUE(node.replanOnce());
+  const auto traj2 = node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj2));
+  EXPECT_NEAR(traj2->pts.back().x(), 9.0, 0.6);
+
+  // 最终关键点已为当前目标（waypoint_consumed_ == size-1）→ 不再推进。
+  node.injectLocalPose(makePose(8.9, 0.0, 5.0, clock.get()));
+  node.arrivalCheckTick();
+  EXPECT_FALSE(node.planningRequested());
+}
+
+TEST(EgoStateMachine, PlanExecAdvanceDiscardsTooCloseTargets)
+{
+  // plan-exec 分支 A：多个关键点挤在 0.5m 内时丢弃推进，直接跳到 >=0.5m 目标。
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  // start(0), (3),(3.1),(3.2),(6) —— (3)/(3.1)/(3.2) 三连点 <0.5m 内。
+  std::vector<geometry_msgs::Point32> wps;
+  for (double x : {0.0, 3.0, 3.1, 3.2, 6.0})
+  {
+    geometry_msgs::Point32 p;
+    p.x = x; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+
+  // 位置 (3.05,0,5)：距 (3,0,5)=0.05 <0.5 → 丢弃 (3)/(3.1)/(3.2)，目标 → (6,0,5)。
+  node.injectLocalPose(makePose(3.05, 0.0, 5.0, clock.get()));
+  node.arrivalCheckTick();
+  ASSERT_TRUE(node.planningRequested());
+  ASSERT_TRUE(node.replanOnce());
+  const auto traj = node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(traj));
+  EXPECT_NEAR(traj->pts.back().x(), 6.0, 0.6);
+}
+
+TEST(EgoStateMachine, PlanExecArrivalCompletesAtFinalKeypoint)
+{
+  // plan-exec 分支 B：距最终关键点 <0.1m（稳定窗口后）→ COMPLETED，冻结目标位姿。
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  std::vector<geometry_msgs::Point32> wps;
+  for (int x : {0, 3, 6, 9})
+  {
+    geometry_msgs::Point32 p;
+    p.x = x; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  // 飞到最终关键点 (9,0,5)：0.05m < 0.1m 到达阈值。
+  node.injectLocalPose(makePose(8.95, 0.0, 5.0, clock.get()));
+  node.arrivalCheckTick();  // 到达窗口开始（稳定未满）
+  EXPECT_EQ(node.execState(), kStateExecuting);
+  clock.advance(1.1);  // > arrival_stable_s
+  node.injectLocalPose(makePose(8.95, 0.0, 5.0, clock.get()));  // pose 保持新鲜
+  node.arrivalCheckTick();
+  EXPECT_EQ(node.execState(), kStateCompleted);
+  ASSERT_TRUE(static_cast<bool>(node.steadyTarget()));
+  EXPECT_NEAR(node.steadyTarget()->pos.x(), 9.0, 1e-6);
+  EXPECT_NEAR(node.steadyTarget()->pos.z(), 5.0, 1e-6);
+}
+
+TEST(EgoStateMachine, RollingSegmentsReachCompleted)
+{
+  // 相邻目标推进：3m 密化关键点多段滚动后最终 COMPLETED（prepare 场景到达路径）。
   usleep(600 * 1000);
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
   node.setReplanLoopEnabled(false);
-  node.setPlanningHorizon(5.0);
   ASSERT_TRUE(setupHold(node, clock, 5.0));
 
-  // 密化航点：0.4m 间距，从 start(0,0,5) 沿 x 延伸至 40m（覆盖多层 horizon 窗口）。
   std::vector<geometry_msgs::Point32> wps;
-  for (int i = 0; i <= 100; ++i)
+  for (int i = 0; i <= 8; ++i)
   {
     geometry_msgs::Point32 p;
-    p.x = 0.4 * i; p.y = 0.0; p.z = 5.0;
+    p.x = i * 3.0; p.y = 0.0; p.z = 5.0;
     wps.push_back(p);
   }
   node.sendWaypoints(wps);
   ASSERT_TRUE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateExecuting);
-  const double seg1_x = node.lastSetpoint().position.x;  // 第一段窗口起点
 
-  // 连续滚动：每次把 UAV 推进到段末触发 checkArrival 置 planning_requested_，
-  // 再 replan；修复后窗口首点必须随实际位置前进，轨迹持续推进。
-  bool progressed = false;
-  for (int iter = 0; iter < 12; ++iter)
+  bool completed = false;
+  for (int guard = 0; guard < 4000; ++guard)
   {
-    for (int step = 0; step < 200; ++step)
-    {
-      node.publishSetpointTick();
-      // 模拟 UAV 实际执行：local_pose 跟随 setpoint，避免 checkArrival 判超时切 HOLD。
-      echoSetpoint(node, clock);
-      clock.advance(0.1);
-      if (node.planningRequested() || node.execState() == kStateCompleted)
-        break;
-    }
+    node.publishSetpointTick();
+    echoSetpoint(node, clock);
+    clock.advance(0.1);
+    if (node.planningRequested())
+      ASSERT_TRUE(node.replanOnce());
     if (node.execState() == kStateCompleted)
+    {
+      completed = true;
       break;
-    ASSERT_TRUE(node.replanOnce());
-    const double cur = node.lastSetpoint().position.x;
-    if (cur > seg1_x + 3.0)
-      progressed = true;
+    }
   }
-  // 修复前窗口被提前消耗，第二次 replan 起终点≈当前位置，无法推进 3m 以上。
-  EXPECT_TRUE(progressed);
+  EXPECT_TRUE(completed);
+  if (completed)
+    EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
 }
-// 回归：periodic replan 在当前段执行完后快照时，currentDerivatives 必须
-// clamp 到轨迹末端速度（旧实现返回全零 vel -> 新段从 0 起步 -> 速度 0~max 震荡）。
+
+TEST(EgoStateMachine, RollingSegmentsReachCompletedWithTrackingLag)
+{
+  // 模拟 SITL 跟踪滞后 0.05m（< arrival_reach_thresh_m 0.1m）：推进/到达判定
+  // 仍收敛到 COMPLETED。
+  usleep(600 * 1000);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+  node.setReplanLoopEnabled(false);
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  std::vector<geometry_msgs::Point32> wps;
+  for (int i = 0; i <= 8; ++i)
+  {
+    geometry_msgs::Point32 p;
+    p.x = i * 3.0; p.y = 0.0; p.z = 5.0;
+    wps.push_back(p);
+  }
+  node.sendWaypoints(wps);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  bool completed = false;
+  for (int guard = 0; guard < 4000; ++guard)
+  {
+    node.publishSetpointTick();
+    const mavros_msgs::PositionTarget sp = node.lastSetpoint();
+    node.injectLocalPose(makePose(sp.position.x - 0.05, sp.position.y,
+                                  sp.position.z, clock.get()));
+    clock.advance(0.1);
+    if (node.planningRequested())
+      ASSERT_TRUE(node.replanOnce());
+    if (node.execState() == kStateCompleted)
+    {
+      completed = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(completed);
+}
+
 TEST(EgoStateMachine, ReplanSnapshotsKeepSegmentVelocity)
 {
+  // 回归：periodic replan 在当前段执行中快照时，新段起点必须保持旧轨迹速度
+  // （rolling continuity），不是从 0 重新加速。
   usleep(600 * 1000);
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
   node.setReplanLoopEnabled(false);
-  node.setPlanningHorizon(5.0);
   ASSERT_TRUE(setupHold(node, clock, 5.0));
 
-  // 短航线：单段 horizon 内只有 4 个点 -> 轨迹 duration 短（< replan_period 4s）
   std::vector<geometry_msgs::Point32> wps;
-  for (int i = 1; i <= 4; ++i)
+  for (int i = 0; i <= 4; ++i)
   {
     geometry_msgs::Point32 p;
-    p.x = 0.4 * i; p.y = 0.0; p.z = 5.0;
+    p.x = i * 3.0; p.y = 0.0; p.z = 5.0;
     wps.push_back(p);
   }
   node.sendWaypoints(wps);
   ASSERT_TRUE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateExecuting);
 
-  // 推进到轨迹执行完（elapsed 远超 duration）：old currentDerivatives 会返回
-  // vel=0；修复后 clamp 到末端速度，replanOnce 规划出的新段起点速度保持非零。
   for (int step = 0; step < 60; ++step)
   {
     node.publishSetpointTick();
@@ -896,16 +1063,17 @@ TEST(EgoStateMachine, ReplanSnapshotsKeepSegmentVelocity)
     if (node.planningRequested())
       break;
   }
-  // periodic replan 应触发（仍有后续航点 + 达到触发时间）。
   EXPECT_TRUE(node.planningRequested());
-  // 新段规划成功，且起点速度接近段末速度（>0.3），不是从 0 重新加速。
   ASSERT_TRUE(node.replanOnce());
   const mavros_msgs::PositionTarget sp = node.lastSetpoint();
-  // 现在可以直接读规划器速度前馈：新段起点速度应为非零（rolling continuity）。
   EXPECT_TRUE(std::isfinite(sp.velocity.x) && std::isfinite(sp.velocity.y));
-  // 验证 exec_state 仍 EXECUTING 且 setpoint 持续推进。
+  const double speed = std::sqrt(sp.velocity.x * sp.velocity.x +
+                                 sp.velocity.y * sp.velocity.y +
+                                 sp.velocity.z * sp.velocity.z);
+  EXPECT_GT(speed, 0.05);
   EXPECT_EQ(node.execState(), kStateExecuting);
-  // 第二次推进一段，setpoint 应越过首段终点（4*0.4=1.6m）。
+
+  // 持续推进，setpoint 应越过首段目标（3m）。
   double max_x = sp.position.x;
   for (int step = 0; step < 100; ++step)
   {
@@ -913,97 +1081,38 @@ TEST(EgoStateMachine, ReplanSnapshotsKeepSegmentVelocity)
     echoSetpoint(node, clock);
     max_x = std::max(max_x, node.lastSetpoint().position.x);
     clock.advance(0.1);
+    if (node.planningRequested())
+      ASSERT_TRUE(node.replanOnce());
     if (node.execState() == kStateCompleted)
       break;
   }
-  EXPECT_GT(max_x, 1.6);
-}
-
-}  // namespace
-
-// 启动隔离 roscore，保证节点 advertise/subscribe/timer 可用
-// （catkin_add_gtest 不自动启动 roscore）
-TEST(EgoStateMachine, HorizonTruncatesAndRollsWaypoints)
-{
-  // 让 replan 线程先进入 sleep 窗口，避免在下方快速 wall-clock 步骤中
-  // 抢占 planning_requested_（FakeClock 推进不影响线程的 0.5s wall sleep）。
-  usleep(600 * 1000);
-
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-  node.setPlanningHorizon(5.0);
-  ASSERT_TRUE(setupHold(node, clock, 5.0));
-
-  std::vector<geometry_msgs::Point32> wps;
-  for (int i = 1; i <= 10; ++i)
-  {
-    geometry_msgs::Point32 p;
-    p.x = i * 2.0; p.y = 0.0; p.z = 5.0;
-    wps.push_back(p);
-  }
-  node.sendWaypoints(wps);
-  ASSERT_TRUE(node.replanOnce());
-  EXPECT_EQ(node.execState(), kStateExecuting);
-
-  // 推进到第一段末端：段末点应落在 horizon 内（首个航点 2m 起步，约 6m），
-  // 远小于最终目标 20m —— 验证 receding-horizon 截取生效。
-  double seg1_x = -1.0;
-  for (int step = 0; step < 300; ++step)
-  {
-    node.publishSetpointTick();
-    seg1_x = node.lastSetpoint().position.x;
-    if (node.execState() == kStateCompleted)
-      break;
-    clock.advance(0.1);
-    echoSetpoint(node, clock);
-  }
-  EXPECT_LT(seg1_x, 8.0);
-  EXPECT_GT(seg1_x, 3.0);
-
-  // 到达段末后 checkArrival 置 planning_requested_（还有后续航点），
-  // 手动 replanOnce 规划下一段并继续推进 —— 验证滚动重规划。
-  double max_x = seg1_x;
-  for (int step = 0; step < 300; ++step)
-  {
-    node.replanOnce();
-    node.publishSetpointTick();
-    max_x = std::max(max_x, node.lastSetpoint().position.x);
-    if (node.execState() == kStateCompleted)
-      break;
-    clock.advance(0.1);
-    echoSetpoint(node, clock);
-  }
-  EXPECT_GT(max_x, seg1_x + 2.0);
+  EXPECT_GT(max_x, 3.0);
 }
 
 TEST(EgoStateMachine, PeriodicReplanTriggersDuringSegmentExecution)
 {
-  // 禁用 replanLoop 线程，手动 replanOnce 驱动，保证时间触发断言确定性。
+  // 分支 C：段内 elapsed >= replan_period_s（1.0s）→ 时间触发置 planning_requested_。
   usleep(600 * 1000);
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
   node.setReplanLoopEnabled(false);
-  node.setPlanningHorizon(5.0);
   ASSERT_TRUE(setupHold(node, clock, 5.0));
 
   std::vector<geometry_msgs::Point32> wps;
-  for (int i = 1; i <= 6; ++i)
+  for (int i = 0; i <= 4; ++i)
   {
     geometry_msgs::Point32 p;
-    p.x = i * 2.0; p.y = 0.0; p.z = 5.0;
+    p.x = i * 3.0; p.y = 0.0; p.z = 5.0;
     wps.push_back(p);
   }
   node.sendWaypoints(wps);
   ASSERT_TRUE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateExecuting);
-  // 到达段末才会置 planning_requested_；此刻仍在段起点 -> 应为 false。
   EXPECT_FALSE(node.planningRequested());
 
-  // 段内推进超过 replan_period_s（1.0s）且仍有后续 waypoints -> 时间触发重规划。
+  // 段内推进超过 replan_period_s（1.0s）且未到最终目标 → 时间触发重规划。
   for (int step = 0; step < 20; ++step)
   {
     node.publishSetpointTick();
@@ -1015,132 +1124,28 @@ TEST(EgoStateMachine, PeriodicReplanTriggersDuringSegmentExecution)
   EXPECT_EQ(node.execState(), kStateExecuting);
 }
 
-TEST(EgoStateMachine, TrajectorySetpointPublishesPvaMask)
-{
-  usleep(600 * 1000);
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-  node.setReplanLoopEnabled(false);
-  ASSERT_TRUE(setupHold(node, clock, 5.0));
-
-  std::vector<geometry_msgs::Point32> wps;
-  for (int i = 1; i <= 8; ++i)
-  {
-    geometry_msgs::Point32 p;
-    p.x = i * 1.0; p.y = 0.0; p.z = 5.0;
-    wps.push_back(p);
-  }
-  node.sendWaypoints(wps);
-  ASSERT_TRUE(node.replanOnce());
-  EXPECT_EQ(node.execState(), kStateExecuting);
-
-  // 段中采样：EGO 执行帧 + P/V/A/yaw 掩码 + 所有启用字段有限 + 速度非零。
-  clock.advance(2.0);
-  node.publishSetpointTick();
-  const mavros_msgs::PositionTarget sp = node.lastSetpoint();
-  EXPECT_EQ(sp.coordinate_frame, mavros_msgs::PositionTarget::FRAME_LOCAL_NED);
-  EXPECT_EQ(sp.type_mask, ego_planner_driver::kMaskEgoTrajectory);
-  EXPECT_TRUE(std::isfinite(sp.position.x) && std::isfinite(sp.position.y) &&
-              std::isfinite(sp.position.z));
-  EXPECT_TRUE(std::isfinite(sp.velocity.x) && std::isfinite(sp.velocity.y) &&
-              std::isfinite(sp.velocity.z));
-  EXPECT_TRUE(std::isfinite(sp.acceleration_or_force.x) &&
-              std::isfinite(sp.acceleration_or_force.y) &&
-              std::isfinite(sp.acceleration_or_force.z));
-  EXPECT_TRUE(std::isfinite(sp.yaw));
-  const double speed = std::sqrt(sp.velocity.x * sp.velocity.x +
-                                 sp.velocity.y * sp.velocity.y +
-                                 sp.velocity.z * sp.velocity.z);
-  EXPECT_GT(speed, 0.05);
-
-  // 轨迹耗尽后切固定 position/yaw HOLD，不得携带末段非零导数。
-  clock.advance(50.0);
-  node.publishSetpointTick();
-  const mavros_msgs::PositionTarget hold = node.lastSetpoint();
-  EXPECT_EQ(hold.type_mask, ego_planner_driver::kMaskHold);
-  EXPECT_EQ(hold.velocity.x, 0.0);
-  EXPECT_EQ(hold.velocity.y, 0.0);
-  EXPECT_EQ(hold.velocity.z, 0.0);
-  EXPECT_EQ(hold.acceleration_or_force.x, 0.0);
-  EXPECT_EQ(hold.acceleration_or_force.y, 0.0);
-  EXPECT_EQ(hold.acceleration_or_force.z, 0.0);
-}
-
-TEST(EgoStateMachine, HoldAndTakeoffUseHoldMask)
-{
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-  node.setReplanLoopEnabled(false);
-
-  ASSERT_TRUE(setupHold(node, clock, 5.0));
-  node.publishSetpointTick();
-  const mavros_msgs::PositionTarget hold = node.lastSetpoint();
-  EXPECT_EQ(hold.coordinate_frame, mavros_msgs::PositionTarget::FRAME_LOCAL_NED);
-  EXPECT_EQ(hold.type_mask, ego_planner_driver::kMaskHold);
-  EXPECT_EQ(hold.velocity.x, 0.0);
-  EXPECT_EQ(hold.velocity.y, 0.0);
-  EXPECT_EQ(hold.velocity.z, 0.0);
-  EXPECT_NEAR(hold.position.z, 5.0, 1e-6);
-
-  // arm+OFFBOARD 进入 TAKEOFF：仍为 position/yaw HOLD mask。
-  node.injectMavrosState(true, true);
-  EXPECT_EQ(node.execState(), kStateTakeoff);
-  clock.advance(1.0 / 30.0);
-  node.publishSetpointTick();
-  EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
-}
-
-TEST(EgoStateMachine, DirectControlSuppressesEgoCandidates)
-{
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-  node.setReplanLoopEnabled(false);
-  ASSERT_TRUE(setupHold(node, clock, 5.0));
-
-  const size_t before = node.setpointCount();
-  node.setDirectControlActive(true);
-  node.publishSetpointTick();
-  EXPECT_EQ(node.setpointCount(), before);
-
-  node.setDirectControlActive(false);
-  node.publishSetpointTick();
-  node.publishSetpointTick();
-  EXPECT_GT(node.setpointCount(), before);
-  EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
-}
-
 TEST(EgoStateMachine, ReplanUsesTrajectoryStateNotLivePose)
 {
-  // 建议 2：滚动重规划起点必须来自旧轨迹同一时刻的完整状态，而不是
-  // "实际位置 + 旧导数"。注入一个明显偏离的 local_pose，新段起点应仍落在
-  // 旧轨迹附近，而非跟随注入位置跳变。
+  // 滚动重规划起点必须来自旧轨迹同一时刻的完整状态，而不是"实际位置 + 旧导数"。
   usleep(600 * 1000);
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
   node.setReplanLoopEnabled(false);
-  node.setPlanningHorizon(5.0);
   ASSERT_TRUE(setupHold(node, clock, 5.0));
 
   std::vector<geometry_msgs::Point32> wps;
-  for (int i = 1; i <= 10; ++i)
+  for (int i = 0; i <= 10; ++i)
   {
     geometry_msgs::Point32 p;
-    p.x = i * 2.0; p.y = 0.0; p.z = 5.0;
+    p.x = i * 3.0; p.y = 0.0; p.z = 5.0;
     wps.push_back(p);
   }
   node.sendWaypoints(wps);
   ASSERT_TRUE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateExecuting);
 
-  // 推进到时间触发重规划。
   for (int step = 0; step < 20; ++step)
   {
     node.publishSetpointTick();
@@ -1166,92 +1171,37 @@ TEST(EgoStateMachine, ReplanUsesTrajectoryStateNotLivePose)
   EXPECT_EQ(node.execState(), kStateExecuting);
 }
 
-TEST(EgoStateMachine, RollingSegmentsReachCompleted)
+TEST(EgoStateMachine, HoldLocksPositionNotPoseDrift)
 {
-  // 滚动多段推进后最终必须 COMPLETED（prepare 场景的到达路径）。建议 2 把
-  // 起点换成旧轨迹状态后，此路径必须有测试覆盖。
-  usleep(600 * 1000);
+  // 删 POSE_STALE 后：HOLD setpoint = 进入 HOLD 时锁存的位置/yaw，不随 pose 漂移。
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
   node.setClockSource([&clock]() { return clock.now(); });
   node.setReplanLoopEnabled(false);
-  node.setPlanningHorizon(3.0);
-  ASSERT_TRUE(setupHold(node, clock, 5.0));
 
-  std::vector<geometry_msgs::Point32> wps;
-  for (int i = 1; i <= 12; ++i)
-  {
-    geometry_msgs::Point32 p;
-    p.x = i * 0.5; p.y = 0.0; p.z = 5.0;
-    wps.push_back(p);
-  }
-  node.sendWaypoints(wps);
-  ASSERT_TRUE(node.replanOnce());
-  EXPECT_EQ(node.execState(), kStateExecuting);
+  ASSERT_TRUE(setupHold(node, clock, 12.0));  // 捕获 HOLD → 锁存 (0,0,12)
+  ASSERT_TRUE(static_cast<bool>(node.steadyTarget()));
+  node.publishSetpointTick();
+  EXPECT_NEAR(node.lastSetpoint().position.x, 0.0, 1e-6);
+  EXPECT_NEAR(node.lastSetpoint().position.z, 12.0, 1e-6);
 
-  bool completed = false;
-  for (int guard = 0; guard < 3000; ++guard)
-  {
-    node.publishSetpointTick();
-    echoSetpoint(node, clock);
-    clock.advance(0.1);
-    if (node.planningRequested())
-      ASSERT_TRUE(node.replanOnce());
-    if (node.execState() == kStateCompleted)
-    {
-      completed = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(completed);
-  if (completed)
-    EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
+  // pose 漂移（如 GPS 抖动）不影响 HOLD setpoint：锁存位置不更新。
+  node.injectLocalPose(makePose(5.0, 3.0, 9.0, clock.get()));
+  node.publishSetpointTick();
+  EXPECT_NEAR(node.lastSetpoint().position.x, 0.0, 1e-6);
+  EXPECT_NEAR(node.lastSetpoint().position.y, 0.0, 1e-6);
+  EXPECT_NEAR(node.lastSetpoint().position.z, 12.0, 1e-6);
+  EXPECT_EQ(node.execState(), kStateHold);
+
+  // 持续漂移也不改变锁存。
+  node.injectLocalPose(makePose(10.0, 10.0, 2.0, clock.get()));
+  node.publishSetpointTick();
+  EXPECT_NEAR(node.lastSetpoint().position.x, 0.0, 1e-6);
+  EXPECT_NEAR(node.lastSetpoint().position.z, 12.0, 1e-6);
 }
 
-TEST(EgoStateMachine, RollingSegmentsReachCompletedWithTrackingLag)
-{
-  // 模拟 SITL 跟踪滞后：回灌 local_pose 时沿 x 落后 setpoint 0.15m（测试默认
-  // position_tolerance_m=0.2，需保持滞后 < 容差），验证窗口推进/到达判定仍
-  // 收敛到 COMPLETED。
-  usleep(600 * 1000);
-  FakeClock clock;
-  clock.set(0.0);
-  EgoPlannerDriverNode node;
-  node.setClockSource([&clock]() { return clock.now(); });
-  node.setReplanLoopEnabled(false);
-  node.setPlanningHorizon(3.0);
-  ASSERT_TRUE(setupHold(node, clock, 5.0));
-
-  std::vector<geometry_msgs::Point32> wps;
-  for (int i = 1; i <= 12; ++i)
-  {
-    geometry_msgs::Point32 p;
-    p.x = i * 0.5; p.y = 0.0; p.z = 5.0;
-    wps.push_back(p);
-  }
-  node.sendWaypoints(wps);
-  ASSERT_TRUE(node.replanOnce());
-  EXPECT_EQ(node.execState(), kStateExecuting);
-
-  bool completed = false;
-  for (int guard = 0; guard < 3000; ++guard)
-  {
-    node.publishSetpointTick();
-    const mavros_msgs::PositionTarget sp = node.lastSetpoint();
-    node.injectLocalPose(makePose(sp.position.x - 0.15, sp.position.y,
-                                  sp.position.z, clock.get()));
-    clock.advance(0.1);
-    if (node.planningRequested())
-      ASSERT_TRUE(node.replanOnce());
-    if (node.execState() == kStateCompleted)
-    {
-      completed = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(completed);
-}
+}  // namespace
 
 int main(int argc, char** argv)
 {

@@ -18,6 +18,8 @@ struct YieldCandidateConfig
   double clearance_factor = 1.3;
   double lateral_max_m = 2.0;   // LEFT/RIGHT 峰值横向偏移上限
   double slow_min_scale = 0.3;  // SLOW 最低时间缩放（速度 ×scale，时长 ÷scale）
+  // 档位（implementation_plan_26082621 §6）：
+  //   SLOW：scale {0.5, 0.3}；LEFT/RIGHT：lateral {1.0, 1.5, 2.0} × scale {0.7, 0.5}。
   double max_velocity_mps = 1.5;
   double max_acceleration_mps2 = 6.0;
   double hovering_velocity_mps = 0.1;  // 邻机末速 < 该值判"近似悬停"→ 跳过 SLOW

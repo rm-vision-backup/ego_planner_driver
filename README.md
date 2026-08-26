@@ -13,7 +13,7 @@
 
 | Topic | 类型 | 方向 |
 |---|---|---|
-| `exec_state` | `std_msgs/String`（latched） | 出：`HOLD`（初始）/`TAKEOFF`/`EXECUTING`/`COMPLETED`/`POSE_STALE`/`EGO_PLAN_FAILED`/`EGO_EXEC_TIMEOUT`（`IDLE` 常量保留但不再作为初始态） |
+| `exec_state` | `std_msgs/String`（latched） | 出：`HOLD`（初始）/`TAKEOFF`/`EXECUTING`/`COMPLETED`/`EGO_PLAN_FAILED`/`EGO_EXEC_TIMEOUT`/`EMERGENCY_BRAKE`/`BRAKE_HOLD`（26082621 删 `POSE_STALE`，HOLD 锁存位置） |
 | `setpoint/ego` | `mavros_msgs/PositionTarget` | 出：30 Hz 候选命令（`FRAME_LOCAL_NED`，业务字段 ROS ENU；`setpoint_relay` 独占转发 `/mavros/setpoint_raw/local`） |
 | `trajectory_intent` | `swarm_uav_interfaces/UavTrajectoryIntent` | 出：本机带时轨迹 |
 | `goal` | `geometry_msgs/PointStamped` | 入：单点目标 |
@@ -46,11 +46,21 @@
   `collisionCheckTick`（本机 `current_` vs fresh 邻机轨迹 <1m → 请求 replan），接收邻机 intent
   的事件驱动 replan 已删除（作用重复，备用记录见计划 §5）。监督层 `SafetyPredictor` 动态
   EMERGENCY 门槛、GPS bias 修正与旧 1m 门禁保留。
-- 机间让路候选（26082602 §10）：`collisionCheckTick` 检测冲突（min_clear < 1.3×clearance）→
-  right-of-way（低 ID STAND_ON 保持、高 ID YIELD）→ YIELD 生成 **SLOW/LEFT/RIGHT** 候选，
-  cost = ΔT/T_nominal + dev/2.0 最小者提交发布；SLOW 时间缩放 `[0.3,1.0]`（悬停前机跳过）、
-  LEFT/RIGHT 横向 C2 偏移（峰值 ≤2.0m，时间轴不变，横向机动速度 ≤0.4m/s）。SafetyPredictor
-  只留 EMERGENCY（先重规划再急停）。
+- **plan-exec 循环重构（26082621）**：上层 `EgoSwarmDriver` 把分层关键点按 **3m 间距**密化后
+  发布 `/waypoints`；C++ 任务航点 = **相邻下一个 keypoints(n+1)**（替换 horizon 窗口滚动）。
+  执行循环每 tick 三分支：①推进（距当前目标 <0.5m → 切下一关键点，<0.5m 丢弃、3.5m 上限）、
+  ②到达（距最终关键点 <0.1m → COMPLETED）、③定时 replan（elapsed ≥1.0s → 置位唤醒）。
+- **单一 replan 入口（26082621 方案 A）**：1s 定时 / 10Hz 冲突 / 推进 / EMERGENCY 事件**全部
+  只置位**（`planning_requested_`/`emergency_pending_`）并唤醒 replanLoop（条件变量，1s 超时
+  兜底）；replanLoop → `replanOnce()` 是**唯一轨迹提交者**（常规 replan / 候选 / 制动）。
+- **EMERGENCY 制动走 replan（26082621 方案 Y）**：监督层检测 EMERGENCY 只置
+  `emergency_pending_`（记录 primary peer + ttc）；replan 线程在"常规 replan 失败且
+  ttc < `emergency_replan_time_s`(1.0s)"时提交受约束制动（EMERGENCY_BRAKE → BRAKE_HOLD），
+  否则收口 PLAN_FAILED。监督回调不再直接改轨迹。
+- **机间让路候选（26082621 §6，replan 失败分支）**：right-of-way（低 ID STAND_ON 保持、高 ID
+  YIELD 生成候选）+ **SLOW scale {0.5,0.3} / LEFT-RIGHT lateral {1.0,1.5,2.0}×scale {0.7,0.5}**
+  （plateau 偏移覆盖重叠全程 + C2 过渡），min_clear ≥1.3×clearance，cost=ΔT/T+dev/1.5；
+  候选**只**在 `replanOnce()` 常规规划失败分支生成（10Hz 独立提交已删除）。
 
 ## 预测安全监督（26082500 阶段 A）
 
@@ -58,9 +68,10 @@
   CPA、首次越过 1m 的 TTC 及动态两级距离门槛（反应时间**不含 data_age**——邻机轨迹激活时刻已由
   GPS bias 修正到本机时间轴，同刻采样即预测；age 仅诊断，防止发布频率降低后门槛被放大误触发）；
   预测窗不足显式输出 `INSUFFICIENT_DATA`。
-- EMERGENCY 处理对齐原版 `planFromCurrentTraj` 优先：先尝试立即重规划（成功则继续执行），失败且
-  预测越界时间 `ttc < emergency_replan_time_s`(1.0s) 才触发受约束制动，否则交常规 replanLoop。
-- 数字身份取末尾数字；低 ID=`STAND_ON`、高 ID=`YIELD`，非法或重复数字=`UNKNOWN`。
+- EMERGENCY 处理走 replan 线程（26082621 方案 Y）：监督回调只置 `emergency_pending_` 唤醒
+  replanLoop；replan 线程先尝试常规重规划（成功则继续执行），失败且预测越界时间
+  `ttc < emergency_replan_time_s`(1.0s) 才提交受约束制动，否则收口 PLAN_FAILED。
+  数字身份取末尾数字；低 ID=`STAND_ON`、高 ID=`YIELD`，非法或重复数字=`UNKNOWN`。
 - `SafetyLogger` 使用有界队列和单写线程。默认覆盖写
   `/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner/UAVn-ego-planner.log`；安全 timer
   不做同步磁盘 IO。目录和队列容量可由 launch 参数覆盖。
@@ -97,8 +108,9 @@
 
 ## min-snap 统一单段重构（26082415）
 
-- 上层 `EgoSwarmDriver` 把分层关键点（start + 层点 + 弓字转折 + 目标）按最大 **2m** 间距密化后
-  发布 `/waypoints`；**2m 密化点只用于窗口推进（`advanceConsumed`）/末点参考，不进 B-spline**。
+- 上层 `EgoSwarmDriver` 把分层关键点（start + 层点 + 弓字转折 + 目标）按最大 **3m** 间距密化后
+  发布 `/waypoints`；**3m 密化关键点只用于相邻目标推进（plan-exec 分支 A）/末点参考，不进
+  B-spline**。任务航点 = 相邻下一个 keypoints(n+1)。
 - `planOnce` 用原版 `one_segment_traj_gen`（单段五次多项式闭式解，min-snap）生成初始轨迹：
   起点=旧轨迹 P/V/A（滚动连续性），end_vel=末点切向 × min(`cruise_velocity`, `max_vel`)，
   end_acc=0，仅最终段 end_vel=0；段时长 T 用梯形速度估计（v0 投影，加速-匀速-减速）。

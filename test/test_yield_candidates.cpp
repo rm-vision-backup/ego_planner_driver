@@ -74,9 +74,10 @@ TEST(YieldCandidates, SlowScalesTimeAndPreservesGeometry)
     if (c.type != YieldCandidate::Type::SLOW)
       continue;
     saw_slow = true;
-    // pts 几何不变（x 等距推进，y 保持 0），时间轴 ×1/scale（scale=0.7 → ~1.43×）。
+    // pts 几何不变（x 等距推进，y 保持 0），时间轴 ×1/scale（档位 {0.5,0.3}；
+    // slow_min_scale=0.5 → 最低档被钳到 0.5 → duration = 10/0.5 = 20s）。
     ASSERT_EQ(c.trajectory.pts.size(), current.pts.size());
-    EXPECT_NEAR(c.trajectory.duration, 14.3, 0.5);
+    EXPECT_NEAR(c.trajectory.duration, 20.0, 0.5);
     for (size_t i = 0; i < current.pts.size(); ++i)
     {
       EXPECT_NEAR(c.trajectory.pts[i].x(), current.pts[i].x(), 1e-6);
