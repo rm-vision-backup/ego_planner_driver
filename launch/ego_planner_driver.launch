@@ -6,6 +6,7 @@
        （backend 任务协议 / identity map）使用 A01-A15，由 executor 层映射。 -->
   <arg name="uav_id" default="UAV1"/>
   <arg name="exec_target" default="UAV1"/>
+  <arg name="safety_supervisor_mode" default="active"/>
 
   <!-- 身份参数放全局（/uav_id、/exec_target），供 EgoSwarmDriver 与 bridge 发现。 -->
   <param name="uav_id" value="$(arg uav_id)"/>
@@ -51,9 +52,9 @@
     <param name="exec_timeout_margin_s" value="5.0"/>
     <param name="takeoff_height_m" value="5.0"/>
     <param name="takeoff_ascend_speed" value="1.0"/>
-    <!-- Stage A: predictive supervisor records decisions only. No state,
-         trajectory, intent, or setpoint behavior changes in shadow mode. -->
-    <param name="safety_supervisor_mode" value="shadow"/>
+    <!-- 监督层默认 active，接入重规划/制动兜底；需要仅记录诊断且不改变
+         状态、轨迹、intent 或 setpoint 行为时，可显式传入 shadow。 -->
+    <param name="safety_supervisor_mode" value="$(arg safety_supervisor_mode)"/>
     <param name="safety_supervisor_rate_hz" value="25.0"/>
     <!-- 周期碰撞检查：10Hz，本机轨迹 vs fresh 邻机轨迹，< 固定 clearance → replan
          （implementation_plan_26082602；intent 生成即发，无周期 5Hz 刷新）。 -->

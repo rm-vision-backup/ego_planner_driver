@@ -126,7 +126,8 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 
 - `calcSwarmCost`：固定 `swarm_clearance×2`=1m 软惩罚（26082602 解耦 data_age/动态门槛）。
   软惩罚椭球为**对称 1m 球**（`kSwarmA=kSwarmB=1.0`，水平=垂直=1m），与原版 `a=2.0,b=1.0`
-  椭圆不同——当前按 CONTEXT「机间最小距离」规约（水平 1m / 垂直 2m 由执行层门禁实施）。
+  椭圆不同。执行层运行时门禁同样采用 1m 三维球，但基于当前 fresh odom；规划层硬门则按轨迹时间轴对
+  intent 同刻采样，二者数值/几何相同、时间语义不同。
 - `checkClearance`：提交前固定 1m 硬门（对全部采样点）。
 - 预测能力来自**同刻采样 + GPS bias 时间戳修正**（`T_own = T_other - bias_other + bias_own`），
   不来自 intent 年龄。intent 生成即发（提交时发布，`stamp`=激活 epoch，`traj_id` 递增），
@@ -143,7 +144,7 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
   "常规 replan 失败且 ttc < `emergency_replan_time_s`(1.0s)" 时提交，监督回调不改轨迹。
 - `level==WARNING`：仅写日志（交规划层软惩罚绕开）。
 - `safety_supervisor_mode`：`off`（关闭）/ `shadow`（仅诊断日志，不改行为）/ `active`（接制动兜底）。
-  launch 默认 `shadow`；`startup_ego_sitl.sh` 机载层统一以 `active` 启动。
+  正式 launch 与裸节点参数缺省均为 `active`；需要仅观测或关闭时可显式设置 `shadow` / `off`。
 - `SafetyLogger` 有界队列 + 单写线程，覆盖写
   `/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner/UAVn-ego-planner.log`。
 
@@ -178,7 +179,7 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 | `takeoff_height_m` / `takeoff_ascend_speed` | 5.0 / 1.0 | 软起飞高度 / 上升速度 |
 | `collision_check_rate_hz` | 10.0 | 周期碰撞检查频率 |
 | `bias_valid_s` | 120.0 | GPS bias 新鲜窗口 |
-| `safety_supervisor_mode` / `safety_supervisor_rate_hz` | shadow / 25.0 | 监督模式 / 频率 |
+| `safety_supervisor_mode` / `safety_supervisor_rate_hz` | active / 25.0 | 监督模式 / 频率；可显式设为 shadow / off |
 | `protected_distance_m` | 1.0 | EMERGENCY 物理距离 |
 | `emergency_ttc_s` / `emergency_replan_time_s` | 1.5 / 1.0 | EMERGENCY ttc / 制动前重规划窗口 |
 | `emergency_decel_mps2` / `emergency_max_velocity_mps` / `emergency_jerk_mps3` | 2.0 / 1.5 / 8.0 | 制动动力学 |
@@ -194,8 +195,9 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 ## 安全与验证
 
 - C++ 节点不 arm、不切 OFFBOARD，也不因 arm+OFFBOARD 自动起飞之外的动作改变飞行。
-- 规划结果提交前硬 clearance 校验；监督 EMERGENCY 与执行层运行时距离门禁
-  （`EgoSwarmDriver._distance_safe`，水平 <1.0m 且垂直 <2.0m → 本机 HOLD）兜底。
+- 规划结果提交前执行 1m 三维球硬 clearance 校验；执行层运行时门禁基于当前 fresh odom 的三维中心距
+  `<1.0m` 触发本机 HOLD。二者数值/几何相同，但前者按轨迹时间轴预测采样、后者检查当前测量；
+  SafetyPredictor 在 `≤1.0m`（并结合 TTC）即判 EMERGENCY，边界判定仍更保守。
 - 全量自动测试 0 failure（含单 Master 冒烟生命周期、状态机、轨迹、候选、监督、制动）。
 
 ## 环境变量（ROS 日志重定向）

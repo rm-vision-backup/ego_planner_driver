@@ -284,9 +284,17 @@ TEST(EgoPlannerCore, FixedClearanceHardGateRejectsIntrudingNeighbor)
 
   // 0.5m 侵入邻机：直线轨迹穿 1m 硬门 → planOnce 必须失败（固定 clearance 硬门）。
   EXPECT_FALSE(core.planOnce(start, waypoints, {intruding}, traj, cost, start_vel));
-  // 硬门校验本身按固定 swarm_clearance×2 拒绝侵入轨迹。
-  EXPECT_FALSE(core.checkClearance(baseline, {intruding},
+  // 1m 开边界与 executor runtime gate 一致：0.99m 拒绝，恰好 1.0m 通过。
+  NeighborTrajectory near_boundary = intruding;
+  NeighborTrajectory exact_boundary = intruding;
+  for (auto& p : near_boundary.pts)
+    p.y() = 0.99;
+  for (auto& p : exact_boundary.pts)
+    p.y() = 1.0;
+  EXPECT_FALSE(core.checkClearance(baseline, {near_boundary},
                                    config.swarm_clearance * 2.0));
+  EXPECT_TRUE(core.checkClearance(baseline, {exact_boundary},
+                                  config.swarm_clearance * 2.0));
 }
 
 TEST(EgoPlannerCore, TimedTrajectorySamplesPvaConsistently)

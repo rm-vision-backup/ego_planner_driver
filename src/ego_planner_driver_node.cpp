@@ -113,7 +113,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   takeoff_ascend_speed_ = pnh_.param("takeoff_ascend_speed", 1.0);
 
   safety_supervisor_mode_ = pnh_.param(
-      "safety_supervisor_mode", std::string("off"));
+      "safety_supervisor_mode", std::string("active"));
   safety_supervisor_rate_hz_ = pnh_.param("safety_supervisor_rate_hz", 25.0);
   safety_config_.protected_distance_m = pnh_.param("protected_distance_m", 1.0);
   safety_config_.prediction_horizon_s = pnh_.param("safety_prediction_horizon_s", 5.0);

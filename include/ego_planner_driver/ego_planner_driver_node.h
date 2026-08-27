@@ -256,7 +256,7 @@ private:
   int activation_replan_attempts_ = 3;
   bool direct_control_active_ = false;
   volatile bool replan_loop_enabled_ = true;
-  std::string safety_supervisor_mode_ = "off";
+  std::string safety_supervisor_mode_ = "active";
   double safety_supervisor_rate_hz_ = 25.0;
   double episode_release_hysteresis_s_ = 1.0;
   SafetyPredictorConfig safety_config_;
