@@ -666,6 +666,32 @@ TEST(EgoStateMachine, GpsBiasCorrectsNeighborIntentEpoch)
   EXPECT_NEAR(node.neighborStartTimeForTest("UAV2"), 221.0, 1e-6);
 }
 
+TEST(EgoStateMachine, MissingOneGpsBiasFallsBackToUncorrectedEpoch)
+{
+  FakeClock clock;
+  clock.set(100.0);
+
+  {
+    EgoPlannerDriverNode node;
+    node.setReplanLoopEnabled(false);
+    node.setClockSource([&clock]() { return clock.now(); });
+    ASSERT_TRUE(setupHold(node, clock, 5.0));
+    node.injectOwnBias(2.0);
+    ASSERT_TRUE(node.injectNeighborIntent(makeIntent(100.0, 1, "UAV2")));
+    EXPECT_NEAR(node.neighborStartTimeForTest("UAV2"), 100.0, 1e-6);
+  }
+
+  {
+    EgoPlannerDriverNode node;
+    node.setReplanLoopEnabled(false);
+    node.setClockSource([&clock]() { return clock.now(); });
+    ASSERT_TRUE(setupHold(node, clock, 5.0));
+    node.injectPeerBias("UAV2", 3.0);
+    ASSERT_TRUE(node.injectNeighborIntent(makeIntent(100.0, 1, "UAV2")));
+    EXPECT_NEAR(node.neighborStartTimeForTest("UAV2"), 100.0, 1e-6);
+  }
+}
+
 TEST(EgoStateMachine, NeighborIntentValidationAndSequenceReset)
 {
   FakeClock clock;
