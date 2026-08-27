@@ -1121,7 +1121,7 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
     return;
   }
   // plan-exec 分支 A/B（每 tick）：推进（距当前目标 <0.5m 切下一 keypoint）与
-  // 到达（距最终关键点 <0.1m → COMPLETED）。推进时置 planning_requested_ 并
+  // 到达（距最终关键点 <0.2m → COMPLETED）。推进时置 planning_requested_ 并
   // 事件唤醒 replanLoop（单一入口）。
   if (exec_state_ == kStateExecuting && !emergency_braking_)
     checkArrival(current_->pts.back(), current_->yaw.back(), now);
@@ -1298,7 +1298,7 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
   const Eigen::Vector3d cur(local_pose_->pose.position.x,
                             local_pose_->pose.position.y,
                             local_pose_->pose.position.z);
-  // 分支 B：到达（||pos - 最终 keypoints|| < arrival_reach_thresh_m_ 0.1m）
+  // 分支 B：到达（||pos - 最终 keypoints|| < arrival_reach_thresh_m_ 0.2m）
   // → COMPLETED，冻结最终关键点位姿为 setpoint（executor 判成功；后续 HOLD/
   // 新目标由 onHold/onGoal 正常接管）。
   if (!waypoints_.empty() &&
@@ -1354,7 +1354,8 @@ void EgoPlannerDriverNode::runCollisionCheckTick()
   const ros::Time now = nowFunc();
   const double base = plan_start_.toSec();
 
-  // 冲突检测：current_ vs 全部 fresh 邻机同刻最小距离（门槛 1.3×clearance）。
+  // 冲突检测：current_ vs 全部 fresh 邻机同刻最小距离（门槛 1.2×clearance，
+  // yield_clearance_factor=1.2）。
   // 单一 replan 入口（方案 A）：检测到冲突只置 planning_requested_ + 唤醒
   // replanLoop；候选生成/提交/制动全部由 replan 线程统一处理（提交唯一化）。
   double min_clear = std::numeric_limits<double>::infinity();

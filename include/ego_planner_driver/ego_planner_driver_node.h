@@ -205,7 +205,7 @@ private:
   bool isPeerHovering(const NeighborTrajectory& nb) const;
   // 方案 A（§10 扩展）：replanOnce 规划失败（safe_candidate=false）时尝试让路候选：
   // SLOW 降 cruise_velocity / LEFT/RIGHT waypoints 横向偏移后重试 planOnce，
-  // 验证 min_clear ≥ 1.3×clearance，cost 最小者提交。成功返回 true。
+  // 验证 min_clear ≥ 1.2×clearance，cost 最小者提交。成功返回 true。
   struct ReplanSnapshot
   {
     GoalPoint start;
@@ -287,8 +287,8 @@ private:
   double plan_fail_timeout_s_ = 10.0;
   ros::Time plan_fail_since_;  // 首次失败时刻（isZero = 当前不在软着陆失败中）
   // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，implementation_plan_26082602 §10）：
-  // collisionCheckTick 检测冲突（min_clear < 1.3×clearance）→ 本机 YIELD（ID 小于
-  // primary peer）生成候选，cost 最小者提交发布；STAND_ON 交常规 replan。
+  // collisionCheckTick 检测冲突（min_clear < 1.2×clearance，yield_clearance_factor=1.2）
+  // → 本机 YIELD（ID 小于 primary peer）生成候选，cost 最小者提交发布；STAND_ON 交常规 replan。
   YieldCandidateConfig yield_config_;
   std::unique_ptr<YieldCandidateGenerator> yield_generator_;
   bool enable_yield_candidates_ = false;
