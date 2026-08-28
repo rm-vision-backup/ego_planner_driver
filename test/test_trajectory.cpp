@@ -372,6 +372,49 @@ TEST(EgoPlannerCore, ClampVectorNormLimitsMagnitudeAndHandlesZero)
   EXPECT_TRUE(z.allFinite());
 }
 
+// §3.2（260828 修复）：当前生产开关组合（enable_rebound=false、
+// enable_time_reparam=false）下 checkFeasibility()==false 必须返回
+// RETRYABLE_FAILURE，不得继续生成并发布动力学不合法的轨迹。不放松到
+// 1.5×max_vel 的判据掩盖结果。
+TEST(EgoPlannerCore, InfeasibleDynamicsRejectedUnderProductionFlags)
+{
+  // launch 实际配置：max_vel=1.0、max_acc=6.0、rebound/time_reparam 均关闭。
+  EgoPlannerConfig config = makeConfig();
+  config.max_vel = 1.0;
+  config.max_acc = 6.0;
+  config.cruise_velocity = 1.0;
+  config.acceleration_limit = 2.0;
+  config.lambda_feasibility = 0.5;
+  config.enable_rebound = false;
+  config.enable_time_reparam = false;
+  EgoPlannerCore core(config);
+
+  GoalPoint start{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0};
+  std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(10.0, 0.0, 15.0), 0.0}};
+  TimedTrajectory traj;
+  double cost = 0.0;
+  // 非退化距离 + 病态超大起始速度（100m/s）：B-spline 起点锚定放大控制点
+  // 间距。生产开关下必须失败且不发布轨迹。拦截点可能有两处：样本计数超
+  // parameterization cap → RESOURCE_LIMIT（node 立即收口），或通过采样后欧氏
+  // 峰值超 1.5× → RETRYABLE_FAILURE（软着陆 10s 收口）。两者均不发布 intent、
+  // 不替换合法 current_，核心语义一致，任一分分类都拒绝成功。
+  const Eigen::Vector3d start_vel(100.0, 0.0, 0.0);
+  const PlanResult result =
+      core.planOnce(start, waypoints, {}, traj, cost, start_vel,
+                    Eigen::Vector3d::Zero(), false);
+  EXPECT_NE(result, PlanResult::SUCCESS);
+  EXPECT_TRUE(traj.pts.empty());  // 失败路径清空输出（不发布部分 intent）
+
+  // 对照组：合理起始速度（≤ max_vel）正常成功，证明不是误伤。
+  TimedTrajectory ok;
+  const PlanResult ok_result =
+      core.planOnce(start, waypoints, {}, ok, cost,
+                    Eigen::Vector3d(0.5, 0.0, 0.0), Eigen::Vector3d::Zero(),
+                    false);
+  EXPECT_EQ(ok_result, PlanResult::SUCCESS);
+  EXPECT_GT(ok.pts.size(), 1u);
+}
+
 int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);

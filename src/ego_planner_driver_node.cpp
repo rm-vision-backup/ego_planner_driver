@@ -359,13 +359,21 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
     // 已锁存 steady_target_ 也放行定时重试（否则 HOLD 状态首轮失败无法恢复/无法
     // 在 10s 超时后收口）；成功提交后 plan_fail_since_ 清空恢复拦截语义。
     if ((!timed_trigger && !planning_requested_ && !emergency_pending_) ||
-        !pending_goal_ || (steady_target_ && plan_fail_since_.isZero()))
+        !pending_goal_ ||
+        // §3.1：退化等待中（arrival_pending_）steady_target_ 可能被 HOLD 捕获
+        // 锁存，必须放行定时补判，否则同点目标永远停在 HOLD。
+        (steady_target_ && plan_fail_since_.isZero() && !arrival_pending_))
       return false;
     planning_requested_ = false;
     const ros::Time now = nowFunc();
     if (!local_pose_ || !local_pose_stamp_ ||
         (now - *local_pose_stamp_).toSec() > pose_timeout_)
       return false;  // pose 过期跳过本轮（无 POSE_STALE；pose 恢复后周期触发重试）
+    // §3.1（260828 修复）：snapshot 前先用 fresh odometry 处理 target 推进与
+    // 最终到达（覆盖无 current_ 的首轮规划/退化等待场景）。真实到达最终关键点
+    // → COMPLETED 收口；稳定窗口未满则等待 1s 定时补判。
+    if (handleArrivalBeforeSnapshotLocked(now))
+      return true;
     ReplanSnapshot data;
     data.now = now;
     data.safety_generation = safety_generation_;
@@ -434,12 +442,30 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
     }
     if (plan_result == PlanResult::DEGENERATE_SEGMENT)
     {
-      // §5.2/§9.4：planned start 到当前 target 方向退化。不提交新轨迹、不清
-      // 失败计时、不改状态；保留现有 current_ 及末端 P/V/A，等待真实 odometry
-      // 进入推进/到达门槛。返回 false 且不启动 plan_fail_since_。
-      ROS_DEBUG_THROTTLE(1.0, "[%s] degenerate segment; keeping current trajectory",
-                         uav_id_.c_str());
-      return false;
+      // §5.2/§9.4 首次退化（无失败计时）：planned start 到当前 target 方向退化。
+      // 不提交新轨迹、不清失败计时、不改状态；保留现有 current_ 及末端 P/V/A，
+      // 由 snapshot 前的 fresh odometry（handleArrivalBeforeSnapshotLocked）推进/
+      // 到达。返回 false 且不启动 plan_fail_since_。
+      // §3.1（260828 修复）：已有 plan_fail_since_ 后持续退化必须走普通可重试
+      // 失败路径（soft-landing 计时），否则失败计时既不清除也不收口，任务无法
+      // 按 plan_fail_timeout_s_ 终止。
+      bool failing = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failing = !plan_fail_since_.isZero();
+      }
+      if (!failing)
+      {
+        ROS_DEBUG_THROTTLE(1.0,
+                           "[%s] degenerate segment; keeping current trajectory",
+                           uav_id_.c_str());
+        return false;
+      }
+      ROS_WARN_THROTTLE(1.0,
+                        "[%s] degenerate segment while replan failing; "
+                        "falling through to soft-landing closure",
+                        uav_id_.c_str());
+      break;  // 进入 safe_candidate=false 软着陆失败路径（10s 收口）
     }
     if (plan_result == PlanResult::RETRYABLE_FAILURE)
     {
@@ -606,6 +632,69 @@ bool EgoPlannerDriverNode::advanceTargetLocked(const Eigen::Vector3d& pos)
     // d_next < 0.5m：丢弃该推进，继续向后找（多个关键点挤在 0.5m 内时）。
   }
   return advanced;
+}
+
+// §3.1（260828 修复）：replan snapshot 前用 fresh odometry 处理 target 推进与
+// 最终到达。覆盖两处原有缺陷：
+//   1. 无 current_（首轮/退化等待）时 checkArrival 直接退出 → 同点目标持续 HOLD；
+//   2. replanOnce 只检查 pose freshness 不推进 → 真实位置已过目标仍规划旧目标。
+// 返回 true = 本轮已收口（无 current_ 且真实到达最终关键点 → COMPLETED），
+// 不需要构建 snapshot；返回 false = 继续正常 snapshot 规划（推进后目标已更新，
+// 或当前处于 EXECUTING 由每 tick checkArrival 处理到达/推进）。
+bool EgoPlannerDriverNode::handleArrivalBeforeSnapshotLocked(const ros::Time& now)
+{
+  // §3.1：steady_target_ 非空时若 arrival_pending_ 未置（正常 HOLD/空闲捕获）
+  // 返回 false；若 arrival_pending_ 已置（退化等待中，steady_target_ 可能是
+  // 等待期间被 pose 捕获锁存）必须忽略并继续判定到达，否则同点目标永远停在
+  // HOLD。
+  if (current_ || emergency_braking_ || hold_requested_ ||
+      (steady_target_ && !arrival_pending_))
+    return false;  // 有轨迹时分支 A/B 由 publishSetpoint tick 的 checkArrival 处理
+  if (!local_pose_ || !local_pose_stamp_ ||
+      (now - *local_pose_stamp_).toSec() > pose_timeout_)
+  {
+    arrival_since_.reset();
+    return false;
+  }
+  const Eigen::Vector3d cur(local_pose_->pose.position.x,
+                            local_pose_->pose.position.y,
+                            local_pose_->pose.position.z);
+  // 分支 A：真实位置已越过当前目标 → 推进到相邻下一个 keypoint（返回 false，
+  // 让本轮 snapshot 用推进后的新目标规划；推进目标最远 3.5m 规则不变）。
+  if (advanceTargetLocked(cur))
+  {
+    planning_requested_ = true;
+    replan_cv_.notify_all();
+    return false;
+  }
+  // 分支 B：无 current_ 且真实位置已在最终关键点附近 → 稳定窗口后 COMPLETED。
+  if (!waypoints_.empty() &&
+      (cur - waypoints_.back().position).norm() <= arrival_reach_thresh_m_)
+  {
+    if (!arrival_since_)
+      arrival_since_ = now;
+    if ((now - *arrival_since_).toSec() >= stable_s_)
+    {
+      steady_target_ = HoldTarget{waypoints_.back().position, goal_yaw_};
+      current_.reset();
+      arrival_since_.reset();
+      arrival_pending_ = false;
+      plan_start_ = ros::Time(0);
+      emergency_pending_ = false;
+      setState(kStateCompleted);
+      ROS_INFO("[%s] real arrival at final keypoint (no current_) -> COMPLETED",
+               uav_id_.c_str());
+      return true;
+    }
+    arrival_pending_ = true;  // 稳定窗口未满：replanLoop 1s 定时补判，不重复规划
+    ROS_DEBUG_THROTTLE(1.0, "[%s] at final keypoint, waiting %.1fs stable",
+                       uav_id_.c_str(),
+                       stable_s_ - (now - *arrival_since_).toSec());
+    return true;  // 已由 fresh odometry 收口判定，本轮不构建 snapshot
+  }
+  arrival_since_.reset();
+  arrival_pending_ = false;
+  return false;
 }
 
 // 方案 Y：EMERGENCY 且 ttc 紧急（< emergency_replan_time_s_）时生成并提交受约束
@@ -1060,6 +1149,10 @@ void EgoPlannerDriverNode::setState(const std::string& state)
 
 bool EgoPlannerDriverNode::captureHoldTargetLocked(const ros::Time& now)
 {
+  // §3.1：退化到达等待中（arrival_pending_）禁止 HOLD 捕获锁存——否则会清除
+  // arrival_since_ 重置稳定窗口并锁存真实位置，使同点目标永远停在 HOLD。
+  if (arrival_pending_)
+    return false;
   // HOLD 锁存：进入 HOLD 时读一次当前 pose 冻结 setpoint（implementation_plan_
   // 26082621 删 POSE_STALE），后续不随 pose 漂移；悬停目标建立后也不因 pose
   // 过期丢弃目标（relay 抖动/短暂丢帧不会把无人机打出稳定悬停停发 setpoint）。

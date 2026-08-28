@@ -214,25 +214,9 @@ void runWorker(bool stress, int out_fd)
             if (rep.violations)
               break;
           }
-    // 资源上限注入：max_parameterization_points=8（正常 3m 段约 8-10 点）时
-    // 4m 以上段应返回 RESOURCE_LIMIT（§13.1 资源用例独立断言）。
-    EgoPlannerConfig tight = makeConfig();
-    tight.max_parameterization_points = 8;
-    EgoPlannerCore tight_core(tight);
-    TimedTrajectory traj;
-    double cost = 0.0;
-    const std::vector<WayPoint> wp{WayPoint{Eigen::Vector3d(6.0, 0.0, 15.0), 0.0}};
-    const PlanResult tight_result =
-        tight_core.planOnce(GoalPoint{Eigen::Vector3d(0.0, 0.0, 15.0), 0.0},
-                            wp, {}, traj, cost);
-    if (tight_result != PlanResult::RESOURCE_LIMIT &&
-        tight_result != PlanResult::RETRYABLE_FAILURE)
-    {
-      std::snprintf(rep.detail, sizeof(rep.detail),
-                    "tight cap must give RESOURCE_LIMIT/RETRYABLE (got %d)",
-                    static_cast<int>(tight_result));
-      rep.violations = true;
-    }
+    // §4.2（260828 方式 B）：资源注入已从普通功能矩阵拆出，独立
+    // ResourceTightCapRejectsOversize 测试（见下）。普通矩阵不再执行资源注入，
+    // 保持 rep.resource==0 断言覆盖普通（default-limit）用例。
   }
   else
   {
@@ -317,14 +301,18 @@ bool runRestrictedWorker(bool stress, int wall_timeout_ms, WorkerReport& rep)
   {
     close(pfd[0]);
     // 受限子进程：AS 512 MiB；功能 worker CPU 10 s、压力 worker CPU 30 s。
+    // §4.2（260828）：setrlimit 失败必须用明确 exit code 报告（不静默放行），
+    // 否则限制未安装时仍可能报告测试成功。
     struct rlimit lim_as;
     lim_as.rlim_cur = kAsLimitBytes;
     lim_as.rlim_max = kAsLimitBytes;
-    setrlimit(RLIMIT_AS, &lim_as);
+    if (setrlimit(RLIMIT_AS, &lim_as) != 0)
+      _exit(110);  // RLIMIT_AS 安装失败
     struct rlimit lim_cpu;
     lim_cpu.rlim_cur = stress ? 30 : 10;
     lim_cpu.rlim_max = stress ? 30 : 10;
-    setrlimit(RLIMIT_CPU, &lim_cpu);
+    if (setrlimit(RLIMIT_CPU, &lim_cpu) != 0)
+      _exit(111);  // RLIMIT_CPU 安装失败
     runWorker(stress, pfd[1]);
     _exit(1);  // not reached
   }
@@ -453,6 +441,25 @@ TEST(ShortFinalSegment, ParameterizationCapRejectsOversize)
       core.planOnce(GoalPoint{start, 0.0}, wp, {}, traj, cost);
   EXPECT_EQ(result, PlanResult::SUCCESS);  // 256 点上限覆盖 60m 长段（§13.2）
   EXPECT_LE(traj.pts.size(), config.max_trajectory_samples);
+}
+
+// §4.2（260828 方式 B）：资源注入独立测试，只接受 PlanResult::RESOURCE_LIMIT，
+// 且失败输出为空（不发布部分 intent）。不放进普通矩阵的 rep.resource 计数。
+TEST(ShortFinalSegment, ResourceTightCapRejectsOversize)
+{
+  // max_parameterization_points=8：正常 3m 段约 8-10 点，6m 段必超 → 资源失败。
+  EgoPlannerConfig tight = makeConfig();
+  tight.max_parameterization_points = 8;
+  EgoPlannerCore tight_core(tight);
+  const Eigen::Vector3d start(0.0, 0.0, 15.0);
+  TimedTrajectory traj;
+  double cost = 0.0;
+  const std::vector<WayPoint> wp{WayPoint{Eigen::Vector3d(6.0, 0.0, 15.0), 0.0}};
+  const PlanResult result =
+      tight_core.planOnce(GoalPoint{start, 0.0}, wp, {}, traj, cost);
+  EXPECT_EQ(result, PlanResult::RESOURCE_LIMIT);  // 只接受 RESOURCE_LIMIT
+  EXPECT_TRUE(traj.pts.empty());                   // 失败输出为空（不发布部分 intent）
+  EXPECT_TRUE(traj.t.empty());
 }
 
 TEST(ShortFinalSegment, DegenerateDoesNotTriggerBrake)

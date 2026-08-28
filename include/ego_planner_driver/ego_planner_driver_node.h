@@ -164,6 +164,11 @@ private:
   // target never exceeds max_advance_dist_m_ from the live pose.  Returns true
   // when the target index moved (caller requests a replan).
   bool advanceTargetLocked(const Eigen::Vector3d& pos);
+  // §3.1（260828 修复）：replan snapshot 前先用 fresh odometry 处理 target
+  // 推进与最终到达（覆盖无 current_ 的首轮规划/退化等待场景）。返回 true =
+  // 本轮已收口（真实到达最终关键点 → COMPLETED），不需要构建 snapshot。
+  // 稳定窗口未满时置 arrival_pending_ 并返回 false（replanLoop 1s 后重试）。
+  bool handleArrivalBeforeSnapshotLocked(const ros::Time& now);
   // Samples the full position/velocity/acceleration/yaw of the current
   // trajectory at replan time (clamped to its end) so a rolling segment starts
   // from the same trajectory state it replaces (upstream FSM semantics)
@@ -391,6 +396,9 @@ private:
   std::string exec_state_;
   boost::optional<HoldTarget> steady_target_;
   boost::optional<ros::Time> arrival_since_;
+  // §3.1（260828 修复）：无 current_ 时真实到达最终关键点但稳定窗口未满，
+  // 锁存 pending 由 replanLoop 1s 定时补判，防止同点目标永远停在 HOLD。
+  bool arrival_pending_ = false;
 
   size_t setpoint_count_ = 0;
   boost::optional<mavros_msgs::PositionTarget> last_setpoint_;

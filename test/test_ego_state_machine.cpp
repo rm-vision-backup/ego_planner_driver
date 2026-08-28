@@ -918,46 +918,128 @@ TEST(EgoStateMachine, CompletedFreezesInHold)
   EXPECT_GT(node.setpointCount(), 0u);
 }
 
-// §9.4/§13.3：目标与 planned start 距离 < segment_direction_epsilon（0.05m）
-// 时 core 返回 DEGENERATE_SEGMENT：replanOnce 不提交、不改状态、不启动失败
-// 计时。真实 odometry 继续权威：当无人机实际已在（无 current_ 可完成的）目标
-// 附近时，publishSetpoint 的 HOLD 捕获锁存真实位置为悬停目标（§9.4 "保留现状
-// 由真实位置处理"），不产生计划轨迹、不进入失败计时、不触发紧急制动。
-TEST(EgoStateMachine, DegenerateSamePointWaitsForOdometryHeldLock)
+// §3.1（260828 修复）：无 current_ 时同点目标由 snapshot 前的 fresh odometry
+// 判定真实到达 → COMPLETED（原缺陷：checkArrival 在无 current_ 时直接退出，
+// 同点目标持续 HOLD；又因 DEGENERATE_SEGMENT 只返回不收口，任务永不完成）。
+TEST(EgoStateMachine, DegenerateSamePointRealArrivalCompletes)
 {
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
   node.setClockSource([&clock]() { return clock.now(); });
 
   ASSERT_TRUE(setupHold(node, clock, 15.0));
   EXPECT_EQ(node.execState(), kStateHold);
 
-  // 目标 == 起点：(0,0,15)。planned start 到 target 距离 0 < epsilon →
-  // DEGENERATE_SEGMENT：replanOnce 返回 false，状态保持 HOLD，不产生轨迹、
-  // 不启动失败计时（soft-landing 不进入）。
+  // 目标 == 起点：(0,0,15)。真实 odometry 已在最终关键点附近（无 current_）：
+  // snapshot 前 fresh odometry 收口等待稳定窗口，不构建退化 snapshot。
   node.sendGoal(0.0, 0.0, 15.0);
-  EXPECT_FALSE(node.replanOnce());
+  EXPECT_TRUE(node.replanOnce());  // 稳定窗口未满：本轮已由 odometry 等待，返回 true
   EXPECT_EQ(node.execState(), kStateHold);
   EXPECT_FALSE(static_cast<bool>(node.steadyTarget()));
   EXPECT_TRUE(node.planFailSinceForTest().isZero());
 
-  // 真实 odometry 已在最终点 (0,0,15)：publishSetpoint 用真实位置锁存悬停
-  // （无 current_ 时走 HOLD 捕获，锁存位置不随 pose 漂移）。
-  node.publishSetpointTick();
-  EXPECT_EQ(node.execState(), kStateHold);
+  // 推进 1.1s + 刷新 pose → 稳定窗口满 → COMPLETED（非 HOLD 锁存）。
+  clock.advance(1.1);
+  node.injectLocalPose(makePose(0.0, 0.0, 15.0, clock.get()));
+  EXPECT_TRUE(node.replanOnce(true));
+  EXPECT_EQ(node.execState(), kStateCompleted);
   EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
   EXPECT_NEAR(node.steadyTarget()->pos.x(), 0.0, 1e-6);
   EXPECT_NEAR(node.steadyTarget()->pos.z(), 15.0, 1e-6);
-  // 多次 tick 仍稳定悬停（setpoint 流不中断）。
-  for (int i = 0; i < 30; ++i)
-  {
-    clock.advance(1.0 / 30.0);
-    node.publishSetpointTick();
-    EXPECT_NEAR(node.lastSetpoint().position.x, 0.0, 1e-3);
-  }
-  EXPECT_EQ(node.execState(), kStateHold);
   EXPECT_TRUE(node.planFailSinceForTest().isZero());
+}
+
+// §3.1（260828 修复）：已有 plan_fail_since_ 后持续 DEGENERATE_SEGMENT 必须走
+// 普通可重试失败路径（soft-landing 计时），10s 内收口 EGO_PLAN_FAILED；既不
+// 清除失败计时也不无限 HOLD。
+TEST(EgoStateMachine, DegenerateWhileFailingClosesAfterTimeout)
+{
+  FakeClock clock;
+  clock.set(100.0);  // 非零起步：plan_start_ 非零（isZero() 假），collision tick 不提前返回
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+  EXPECT_EQ(node.execState(), kStateHold);
+
+  // 首轮：目标 (5,0,5) 成功 EXECUTING（无 peer）。
+  node.sendGoal(5.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateExecuting);
+
+  // 注入与本机轨迹完全同刻同点的挡路 peer（任何时刻同刻距离 0 < 1m 硬门）
+  // → 冲突检测必然置位；常规 replan 也必然因 1m 硬门失败。
+  const boost::optional<ego_planner_driver::TimedTrajectory> own =
+      node.currentTrajectory();
+  ASSERT_TRUE(static_cast<bool>(own));
+  auto peer = makeIntent(100.0, 1, "UAV2");
+  peer.t = own->t;
+  peer.sampled_traj.clear();
+  for (const auto& p : own->pts)
+  {
+    geometry_msgs::Pose pose;
+    pose.position.x = p.x();
+    pose.position.y = p.y();
+    pose.position.z = p.z();
+    peer.sampled_traj.push_back(pose);
+  }
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+  node.runCollisionCheckTick();
+  ASSERT_TRUE(node.planningRequested());
+  EXPECT_FALSE(node.replanOnce());  // 挡路 peer → 失败 → plan_fail_since_ 启动
+  EXPECT_FALSE(node.planFailSinceForTest().isZero());
+
+  // 推进时钟模拟轨迹执行（elapsed 接近 duration）：pose 固定 (4.7,0,5)
+  // （距最终点 (5,0,5) 0.3m > 0.2m 不算到达）。planned_start 采样 clamp 到
+  // 轨迹末端 (5,0,5) == target → core 返回 DEGENERATE_SEGMENT；此时已有失败
+  // 计时 → 走软着陆失败路径：不清计时、不提交、定时重试直到 10s 收口。
+  for (int i = 0; i < 14; ++i)
+  {
+    clock.advance(1.0);
+    node.injectLocalPose(makePose(4.7, 0.0, 5.0, clock.get()));
+    node.publishSetpointTick();  // 维持 setpoint 流（不触发 COMPLETED/HOLD 分支以外的干扰）
+    EXPECT_FALSE(node.replanOnce(true)) << "iter " << i;
+    // 收口前失败计时持续不清（收口后清零，由下方最终断言验证）。
+    if (node.execState() != ego_planner_driver::kStatePlanFailed)
+      EXPECT_FALSE(node.planFailSinceForTest().isZero());
+    else
+      EXPECT_TRUE(node.planFailSinceForTest().isZero());
+    if (node.execState() == ego_planner_driver::kStatePlanFailed)
+      break;
+  }
+  // 总失败时长超过 plan_fail_timeout_s_（10s）→ EGO_PLAN_FAILED 收口。
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
+  EXPECT_TRUE(node.planFailSinceForTest().isZero());  // 收口后清计时
+}
+
+// §4.2（260828 方式 B，node 层）：RESOURCE_LIMIT 零 activation retry、零 yield、
+// 不发布部分 intent、立即失败/HOLD 收口。通过私有参数注入紧 parameterization
+// cap（8），长距离目标触发 core 资源失败。
+TEST(EgoStateMachine, ResourceLimitClosesPlanFailedImmediately)
+{
+  ros::param::set("/ego_state_machine_test/max_parameterization_points", 8);
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setReplanLoopEnabled(false);
+  node.setClockSource([&clock]() { return clock.now(); });
+  ASSERT_TRUE(setupHold(node, clock, 5.0));
+
+  // node 构造已读取一次私有参数。立即删除，防止 cap=8 残留污染后续测试
+  // （node 构造只读一次，删除不影响本测试后续 replanOnce）。
+  ros::param::del("/ego_state_machine_test/max_parameterization_points");
+  // 6m 目标（cap=8 时弧长重采样点约 16 > 8）→ core RESOURCE_LIMIT。
+  node.sendGoal(6.0, 0.0, 5.0);
+  ASSERT_TRUE(node.replanOnce());  // 同一事务内立即收口 → 返回 true
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
+  EXPECT_TRUE(node.planFailSinceForTest().isZero());
+  EXPECT_FALSE(node.yieldCommittedForTest());          // 零 yield
+  EXPECT_FALSE(static_cast<bool>(node.currentTrajectory()));  // 不发布部分 intent
+  // 立即 HOLD 语义：steady_target_ 由 captureHoldTargetLocked 锁存（fresh pose）。
+  EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
 }
 
 TEST(EgoStateMachine, HoldRemainsFixed)

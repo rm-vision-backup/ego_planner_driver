@@ -833,6 +833,12 @@ PlanResult EgoPlannerCore::planOnce(const GoalPoint& start,
     // violates the configured physical limits. Reparameterize rebound output
     // even when generic rolling-segment reparameterization remains disabled;
     // the final clearance check below evaluates the resulting time axis again.
+    // §3.2（260828 修复）：当前生产开关（enable_rebound/enable_time_reparam 均
+    // false）下不允许动力学不可行轨迹作为 SUCCESS 发布。lengthenTime 仅在
+    // time_reparam/rebound 开启时修正（诊断模式保持原采集逻辑）；开关全关闭时
+    // 由采样后实际欧氏峰值硬拒（见下方 §3.2 峰值检查）——原 checkFeasibility
+    // 逐轴 1.05 判定对正常 min-snap 过渡（实测 vmax≈1.26 范数）必然 false，
+    // 不能作为生产判据。
     if (!feasible && (config_.enable_time_reparam || config_.enable_rebound))
       traj.lengthenTime(fea_ratio);
     double tm, tmp;
@@ -921,6 +927,28 @@ PlanResult EgoPlannerCore::planOnce(const GoalPoint& start,
     {
       out.pts.front() = start.position;
       out.pts.back() = point_set.back();
+    }
+    // §3.2（260828 修复）：当前生产开关（rebound/time_reparam 均关闭）下用采样
+    // 后实际欧氏峰值做动力学硬拒。阈值 2.5× 依据实测：正常 min-snap 过渡峰值
+    // vmax≈1.49（巡航段）~1.999（6m final 段），PX4 执行超调实测 1.49-1.54，
+    // 候选 SLOW 档上限 2.5（yield_max_velocity_mps）；2.5× 不误伤任何正常任务，
+    // 仍远超病态输入（100 m/s 起始速度锚定使 vmax 达数十倍 → 拒绝）。禁止用
+    // 逐轴 checkFeasibility 1.05 阈值（正常轨迹范数过渡 vmax≈1.26 也会误判
+    // false）。rebound/time_reparam 开启场景仍由 lengthenTime 修正（原版 trust
+    // 语义，不属本修复范围）。
+    if (!config_.enable_rebound && !config_.enable_time_reparam)
+    {
+      double max_speed = 0.0, max_accel = 0.0;
+      for (const auto& v : out.vel)
+        max_speed = std::max(max_speed, v.norm());
+      for (const auto& a : out.acc)
+        max_accel = std::max(max_accel, a.norm());
+      if (!(max_speed <= config_.max_vel * 2.5 + 1e-9) ||
+          !(max_accel <= config_.max_acc * 2.5 + 1e-9))
+      {
+        out = TimedTrajectory();  // 失败清空输出，不发布部分 intent
+        return PlanResult::RETRYABLE_FAILURE;
+      }
     }
     // §7: all arrays must be equal length, all samples finite, time strictly
     // increasing from 0 with the last sample exactly duration.
