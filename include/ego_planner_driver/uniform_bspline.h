@@ -3,6 +3,7 @@
 
 #include <Eigen/Eigen>
 #include <algorithm>
+#include <cstddef>
 #include <iostream>
 
 using namespace std;
@@ -53,11 +54,20 @@ namespace ego_planner
     UniformBspline getDerivative();
 
     // 3D B-spline interpolation of points in point_set, with boundary vel&acc
-    // constraints
-    // input : (K+2) points with boundary vel/acc; ts
-    // output: (K+6) control_pts
-    static void parameterizeToBspline(const double &ts, const vector<Eigen::Vector3d> &point_set,
+    // constraints.  Bounded single-QR parameterization (implementation_plan_
+    // 26082722):
+    //   - on entry ctrl_pts is cleared so a failed call never leaves a stale
+    //     or partial output;
+    //   - ts must be finite and > 0; point_set size must be within [4,
+    //     max_points]; derivatives must be exactly 4; all values finite;
+    //   - x/y/z are solved with ONE pivoted QR on the shared (K+4)x(K+2)
+    //     system (single decomposition, 3-column RHS) and the result is
+    //     assigned only after the solver succeeds and the solution is finite.
+    // input : (K+2) points with boundary vel/acc; ts; max_points
+    // output: (K+6) control_pts; returns true only after a complete success.
+    static bool parameterizeToBspline(const double &ts, const vector<Eigen::Vector3d> &point_set,
                                       const vector<Eigen::Vector3d> &start_end_derivative,
+                                      std::size_t max_points,
                                       Eigen::MatrixXd &ctrl_pts);
 
     /* check feasibility, adjust time */

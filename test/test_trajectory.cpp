@@ -10,6 +10,7 @@ using ego_planner_driver::EgoPlannerCore;
 using ego_planner_driver::GoalPoint;
 using ego_planner_driver::NeighborTrajectory;
 using ego_planner_driver::TimedTrajectory;
+using ego_planner_driver::PlanResult;
 using ego_planner_driver::TrajectorySample;
 using ego_planner_driver::WayPoint;
 
@@ -75,7 +76,7 @@ TEST(EgoPlannerCore, PlanOnceProducesTimedTrajectory)
   std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(10.0, 0.0, 15.0), 0.0}};
   TimedTrajectory trajectory;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, trajectory, cost));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, trajectory, cost));
   ASSERT_GT(trajectory.pts.size(), 1u);
   ASSERT_GT(trajectory.duration, 0.0);
   EXPECT_NEAR(trajectory.pts.front().x(), 0.0, 1e-3);
@@ -91,14 +92,14 @@ TEST(EgoPlannerCore, PlanOnceAppliesStartDerivativesForRollingContinuity)
   const Eigen::Vector3d start_acc(0.0, 0.0, 0.0);
   TimedTrajectory traj;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost, start_vel, start_acc));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, traj, cost, start_vel, start_acc));
   ASSERT_GT(traj.vel.size(), 1u);
   // 起点 B-spline 一阶导数被精确锚定为 start_vel（优化器/rebound 不动前 3 列）。
   EXPECT_NEAR(traj.vel.front().x(), start_vel.x(), 0.1);
   EXPECT_NEAR(traj.vel.front().y(), start_vel.y(), 0.1);
   // 对照：默认全零起始导数 -> 起点静止，证明 vel 参数确实生效。
   TimedTrajectory zero_traj;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, zero_traj, cost));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, zero_traj, cost));
   ASSERT_GT(zero_traj.vel.size(), 1u);
   EXPECT_NEAR(zero_traj.vel.front().x(), 0.0, 0.1);
 }
@@ -109,7 +110,7 @@ TEST(EgoPlannerCore, PlanOnceWithoutWaypointsHoldsPosition)
   GoalPoint start{Eigen::Vector3d(1.0, 2.0, 15.0), 0.0};
   TimedTrajectory trajectory;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, {}, {}, trajectory, cost));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, {}, {}, trajectory, cost));
   EXPECT_NEAR(trajectory.pts.front().x(), 1.0, 1e-3);
   EXPECT_NEAR(trajectory.pts.front().y(), 2.0, 1e-3);
 }
@@ -122,8 +123,8 @@ TEST(EgoPlannerCore, NeighborMissingDegradesToSingle)
   TimedTrajectory with_neighbor, without_neighbor;
   double cost_a = 0.0, cost_b = 0.0;
   std::vector<NeighborTrajectory> neighbors{straightNeighbor(2.0, 6.0, 2.0, 2.0)};
-  ASSERT_TRUE(core.planOnce(start, waypoints, neighbors, with_neighbor, cost_a));
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, without_neighbor, cost_b));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, neighbors, with_neighbor, cost_a));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, without_neighbor, cost_b));
   EXPECT_FALSE(with_neighbor.pts.empty());
   EXPECT_FALSE(without_neighbor.pts.empty());
   EXPECT_TRUE(std::isfinite(cost_a));
@@ -150,7 +151,7 @@ TEST(EgoPlannerCore, CheckClearanceCatchesViolation)
   std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(0.0, 10.0, 15.0), 0.0}};
   TimedTrajectory trajectory;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, trajectory, cost));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, trajectory, cost));
   // Neighbor parked on the trajectory path at the same altitude.
   std::vector<NeighborTrajectory> neighbors{straightNeighbor(0.0, 5.0, 0.0, 5.0, 15.0)};
   EXPECT_FALSE(core.checkClearance(trajectory, neighbors, 0.5));
@@ -171,7 +172,7 @@ TEST(EgoPlannerCore, SwarmReboundPushesTrajectoryAway)
   double cost = 0.0;
   // 邻居正对轨迹路径（同一高度、同时段）
   std::vector<NeighborTrajectory> neighbors{straightNeighbor(0.0, 5.0, 0.0, 5.0, 15.0)};
-  ASSERT_TRUE(core.planOnce(start, waypoints, neighbors, trajectory, cost));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, neighbors, trajectory, cost));
   // rebound 后 clearance 硬校验应通过（控制点被推开绕开正对邻居）
   EXPECT_TRUE(core.checkClearance(trajectory, neighbors, 0.5));
 }
@@ -196,7 +197,7 @@ TEST(EgoPlannerCore, CrossingTrajectoriesReplanToSafeArrival)
       straightNeighbor(5.0, -5.0, 5.0, 5.0, 15.0)};
   TimedTrajectory trajectory;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, neighbors, trajectory, cost,
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, neighbors, trajectory, cost,
                             Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
                             true));
   ASSERT_FALSE(trajectory.pts.empty());
@@ -225,14 +226,14 @@ TEST(EgoPlannerCore, ReciprocalNominalIntentBlocksUnsafeDefaultEnablement)
   TimedTrajectory nominal_a;
   TimedTrajectory traj_b;
   double cost = 0.0;
-  ASSERT_TRUE(core_a.planOnce(start_a, waypoints_a, {}, nominal_a, cost,
+  ASSERT_EQ(PlanResult::SUCCESS, core_a.planOnce(start_a, waypoints_a, {}, nominal_a, cost,
                               Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
                               true));
   // Rebound passes against an ideal constant-speed crossing intent, but it
   // still cannot guarantee a solution against a peer trajectory generated by
   // this same min-snap core. Keep the production default disabled until this
   // assertion can be inverted together with a multi-round convergence test.
-  EXPECT_FALSE(core_b.planOnce(start_b, waypoints_b, {asNeighbor(nominal_a)},
+  EXPECT_NE(PlanResult::SUCCESS, core_b.planOnce(start_b, waypoints_b, {asNeighbor(nominal_a)},
                                traj_b, cost, Eigen::Vector3d::Zero(),
                                Eigen::Vector3d::Zero(), true));
   expectDynamicsWithin(nominal_a, config);
@@ -275,15 +276,15 @@ TEST(EgoPlannerCore, FixedClearanceHardGateRejectsIntrudingNeighbor)
 
   TimedTrajectory baseline, traj;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, baseline, cost, start_vel));
-  ASSERT_TRUE(core.planOnce(start, waypoints, {clear}, traj, cost, start_vel));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, baseline, cost, start_vel));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {clear}, traj, cost, start_vel));
   // 1.5m 平行邻机在固定 1m 门禁外：轨迹应与无 peer 一致（无软惩罚绕开）。
   ASSERT_EQ(baseline.pts.size(), traj.pts.size());
   for (size_t i = 0; i < baseline.pts.size(); ++i)
     EXPECT_LT((baseline.pts[i] - traj.pts[i]).norm(), 1e-6);
 
   // 0.5m 侵入邻机：直线轨迹穿 1m 硬门 → planOnce 必须失败（固定 clearance 硬门）。
-  EXPECT_FALSE(core.planOnce(start, waypoints, {intruding}, traj, cost, start_vel));
+  EXPECT_NE(PlanResult::SUCCESS, core.planOnce(start, waypoints, {intruding}, traj, cost, start_vel));
   // 1m 开边界与 executor runtime gate 一致：0.99m 拒绝，恰好 1.0m 通过。
   NeighborTrajectory near_boundary = intruding;
   NeighborTrajectory exact_boundary = intruding;
@@ -307,7 +308,7 @@ TEST(EgoPlannerCore, TimedTrajectorySamplesPvaConsistently)
   const Eigen::Vector3d start_vel(1.5, 0.0, 0.0);
   TimedTrajectory traj;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost, start_vel,
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, traj, cost, start_vel,
                             Eigen::Vector3d::Zero()));
   ASSERT_GT(traj.acc.size(), 1u);
   ASSERT_EQ(traj.acc.size(), traj.pts.size());
@@ -341,7 +342,7 @@ TEST(EgoPlannerCore, SamplePvaAtStartMatchesRequestedDerivatives)
   const Eigen::Vector3d start_vel(1.5, 0.0, 0.0);
   TimedTrajectory traj;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost, start_vel,
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, traj, cost, start_vel,
                             Eigen::Vector3d::Zero()));
   TrajectorySample s;
   ASSERT_TRUE(traj.samplePVA(0.0, s));
@@ -392,7 +393,7 @@ TEST(EgoPlannerCore, FeasibilityCubicSmoothVelocity)
     waypoints.push_back(WayPoint{Eigen::Vector3d(x, 0.0, 15.0), 0.0});
   TimedTrajectory traj;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(GoalPoint{start, 0.0}, waypoints, {}, traj, cost));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(GoalPoint{start, 0.0}, waypoints, {}, traj, cost));
   ASSERT_GT(traj.vel.size(), 2u);
   // 巡航段速度应贴住 max_vel（允许 ~20% 波动），且不出现极端超速。
   double vmax = 0.0;
@@ -446,7 +447,7 @@ TEST(EgoPlannerCore, VerticalClimbWithNeighborsSucceeds)
   }
   TimedTrajectory traj;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, neighbors, traj, cost));
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, neighbors, traj, cost));
   EXPECT_GT(traj.duration, 0.0);
   // 轨迹应爬升（终点 z 显著高于起点）。
   const double z_end = traj.pts.back().z();
@@ -482,14 +483,14 @@ TEST(EgoPlannerCore, PlanOnceFinalSegmentEndsStatic)
   TimedTrajectory traj;
   double cost = 0.0;
   // final_segment=true：末端静止到达（end_vel=0），轨迹末速度约 0。
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost,
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, traj, cost,
                             Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
                             true));
   ASSERT_GT(traj.vel.size(), 1u);
   EXPECT_LT(traj.vel.back().norm(), 0.1);
   // 巡航段（final_segment=false）：末速度保持切线巡航速度量级（>= 0.5）。
   TimedTrajectory cruise;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, cruise, cost,
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, cruise, cost,
                             Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
                             false));
   EXPECT_GT(cruise.vel.back().norm(), 0.5);
@@ -512,7 +513,7 @@ TEST(EgoPlannerCore, MinSnapInitialPointSetYieldsCruiseSpeedProfile)
   std::vector<WayPoint> waypoints{WayPoint{Eigen::Vector3d(40.0, 0.0, 15.0), 0.0}};
   TimedTrajectory traj;
   double cost = 0.0;
-  ASSERT_TRUE(core.planOnce(start, waypoints, {}, traj, cost,
+  ASSERT_EQ(PlanResult::SUCCESS, core.planOnce(start, waypoints, {}, traj, cost,
                             Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
                             false));
   ASSERT_GT(traj.vel.size(), 2u);

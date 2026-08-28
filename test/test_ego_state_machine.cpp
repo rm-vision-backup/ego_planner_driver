@@ -881,7 +881,8 @@ TEST(EgoStateMachine, CompletedFreezesInHold)
   ASSERT_TRUE(setupHold(node, clock, 15.0));
   EXPECT_EQ(node.execState(), kStateHold);
 
-  node.sendGoal(0.0, 0.0, 15.0);
+  // 非退化目标（起点 (0,0,15) -> 目标 (1,0,15)）：正常 EXECUTING → COMPLETED。
+  node.sendGoal(1.0, 0.0, 15.0);
   ASSERT_TRUE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateExecuting);
 
@@ -897,7 +898,7 @@ TEST(EgoStateMachine, CompletedFreezesInHold)
   }
   EXPECT_EQ(node.execState(), kStateCompleted);
   EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
-  EXPECT_NEAR(node.steadyTarget()->pos.x(), 0.0, 0.5);
+  EXPECT_NEAR(node.steadyTarget()->pos.x(), 1.0, 0.5);
 
   // COMPLETED 后 2 秒内：继续发布冻结位姿（setpoint 流不断）
   const double frozen_x = node.lastSetpoint().position.x;
@@ -915,6 +916,48 @@ TEST(EgoStateMachine, CompletedFreezesInHold)
   EXPECT_EQ(node.execState(), kStateCompleted);
   EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
   EXPECT_GT(node.setpointCount(), 0u);
+}
+
+// §9.4/§13.3：目标与 planned start 距离 < segment_direction_epsilon（0.05m）
+// 时 core 返回 DEGENERATE_SEGMENT：replanOnce 不提交、不改状态、不启动失败
+// 计时。真实 odometry 继续权威：当无人机实际已在（无 current_ 可完成的）目标
+// 附近时，publishSetpoint 的 HOLD 捕获锁存真实位置为悬停目标（§9.4 "保留现状
+// 由真实位置处理"），不产生计划轨迹、不进入失败计时、不触发紧急制动。
+TEST(EgoStateMachine, DegenerateSamePointWaitsForOdometryHeldLock)
+{
+  FakeClock clock;
+  clock.set(0.0);
+  EgoPlannerDriverNode node;
+  node.setClockSource([&clock]() { return clock.now(); });
+
+  ASSERT_TRUE(setupHold(node, clock, 15.0));
+  EXPECT_EQ(node.execState(), kStateHold);
+
+  // 目标 == 起点：(0,0,15)。planned start 到 target 距离 0 < epsilon →
+  // DEGENERATE_SEGMENT：replanOnce 返回 false，状态保持 HOLD，不产生轨迹、
+  // 不启动失败计时（soft-landing 不进入）。
+  node.sendGoal(0.0, 0.0, 15.0);
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_FALSE(static_cast<bool>(node.steadyTarget()));
+  EXPECT_TRUE(node.planFailSinceForTest().isZero());
+
+  // 真实 odometry 已在最终点 (0,0,15)：publishSetpoint 用真实位置锁存悬停
+  // （无 current_ 时走 HOLD 捕获，锁存位置不随 pose 漂移）。
+  node.publishSetpointTick();
+  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_TRUE(static_cast<bool>(node.steadyTarget()));
+  EXPECT_NEAR(node.steadyTarget()->pos.x(), 0.0, 1e-6);
+  EXPECT_NEAR(node.steadyTarget()->pos.z(), 15.0, 1e-6);
+  // 多次 tick 仍稳定悬停（setpoint 流不中断）。
+  for (int i = 0; i < 30; ++i)
+  {
+    clock.advance(1.0 / 30.0);
+    node.publishSetpointTick();
+    EXPECT_NEAR(node.lastSetpoint().position.x, 0.0, 1e-3);
+  }
+  EXPECT_EQ(node.execState(), kStateHold);
+  EXPECT_TRUE(node.planFailSinceForTest().isZero());
 }
 
 TEST(EgoStateMachine, HoldRemainsFixed)

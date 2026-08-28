@@ -46,6 +46,13 @@
     <param name="cruise_velocity" value="1.0"/>
     <param name="acceleration_limit" value="2.0"/>
     <param name="lambda_feasibility" value="0.5"/>
+    <!-- 资源安全边界（implementation_plan_26082722 §11）：node 启动时 fail-fast
+         校验 count limit>0 且不超过编译期绝对 hard limit；危险配置拒绝启动。 -->
+    <param name="max_arc_samples" value="4096"/>
+    <param name="max_parameterization_points" value="256"/>
+    <param name="max_trajectory_samples" value="4096"/>
+    <param name="max_neighbor_intent_samples" value="256"/>
+    <param name="segment_direction_epsilon_m" value="0.05"/>
     <param name="setpoint_rate_hz" value="30.0"/>
     <param name="local_pose_timeout_s" value="1.0"/>
     <param name="arrival_stable_s" value="1.0"/>

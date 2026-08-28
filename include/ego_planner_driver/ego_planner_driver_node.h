@@ -134,6 +134,8 @@ public:
   void setReplanLoopEnabled(bool enabled);
   // 软着陆测试：查询首次失败时刻（isZero = 未在软着陆失败中）。
   ros::Time planFailSinceForTest() const;
+  // 资源边界测试查询：分别返回配置的自然上限（用于 resource-limit 单测）。
+  std::size_t maxNeighborIntentSamplesForTest() const { return max_neighbor_intent_samples_; }
 
 private:
   void onGoal(const geometry_msgs::PointStamped::ConstPtr& msg);
@@ -203,9 +205,16 @@ private:
   void commitYieldCandidate(const YieldCandidate& cand);
   // 判定 primary peer 是否近似悬停（末段速度 < hovering_velocity_mps）。
   bool isPeerHovering(const NeighborTrajectory& nb) const;
+  // 让路候选结果分类（implementation_plan_26082722 §9.7）。
+  enum class YieldResult
+  {
+    COMMITTED,      // 候选提交成功
+    NOT_AVAILABLE,  // 无有效候选（常规规划失败保持软着陆）
+    RESOURCE_LIMIT  // 候选生成内部出现资源失败，必须向上传播并 §9.6 立即收口
+  };
   // 方案 A（§10 扩展）：replanOnce 规划失败（safe_candidate=false）时尝试让路候选：
   // SLOW 降 cruise_velocity / LEFT/RIGHT waypoints 横向偏移后重试 planOnce，
-  // 验证 min_clear ≥ 1.2×clearance，cost 最小者提交。成功返回 true。
+  // 验证 min_clear ≥ 1.2×clearance，cost 最小者提交。成功返回 COMMITTED。
   struct ReplanSnapshot
   {
     GoalPoint start;
@@ -217,7 +226,7 @@ private:
     bool final_segment = false;
     uint64_t safety_generation = 0;
   };
-  bool tryYieldReplan(const ReplanSnapshot& snap);
+  YieldResult tryYieldReplan(const ReplanSnapshot& snap);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
   // 方案 Y：EMERGENCY 且 ttc 紧急时生成并提交受约束制动轨迹（replan 线程内调用，
   // 持 mutex_）。返回 true 表示已提交制动/fallback；false 表示不满足制动条件
@@ -285,6 +294,14 @@ private:
   // plan_fail_timeout_s_（10s）才 EGO_PLAN_FAILED 收口（executor 收口后经
   // backend 对全组活动机发 HOLD）。
   double plan_fail_timeout_s_ = 10.0;
+  // 资源边界（implementation_plan_26082722 §11）：与 EgoPlannerConfig 中同名
+  // 参数同步读取；node 启动时 fail-fast 校验。max_neighbor_intent_samples_ 只
+  // 属于 node 侧 intent consumer（§10）。
+  std::size_t max_arc_samples_ = 4096;
+  std::size_t max_parameterization_points_ = 256;
+  std::size_t max_trajectory_samples_ = 4096;
+  std::size_t max_neighbor_intent_samples_ = 256;
+  double segment_direction_epsilon_m_ = 0.05;
   ros::Time plan_fail_since_;  // 首次失败时刻（isZero = 当前不在软着陆失败中）
   // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，implementation_plan_26082602 §10）：
   // collisionCheckTick 检测冲突（min_clear < 1.2×clearance，yield_clearance_factor=1.2）

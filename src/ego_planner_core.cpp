@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <new>
 
 namespace ego_planner_driver
 {
@@ -20,7 +21,7 @@ constexpr double kSwarmA = 1.0;
 constexpr double kSwarmB = 1.0;
 constexpr double kInvA2 = 1.0 / (kSwarmA * kSwarmA);
 constexpr double kInvB2 = 1.0 / (kSwarmB * kSwarmB);
-constexpr double kSampleStepS = 0.1;
+constexpr double kSampleStepS = 0.1;  // TimedTrajectory nominal step (frozen contract)
 
 Eigen::Vector3d sampleNeighbor(const NeighborTrajectory& traj, double t_rel)
 {
@@ -86,50 +87,171 @@ double estimateTrapezoidTime(double dist, double v0, double v_cruise,
   return std::max(0.0, t_acc + t_cruise + t_dec);
 }
 
-// Samples the min-snap polynomial at `spacing` arc-length intervals.
-// A dense polyline is built with a fine time step, then points are taken every
-// `spacing` along it (linear interpolation).  `start`/`end` are always the
-// first/last samples so the B-spline parameterization anchors the exact
-// endpoints.
-std::vector<Eigen::Vector3d> samplePolynomialByArcLength(
-    const OneSegmentPolynomial& poly, double spacing,
-    const Eigen::Vector3d& start, const Eigen::Vector3d& end)
+// Checked ceil division: numerator/denominator -> size_t, refusing non-finite,
+// non-positive denominators, overflow and ceil values beyond size_t range.
+bool checkedCeilDiv(double numerator, double denominator, std::size_t& out)
 {
+  if (!std::isfinite(numerator) || !std::isfinite(denominator) ||
+      denominator <= 0.0)
+    return false;
+  const double v = std::ceil(numerator / denominator);
+  if (!std::isfinite(v) ||
+      v > static_cast<double>(std::numeric_limits<std::size_t>::max()))
+    return false;
+  out = static_cast<std::size_t>(v);
+  return true;
+}
+
+// Samples the min-snap polynomial ONLY on the real physical time domain
+// [0, duration_s]（implementation_plan_26082722 §6）.  A dense polyline is
+// built with a 0.02 s nominal step (bounded by max_arc_samples), then points
+// are taken every `spacing` along it (linear interpolation).  `start`/`end`
+// are always the first/last samples.  All counts and arithmetic are validated
+// BEFORE any reserve/push_back: sample count / total arc-length-resampled
+// point count beyond the configured caps return RESOURCE_LIMIT; ordinary
+// finite inputs that cannot form a valid polyline return RETRYABLE_FAILURE.
+// On any failure `out` is cleared so no half-built point set is exposed.
+PlanResult samplePolynomialByArcLength(
+    const OneSegmentPolynomial& poly,
+    double duration_s,
+    double spacing_m,
+    std::size_t max_arc_samples,
+    std::size_t max_parameterization_points,
+    const Eigen::Vector3d& start,
+    const Eigen::Vector3d& end,
+    std::vector<Eigen::Vector3d>& out)
+{
+  out.clear();
+  if (!(std::isfinite(duration_s) && std::isfinite(spacing_m)) ||
+      duration_s <= 0.0 || spacing_m <= 0.0)
+    return PlanResult::RETRYABLE_FAILURE;
+  if (!start.allFinite() || !end.allFinite())
+    return PlanResult::RETRYABLE_FAILURE;
+
+  // N_requested = ceil(duration_s / 0.02) + 1, checked size_t (§6.1).
+  std::size_t n_requested = 0;
+  if (!checkedCeilDiv(duration_s, 0.02, n_requested))
+    return PlanResult::RESOURCE_LIMIT;
+  if (n_requested >= std::numeric_limits<std::size_t>::max() - 1u)
+    return PlanResult::RESOURCE_LIMIT;
+  n_requested += 1;
+  if (n_requested > max_arc_samples)
+    return PlanResult::RESOURCE_LIMIT;
+  if (n_requested < 2)
+    return PlanResult::RETRYABLE_FAILURE;
+
+  // Evaluate only on [0, duration_s]; t_i = duration_s * i/(N-1) covers 0 and
+  // duration_s exactly.
   std::vector<Eigen::Vector3d> dense;
-  const double dt = 0.02;
-  for (double t = 0.0; t <= 1.0 + 1e-9; t += dt)
-    dense.push_back(poly.evaluate(t));
+  dense.reserve(n_requested);
+  for (std::size_t i = 0; i < n_requested; ++i)
+  {
+    const double t = duration_s * (static_cast<double>(i) /
+                                   static_cast<double>(n_requested - 1));
+    const Eigen::Vector3d p = poly.evaluate(t);
+    if (!p.allFinite())
+    {
+      out.clear();
+      return PlanResult::RETRYABLE_FAILURE;
+    }
+    dense.push_back(p);
+  }
   dense.back() = end;  // exact endpoint
 
+  // Cumulative arc length: finite, non-negative, monotonic.
   std::vector<double> cum(dense.size(), 0.0);
+  double total = 0.0;
   for (size_t i = 1; i < dense.size(); ++i)
-    cum[i] = cum[i - 1] + (dense[i] - dense[i - 1]).norm();
-  const double total = cum.back();
+  {
+    const Eigen::Vector3d seg = dense[i] - dense[i - 1];
+    if (!seg.allFinite())
+    {
+      out.clear();
+      return PlanResult::RETRYABLE_FAILURE;
+    }
+    const double chord = seg.norm();
+    if (!std::isfinite(chord) || chord < 0.0)
+    {
+      out.clear();
+      return PlanResult::RETRYABLE_FAILURE;
+    }
+    total += chord;
+    if (!std::isfinite(total))
+    {
+      out.clear();
+      return PlanResult::RETRYABLE_FAILURE;
+    }
+    cum[i] = total;
+  }
 
-  std::vector<Eigen::Vector3d> out;
+  // required_points = ceil(total_arc_length / spacing_m) + 1 before any
+  // allocation (§6.3).  No silent truncation: exceeding the cap rejects the
+  // plan with RESOURCE_LIMIT.
+  std::size_t required_points = 0;
+  if (!checkedCeilDiv(total, spacing_m, required_points))
+    return PlanResult::RESOURCE_LIMIT;
+  if (required_points >= std::numeric_limits<std::size_t>::max() - 1u)
+    return PlanResult::RESOURCE_LIMIT;
+  required_points += 1;
+  if (required_points > max_parameterization_points)
+  {
+    out.clear();
+    return PlanResult::RESOURCE_LIMIT;
+  }
+
+  out.clear();
+  out.reserve(required_points);
   out.push_back(start);
-  if (spacing <= 0.0 || total <= spacing)
+  if (total <= spacing_m)
   {
     out.push_back(end);
-    return out;
+    return PlanResult::SUCCESS;
   }
   size_t j = 1;
-  double target = spacing;
+  double target = spacing_m;
   while (target < total - 1e-6)
   {
     while (j + 1 < cum.size() && cum[j] < target)
       ++j;
     const double span = cum[j] - cum[j - 1];
     const double a = (span > 1e-12) ? (target - cum[j - 1]) / span : 0.0;
-    out.push_back(dense[j - 1] * (1.0 - a) + dense[j] * a);
-    target += spacing;
+    if (!std::isfinite(a))
+    {
+      out.clear();
+      return PlanResult::RETRYABLE_FAILURE;
+    }
+    const Eigen::Vector3d pt = dense[j - 1] * (1.0 - a) + dense[j] * a;
+    if (!pt.allFinite())
+    {
+      out.clear();
+      return PlanResult::RETRYABLE_FAILURE;
+    }
+    out.push_back(pt);
+    if (out.size() > required_points)
+    {
+      out.clear();
+      return PlanResult::RESOURCE_LIMIT;  // defensive cap
+    }
+    target += spacing_m;
+    if (!std::isfinite(target))
+    {
+      out.clear();
+      return PlanResult::RESOURCE_LIMIT;
+    }
   }
   if ((out.back() - end).norm() > 1e-6)
+  {
+    if (out.size() >= required_points)
+    {
+      out.clear();
+      return PlanResult::RESOURCE_LIMIT;
+    }
     out.push_back(end);
-  return out;
+  }
+  return PlanResult::SUCCESS;
 }
 
-} // namespace
+}  // namespace
 
 EgoPlannerCore::EgoPlannerCore(const EgoPlannerConfig& config)
   : config_(config)
@@ -379,6 +501,7 @@ std::vector<NeighborTrajectory> EgoPlannerCore::filterByRange(
     const Eigen::Vector3d& local_position, double planning_range)
 {
   std::vector<NeighborTrajectory> kept;
+  kept.reserve(neighbors.size());
   for (const auto& neighbor : neighbors)
   {
     if (neighbor.pts.empty())
@@ -516,237 +639,315 @@ bool EgoPlannerCore::optimizeControls(double& final_cost)
   return true;
 }
 
-bool EgoPlannerCore::planOnce(const GoalPoint& start,
-                              const std::vector<WayPoint>& sparse_waypoints,
-                              const std::vector<NeighborTrajectory>& neighbors,
-                              TimedTrajectory& out, double& final_cost,
-                              const Eigen::Vector3d& start_vel,
-                              const Eigen::Vector3d& start_acc,
-                              bool final_segment)
+PlanResult EgoPlannerCore::planOnce(const GoalPoint& start,
+                                    const std::vector<WayPoint>& sparse_waypoints,
+                                    const std::vector<NeighborTrajectory>& neighbors,
+                                    TimedTrajectory& out, double& final_cost,
+                                    const Eigen::Vector3d& start_vel,
+                                    const Eigen::Vector3d& start_acc,
+                                    bool final_segment)
 {
-  if (sparse_waypoints.empty())
+  out = TimedTrajectory();
+  final_cost = 0.0;
+  try
   {
-    out.t.assign(1, 0.0);
-    out.pts.assign(1, start.position);
-    out.yaw.assign(1, start.yaw);
-    final_cost = 0.0;
-    return true;
-  }
-  // Window end point: the last waypoint of this plan.  The node already
-  // truncated sparse_waypoints to planning_horizon; when final_segment the
-  // waypoints are the full remaining route and end_vel must be zero (static
-  // arrival).  Cruise segments keep end_vel = tangent * min(v_cruise, max_vel)
-  // so the rolling replan's next segment joins velocity-continuously.
-  const Eigen::Vector3d end_pt = sparse_waypoints.back().position;
-  Eigen::Vector3d end_vel = Eigen::Vector3d::Zero();
-  if (!final_segment)
-  {
-    Eigen::Vector3d tangent;
-    if (sparse_waypoints.size() >= 2)
-      tangent = end_pt - sparse_waypoints[sparse_waypoints.size() - 2].position;
-    else
-      tangent = end_pt - start.position;
-    const double len = tangent.norm();
-    if (len > 1e-9)
-      end_vel = tangent / len * std::min(config_.cruise_velocity, config_.max_vel);
-  }
-  const Eigen::Vector3d end_acc = Eigen::Vector3d::Zero();
-
-  // Trapezoidal segment duration T (v0 projection, accel-cruise-decel).
-  const Eigen::Vector3d dir = end_pt - start.position;
-  const double dist = dir.norm();
-  double v0_proj = 0.0;
-  if (dist > 1e-9)
-    v0_proj = start_vel.dot(dir / dist);
-  const double v_cruise = std::max(0.0,
-      std::min(config_.cruise_velocity, config_.max_vel));
-  const double a = std::max(0.1, config_.acceleration_limit);
-  const double segment_time = estimateTrapezoidTime(
-      dist, v0_proj, v_cruise, a, final_segment);
-
-  // min-snap single segment (one_segment_traj_gen): a quintic closed-form
-  // polynomial that interpolates start P/V/A -> end P/V/A.  Sample it at
-  // 0.4 m arc-length intervals to build the B-spline parameterization input
-  // (the 2 m driver waypoints never enter the B-spline directly).
-  const OneSegmentPolynomial poly = oneSegmentTrajGen(
-      start.position, start_vel, start_acc, end_pt, end_vel, end_acc,
-      std::max(segment_time, 1e-3));
-  std::vector<Eigen::Vector3d> point_set = samplePolynomialByArcLength(
-      poly, 0.4, start.position, end_pt);
-  // Short-window fallback only: the parameterization needs >= 5 points so the
-  // optimizer keeps at least one free control point; the min-snap 0.4 m
-  // sampling already provides this for normal windows.
-  while (point_set.size() < 5)
-  {
-    std::vector<Eigen::Vector3d> subdivided;
-    subdivided.reserve(point_set.size() * 2);
-    for (size_t i = 0; i + 1 < point_set.size(); ++i)
+    if (sparse_waypoints.empty())
     {
-      subdivided.push_back(point_set[i]);
-      subdivided.push_back((point_set[i] + point_set[i + 1]) * 0.5);
+      out.t.assign(1, 0.0);
+      out.pts.assign(1, start.position);
+      out.yaw.assign(1, start.yaw);
+      final_cost = 0.0;
+      return PlanResult::SUCCESS;
     }
-    subdivided.push_back(point_set.back());
-    point_set.swap(subdivided);
+    // Window end point: the last waypoint of this plan.  The node already
+    // truncated sparse_waypoints to planning_horizon; when final_segment the
+    // waypoints are the full remaining route and end_vel must be zero (static
+    // arrival).  Cruise segments keep end_vel = tangent * min(v_cruise, max_vel)
+    // so the rolling replan's next segment joins velocity-continuously.
+    const Eigen::Vector3d end_pt = sparse_waypoints.back().position;
+    const Eigen::Vector3d dir = end_pt - start.position;
+    const double dist = dir.norm();
+    if (!std::isfinite(dist))
+      return PlanResult::RETRYABLE_FAILURE;
+
+    // §5.2/§6: degenerate direction check BEFORE any normalization of the
+    // micro-vector, duration estimation, quintic construction or point-set
+    // allocation.  This only classifies the input segment; it never declares
+    // arrival, advances targets or triggers emergency braking.
+    const double eps = config_.segment_direction_epsilon_m;
+    if (!(std::isfinite(eps) && eps > 0.0))
+      return PlanResult::RETRYABLE_FAILURE;
+    if (dist < eps)
+      return PlanResult::DEGENERATE_SEGMENT;
+
+    Eigen::Vector3d end_vel = Eigen::Vector3d::Zero();
+    if (!final_segment)
+    {
+      Eigen::Vector3d tangent;
+      if (sparse_waypoints.size() >= 2)
+        tangent = end_pt - sparse_waypoints[sparse_waypoints.size() - 2].position;
+      else
+        tangent = end_pt - start.position;
+      const double len = tangent.norm();
+      if (len > 1e-9)
+        end_vel = tangent / len * std::min(config_.cruise_velocity, config_.max_vel);
+    }
+    const Eigen::Vector3d end_acc = Eigen::Vector3d::Zero();
+
+    // Trapezoidal segment duration T (v0 projection, accel-cruise-decel).
+    double v0_proj = 0.0;
+    if (dist > 1e-9)
+      v0_proj = start_vel.dot(dir / dist);
+    const double v_cruise = std::max(0.0,
+        std::min(config_.cruise_velocity, config_.max_vel));
+    const double a = std::max(0.1, config_.acceleration_limit);
+    const double segment_time = estimateTrapezoidTime(
+        dist, v0_proj, v_cruise, a, final_segment);
+    if (!std::isfinite(segment_time) || segment_time <= 0.0)
+      return PlanResult::RETRYABLE_FAILURE;
+    const double duration_s = std::max(segment_time, 1e-3);
+
+    // min-snap single segment (one_segment_traj_gen): a quintic closed-form
+    // polynomial that interpolates start P/V/A -> end P/V/A.  Sample it on the
+    // REAL physical time domain [0, duration_s] at 0.4 m arc-length intervals
+    // to build the B-spline parameterization input (implementation_plan_
+    // 26082722 §6: the fixed-[0,1] evaluation was the OOM root cause).
+    const OneSegmentPolynomial poly = oneSegmentTrajGen(
+        start.position, start_vel, start_acc, end_pt, end_vel, end_acc,
+        duration_s);
+    std::vector<Eigen::Vector3d> point_set;
+    const PlanResult sample_result = samplePolynomialByArcLength(
+        poly, duration_s, 0.4, config_.max_arc_samples,
+        config_.max_parameterization_points, start.position, end_pt, point_set);
+    if (sample_result != PlanResult::SUCCESS)
+      return sample_result;
+
+    // Short-window fallback only: the parameterization needs >= 5 points so the
+    // optimizer keeps at least one free control point; the min-snap 0.4 m
+    // sampling already provides this for normal windows.  Bounded: the
+    // subdivision loop can never exceed max_parameterization_points.
+    while (point_set.size() < 5 &&
+           point_set.size() * 2 <= config_.max_parameterization_points)
+    {
+      std::vector<Eigen::Vector3d> subdivided;
+      subdivided.reserve(point_set.size() * 2);
+      for (size_t i = 0; i + 1 < point_set.size(); ++i)
+      {
+        subdivided.push_back(point_set[i]);
+        subdivided.push_back((point_set[i] + point_set[i + 1]) * 0.5);
+      }
+      subdivided.push_back(point_set.back());
+      point_set.swap(subdivided);
+    }
+    if (point_set.size() < 5)
+      return PlanResult::RETRYABLE_FAILURE;
+
+    std::vector<Eigen::Vector3d> start_end_derivative(4, Eigen::Vector3d::Zero());
+    // upstream order: [0]=vel_start, [1]=vel_end, [2]=acc_start, [3]=acc_end
+    start_end_derivative[0] = start_vel;  // start velocity (rolling continuity)
+    start_end_derivative[1] = end_vel;    // end velocity (tangent cruise / stop)
+    start_end_derivative[2] = start_acc;  // start acceleration (rolling continuity)
+    start_end_derivative[3] = end_acc;    // end acceleration (zero)
+    if (point_set.size() > config_.max_parameterization_points)
+      return PlanResult::RESOURCE_LIMIT;
+    Eigen::MatrixXd ctrl_pts;
+    if (!ego_planner::UniformBspline::parameterizeToBspline(
+            bspline_interval_, point_set, start_end_derivative,
+            config_.max_parameterization_points, ctrl_pts))
+      return PlanResult::RETRYABLE_FAILURE;
+    if (ctrl_pts.cols() < order_ + 1)
+      return PlanResult::RETRYABLE_FAILURE;
+
+    local_target_pt_ = point_set.back();
+    cps_.clearance = config_.swarm_clearance;
+    cps_.size = static_cast<int>(ctrl_pts.cols());
+    cps_.points = ctrl_pts;
+    neighbors_ = filterByRange(neighbors, start.position, config_.planning_range);
+
+    // Pin the last order_ control points as a hard terminal constraint so jerk
+    // smoothing cannot pull the free end away from the goal (original kernel
+    // uses end_id = size - order_, the "Fixed end" mode).
+    const int start_id = order_;
+    const int end_id = cps_.size;
+    variable_num_ = 3 * (end_id - start_id);
+    // Exact-anchor the leading control points so the spline start pose is
+    // exactly start.position.  The B-spline uses uniform (non-clamped) knots,
+    // so at t=0 the de Boor average B(0)=(P0+4P1+P2)/6 holds and the velocity
+    // row of parameterizeToBspline reads (P2-P0)/(2*ts) = start_vel.  The
+    // underlying parameterizeToBspline is an over-determined least-squares
+    // solve (K+2 controls vs K+4 constraints) and dilutes these boundary rows
+    // (measured start velocity came out ~8 m/s regardless of the requested
+    // derivative); re-solving P0..P2 here pins them exactly:
+    //   P0 = pos - vel*ts + acc*ts^2/3
+    //   P1 = pos - acc*ts^2/6
+    //   P2 = pos + vel*ts + acc*ts^2/3
+    // cols 0..2 are never optimized (start_id=3) nor rebound (rebound starts
+    // at i=order_).
+    if (cps_.points.cols() >= 3)
+    {
+      const double ts = bspline_interval_;
+      const double t2 = ts * ts;
+      const Eigen::Vector3d pos = start.position;
+      cps_.points.col(0) = pos - start_vel * ts + start_acc * (t2 / 3.0);
+      cps_.points.col(1) = pos - start_acc * (t2 / 6.0);
+      cps_.points.col(2) = pos + start_vel * ts + start_acc * (t2 / 3.0);
+    }
+    if (!optimizeControls(final_cost))
+      return PlanResult::RETRYABLE_FAILURE;
+    // Symmetric exact-anchor of the trailing control points AFTER the optimizer
+    // (the last order_=3 columns participate in L-BFGS; re-solving them here
+    // restores the exact end_pt / end_vel / end_acc boundary constraints that
+    // the smoothness cost would otherwise relax):
+    //   B(1)     = (P[n-3] + 4P[n-2] + P[n-1])/6 = end_pt
+    //   v(1)     = (P[n-1] - P[n-3])/(2*ts)      = end_vel
+    //   a(1)     = (P[n-3] - 2P[n-2] + P[n-1])/ts^2 = end_acc
+    if (cps_.points.cols() >= 3)
+    {
+      const double ts = bspline_interval_;
+      const double t2 = ts * ts;
+      const int n = static_cast<int>(cps_.points.cols());
+      cps_.points.col(n - 3) = end_pt - end_vel * ts + end_acc * (t2 / 3.0);
+      cps_.points.col(n - 2) = end_pt - end_acc * (t2 / 6.0);
+      cps_.points.col(n - 1) = end_pt + end_vel * ts + end_acc * (t2 / 3.0);
+    }
+
+    // Swarm rebound hard push is DISABLED by default (min-snap refactor):
+    // inter-UAV safety is owned by the execution-layer runtime distance gate
+    // (EgoSwarmDriver), not the optimizer.  Re-enable via enable_rebound for
+    // A/B comparison or the backup configuration.
+    if (config_.enable_rebound)
+      reboundFromNeighbors(neighbors_, point_set, config_.swarm_clearance * 2.0);
+
+    ego_planner::UniformBspline traj(cps_.points, order_, bspline_interval_);
+    // Physical-limit check (diagnostics only when time reparameterization is
+    // disabled).  Time reparameterization is DISABLED by default: the min-snap
+    // 0.4 m arc-length point set with ts = 0.4 s already yields ~1 m/s control
+    // spacing, and lengthening the time axis destabilizes the speed profile
+    // under 1 s rolling replan (see implementation_plan_26082415.md).
+    traj.setPhysicalLimits(config_.max_vel, config_.max_acc,
+                           config_.feasibility_tolerance);
+    double fea_ratio = 1.0;
+    const bool feasible = traj.checkFeasibility(fea_ratio);
+    // Rebound changes geometry after optimization and can create large control
+    // point derivatives. Never release an actively avoided trajectory that
+    // violates the configured physical limits. Reparameterize rebound output
+    // even when generic rolling-segment reparameterization remains disabled;
+    // the final clearance check below evaluates the resulting time axis again.
+    if (!feasible && (config_.enable_time_reparam || config_.enable_rebound))
+      traj.lengthenTime(fea_ratio);
+    double tm, tmp;
+    traj.getTimeSpan(tm, tmp);
+    const double duration = std::max(0.0, tmp - tm);
+    if (!std::isfinite(duration) || duration < 0.0)
+      return PlanResult::RETRYABLE_FAILURE;
+
+    ego_planner::UniformBspline dtraj = traj.getDerivative();
+    ego_planner::UniformBspline ddtraj = dtraj.getDerivative();
+    double du0 = 0.0, dup = 0.0;
+    // The derivative B-splines drop one knot per order, so their time spans are
+    // shorter than the position trajectory; clamp derivative samples to them.
+    const double t_der_max =
+        (dtraj.getTimeSpan(du0, dup)) ? std::max(0.0, dup - du0 - 1e-3) : duration;
+    double duu0 = 0.0, duup = 0.0;
+    const double t_acc_max =
+        (ddtraj.getTimeSpan(duu0, duup)) ? std::max(0.0, duup - duu0 - 1e-3) : t_der_max;
+
+    // Bounded TimedTrajectory sampling（§7）：nominal step 保持 0.1s（冻结契约，
+    // kSampleStepS）；非末端间隔 0.1s，末间隔在 (0,0.1s] 内精确覆盖 duration。
+    // duration/step 与样本数在转换为 size_t 和任何 reserve 前完成 checked
+    // arithmetic；超 max_trajectory_samples 直接 RESOURCE_LIMIT。
+    const double step = std::max(kSampleStepS, bspline_interval_ * 0.25);
+    if (!std::isfinite(step) || step <= 0.0)
+      return PlanResult::RETRYABLE_FAILURE;
+    std::size_t samples = 0;
+    {
+      const double nd = std::floor(duration / step) + 1.0;
+      if (!std::isfinite(nd) || nd < 0.0 ||
+          nd > static_cast<double>(std::numeric_limits<std::size_t>::max()))
+        return PlanResult::RESOURCE_LIMIT;
+      samples = static_cast<std::size_t>(nd);
+    }
+    // The final fractional sample may add one more entry (last == duration).
+    if (samples > config_.max_trajectory_samples ||
+        samples + 1 > config_.max_trajectory_samples)
+      return PlanResult::RESOURCE_LIMIT;
+
+    out.duration = duration;
+    out.t.clear();
+    out.pts.clear();
+    out.vel.clear();
+    out.acc.clear();
+    out.yaw.clear();
+    out.t.reserve(samples + 1);
+    out.pts.reserve(samples + 1);
+    out.vel.reserve(samples + 1);
+    out.acc.reserve(samples + 1);
+    out.yaw.reserve(samples + 1);
+
+    for (std::size_t i = 0; i < samples; ++i)
+    {
+      const double t_rel = std::min(duration, static_cast<double>(i) * step);
+      out.t.push_back(t_rel);
+      out.pts.push_back(traj.evaluateDeBoorT(t_rel));
+      out.vel.push_back(Eigen::Vector3d(dtraj.evaluateDeBoorT(std::min(t_rel, t_der_max))));
+      out.acc.push_back(Eigen::Vector3d(ddtraj.evaluateDeBoorT(std::min(t_rel, t_acc_max))));
+      out.yaw.push_back(start.yaw);
+    }
+    // The fixed sampling step rarely divides the exact B-spline duration. The
+    // intent contract requires t.back() == duration so neighbors can predict the
+    // entire execution interval rather than losing the fractional final sample.
+    if (!out.t.empty() && duration - out.t.back() > 1e-9)
+    {
+      out.t.push_back(duration);
+      out.pts.push_back(traj.evaluateDeBoorT(duration));
+      out.vel.push_back(Eigen::Vector3d(
+          dtraj.evaluateDeBoorT(std::min(duration, t_der_max))));
+      out.acc.push_back(Eigen::Vector3d(
+          ddtraj.evaluateDeBoorT(std::min(duration, t_acc_max))));
+      out.yaw.push_back(start.yaw);
+    }
+    if (out.t.empty())
+    {
+      out.t.push_back(0.0);
+      out.pts.push_back(start.position);
+      out.vel.push_back(Eigen::Vector3d::Zero());
+      out.acc.push_back(Eigen::Vector3d::Zero());
+      out.yaw.push_back(start.yaw);
+    }
+    // Anchor the sampled endpoints to the exact start position and the final
+    // key point so the timed trajectory strictly respects the sparse way
+    // point semantics regardless of the de Boor knot-interval definition.
+    if (!out.pts.empty())
+    {
+      out.pts.front() = start.position;
+      out.pts.back() = point_set.back();
+    }
+    // §7: all arrays must be equal length, all samples finite, time strictly
+    // increasing from 0 with the last sample exactly duration.
+    if (out.pts.size() != out.t.size() || out.vel.size() != out.t.size() ||
+        out.acc.size() != out.t.size() || out.yaw.size() != out.t.size())
+      return PlanResult::RETRYABLE_FAILURE;
+    if (out.t.empty() || std::abs(out.t.front()) > 1e-9 ||
+        std::abs(out.t.back() - out.duration) > 1e-6)
+      return PlanResult::RETRYABLE_FAILURE;
+    for (size_t i = 0; i < out.t.size(); ++i)
+    {
+      if (!std::isfinite(out.t[i]) || !out.pts[i].allFinite() ||
+          !out.vel[i].allFinite() || !out.acc[i].allFinite() ||
+          !std::isfinite(out.yaw[i]) ||
+          (i > 0 && out.t[i] <= out.t[i - 1]))
+        return PlanResult::RETRYABLE_FAILURE;
+    }
+    if (!checkClearance(out, neighbors_, config_.swarm_clearance * 2.0))
+      return PlanResult::RETRYABLE_FAILURE;
+    return PlanResult::SUCCESS;
   }
-
-  std::vector<Eigen::Vector3d> start_end_derivative(4, Eigen::Vector3d::Zero());
-  // upstream order: [0]=vel_start, [1]=vel_end, [2]=acc_start, [3]=acc_end
-  start_end_derivative[0] = start_vel;  // start velocity (rolling continuity)
-  start_end_derivative[1] = end_vel;    // end velocity (tangent cruise / stop)
-  start_end_derivative[2] = start_acc;  // start acceleration (rolling continuity)
-  start_end_derivative[3] = end_acc;    // end acceleration (zero)
-  Eigen::MatrixXd ctrl_pts;
-  ego_planner::UniformBspline::parameterizeToBspline(bspline_interval_, point_set,
-                                        start_end_derivative, ctrl_pts);
-  if (ctrl_pts.cols() < order_ + 1)
-    return false;
-
-  local_target_pt_ = point_set.back();
-  cps_.clearance = config_.swarm_clearance;
-  cps_.size = static_cast<int>(ctrl_pts.cols());
-  cps_.points = ctrl_pts;
-  neighbors_ = filterByRange(neighbors, start.position, config_.planning_range);
-
-  // Pin the last order_ control points as a hard terminal constraint so jerk
-  // smoothing cannot pull the free end away from the goal (original kernel
-  // uses end_id = size - order_, the "Fixed end" mode).
-  const int start_id = order_;
-  const int end_id = cps_.size;
-  variable_num_ = 3 * (end_id - start_id);
-  // Exact-anchor the leading control points so the spline start pose is
-  // exactly start.position.  The B-spline uses uniform (non-clamped) knots,
-  // so at t=0 the de Boor average B(0)=(P0+4P1+P2)/6 holds and the velocity
-  // row of parameterizeToBspline reads (P2-P0)/(2*ts) = start_vel.  The
-  // underlying parameterizeToBspline is an over-determined least-squares
-  // solve (K+2 controls vs K+4 constraints) and dilutes these boundary rows
-  // (measured start velocity came out ~8 m/s regardless of the requested
-  // derivative); re-solving P0..P2 here pins them exactly:
-  //   P0 = pos - vel*ts + acc*ts^2/3
-  //   P1 = pos - acc*ts^2/6
-  //   P2 = pos + vel*ts + acc*ts^2/3
-  // cols 0..2 are never optimized (start_id=3) nor rebound (rebound starts
-  // at i=order_).
-  if (cps_.points.cols() >= 3)
+  catch (const std::bad_alloc&)
   {
-    const double ts = bspline_interval_;
-    const double t2 = ts * ts;
-    const Eigen::Vector3d pos = start.position;
-    cps_.points.col(0) = pos - start_vel * ts + start_acc * (t2 / 3.0);
-    cps_.points.col(1) = pos - start_acc * (t2 / 6.0);
-    cps_.points.col(2) = pos + start_vel * ts + start_acc * (t2 / 3.0);
+    // §9.9：即使确定性门禁已存在，仍把分配失败收口为 RESOURCE_LIMIT，
+    // 不让异常逃出 replan 事务。
+    return PlanResult::RESOURCE_LIMIT;
   }
-  if (!optimizeControls(final_cost))
-    return false;
-  // Symmetric exact-anchor of the trailing control points AFTER the optimizer
-  // (the last order_=3 columns participate in L-BFGS; re-solving them here
-  // restores the exact end_pt / end_vel / end_acc boundary constraints that
-  // the smoothness cost would otherwise relax):
-  //   B(1)     = (P[n-3] + 4P[n-2] + P[n-1])/6 = end_pt
-  //   v(1)     = (P[n-1] - P[n-3])/(2*ts)      = end_vel
-  //   a(1)     = (P[n-3] - 2P[n-2] + P[n-1])/ts^2 = end_acc
-  if (cps_.points.cols() >= 3)
-  {
-    const double ts = bspline_interval_;
-    const double t2 = ts * ts;
-    const int n = static_cast<int>(cps_.points.cols());
-    cps_.points.col(n - 3) = end_pt - end_vel * ts + end_acc * (t2 / 3.0);
-    cps_.points.col(n - 2) = end_pt - end_acc * (t2 / 6.0);
-    cps_.points.col(n - 1) = end_pt + end_vel * ts + end_acc * (t2 / 3.0);
-  }
-
-  // Swarm rebound hard push is DISABLED by default (min-snap refactor):
-  // inter-UAV safety is owned by the execution-layer runtime distance gate
-  // (EgoSwarmDriver), not the optimizer.  Re-enable via enable_rebound for
-  // A/B comparison or the backup configuration.
-  if (config_.enable_rebound)
-    reboundFromNeighbors(neighbors_, point_set, config_.swarm_clearance * 2.0);
-
-  ego_planner::UniformBspline traj(cps_.points, order_, bspline_interval_);
-  // Physical-limit check (diagnostics only when time reparameterization is
-  // disabled).  Time reparameterization is DISABLED by default: the min-snap
-  // 0.4 m arc-length point set with ts = 0.4 s already yields ~1 m/s control
-  // spacing, and lengthening the time axis destabilizes the speed profile
-  // under 1 s rolling replan (see implementation_plan_26082415.md).
-  traj.setPhysicalLimits(config_.max_vel, config_.max_acc,
-                         config_.feasibility_tolerance);
-  double fea_ratio = 1.0;
-  const bool feasible = traj.checkFeasibility(fea_ratio);
-  // Rebound changes geometry after optimization and can create large control
-  // point derivatives. Never release an actively avoided trajectory that
-  // violates the configured physical limits. Reparameterize rebound output
-  // even when generic rolling-segment reparameterization remains disabled;
-  // the final clearance check below evaluates the resulting time axis again.
-  if (!feasible && (config_.enable_time_reparam || config_.enable_rebound))
-    traj.lengthenTime(fea_ratio);
-  double tm, tmp;
-  traj.getTimeSpan(tm, tmp);
-  const double duration = std::max(0.0, tmp - tm);
-  out.duration = duration;
-  ego_planner::UniformBspline dtraj = traj.getDerivative();
-  ego_planner::UniformBspline ddtraj = dtraj.getDerivative();
-  double du0 = 0.0, dup = 0.0;
-  // The derivative B-splines drop one knot per order, so their time spans are
-  // shorter than the position trajectory; clamp derivative samples to them.
-  const double t_der_max =
-      (dtraj.getTimeSpan(du0, dup)) ? std::max(0.0, dup - du0 - 1e-3) : duration;
-  double duu0 = 0.0, duup = 0.0;
-  const double t_acc_max =
-      (ddtraj.getTimeSpan(duu0, duup)) ? std::max(0.0, duup - duu0 - 1e-3) : t_der_max;
-  out.t.clear();
-  out.pts.clear();
-  out.vel.clear();
-  out.acc.clear();
-  out.yaw.clear();
-
-  const double step = std::max(kSampleStepS, bspline_interval_ * 0.25);
-  const int samples = static_cast<int>(std::floor(duration / step)) + 1;
-  out.t.reserve(samples);
-  out.pts.reserve(samples);
-  out.vel.reserve(samples);
-  out.acc.reserve(samples);
-  out.yaw.reserve(samples);
-
-  for (int i = 0; i < samples; ++i)
-  {
-    const double t_rel = std::min(duration, static_cast<double>(i) * step);
-    out.t.push_back(t_rel);
-    out.pts.push_back(traj.evaluateDeBoorT(t_rel));
-    out.vel.push_back(Eigen::Vector3d(dtraj.evaluateDeBoorT(std::min(t_rel, t_der_max))));
-    out.acc.push_back(Eigen::Vector3d(ddtraj.evaluateDeBoorT(std::min(t_rel, t_acc_max))));
-    out.yaw.push_back(start.yaw);
-  }
-  // The fixed sampling step rarely divides the exact B-spline duration. The
-  // intent contract requires t.back() == duration so neighbors can predict the
-  // entire execution interval rather than losing the fractional final sample.
-  if (!out.t.empty() && duration - out.t.back() > 1e-9)
-  {
-    out.t.push_back(duration);
-    out.pts.push_back(traj.evaluateDeBoorT(duration));
-    out.vel.push_back(Eigen::Vector3d(
-        dtraj.evaluateDeBoorT(std::min(duration, t_der_max))));
-    out.acc.push_back(Eigen::Vector3d(
-        ddtraj.evaluateDeBoorT(std::min(duration, t_acc_max))));
-    out.yaw.push_back(start.yaw);
-  }
-  if (out.t.empty())
-  {
-    out.t.push_back(0.0);
-    out.pts.push_back(start.position);
-    out.vel.push_back(Eigen::Vector3d::Zero());
-    out.acc.push_back(Eigen::Vector3d::Zero());
-    out.yaw.push_back(start.yaw);
-  }
-  // Anchor the sampled endpoints to the exact start position and the final
-  // key point so the timed trajectory strictly respects the sparse way
-  // point semantics regardless of the de Boor knot-interval definition.
-  if (!out.pts.empty())
-  {
-    out.pts.front() = start.position;
-    out.pts.back() = point_set.back();
-  }
-  if (!checkClearance(out, neighbors_, config_.swarm_clearance * 2.0))
-    return false;
-  return true;
 }
 
 bool EgoPlannerCore::checkClearance(const TimedTrajectory& trajectory,

@@ -2,6 +2,7 @@
 #define EGO_PLANNER_CORE_H_
 
 #include <Eigen/Eigen>
+#include <cstddef>
 #include <vector>
 
 #include "ego_planner_driver/lbfgs.hpp"
@@ -19,6 +20,22 @@ inline void clampVectorNorm(Eigen::Vector3d& v, double limit)
     v *= limit / n;
 }
 
+// 内部规划结果分类（implementation_plan_26082722 §5）。这些值只供 node 分流
+// 使用，不进入 ROS /exec_state，不改变 executor/backend 协议。
+enum class PlanResult
+{
+  SUCCESS,              // 完整轨迹生成成功
+  DEGENERATE_SEGMENT,   // planned start 到当前 target 方向退化，不生成新段
+  RETRYABLE_FAILURE,    // 普通有限数值输入无法形成合法轨迹（可重试）
+  RESOURCE_LIMIT        // 资源上限/checked arithmetic/bad_alloc，立即收口
+};
+
+// 编译期绝对 hard limits（资源配置不得超过；见 §11.3 fail-fast）。
+constexpr std::size_t kMaxArcSamplesAbsHard = 32768;              // 细折线采样绝对上限
+constexpr std::size_t kMaxParameterizationPointsAbsHard = 1024;   // B-spline 输入点集绝对上限
+constexpr std::size_t kMaxTrajectorySamplesAbsHard = 65536;       // TimedTrajectory 样本绝对上限
+constexpr std::size_t kMaxNeighborIntentSamplesAbsHard = 4096;    // 邻机 intent 样本绝对上限
+
 // Extracted, no-ROS numerical core of the ego-planner-swarm kernel.
 // Keeps three cost terms only: jerk smoothness, dynamic feasibility and
 // reciprocal swarm avoidance.  Static obstacle / moving object / fitness
@@ -29,6 +46,13 @@ struct EgoPlannerConfig
   double ts = 0.4;              // B-spline knot span (s)
   double max_vel = 8.0;         // m/s
   double max_acc = 6.0;         // m/s^2
+  // 资源安全边界（implementation_plan_26082722 §11）。node 启动时 fail-fast
+  // 校验：所有 count limit > 0 且不超过相应编译期绝对 hard limit。
+  std::size_t max_arc_samples = 4096;              // §6 细折线采样上限（0.02s 步长）
+  std::size_t max_parameterization_points = 256;   // §6.3 弧长重采样送入 B-spline 的点数上限
+  std::size_t max_trajectory_samples = 4096;       // §7 最终 TimedTrajectory 离散样本上限
+  std::size_t max_neighbor_intent_samples = 256;   // §10 每条邻机 intent 保留样本上限
+  double segment_direction_epsilon_m = 0.05;       // §5.2 方向有效性阈值（非任务到达容差）
   // Permitted ratio by which vel/acc may exceed limits before time reparam
   // triggers (upstream fsm: manager/feasibility_tolerance = 0.05).
   double feasibility_tolerance = 0.05;
@@ -213,13 +237,13 @@ public:
   // (min-snap unified single-segment refactor).  final_segment == true makes
   // the segment end velocity zero (static arrival); otherwise end_vel follows
   // the end-point tangent at min(cruise_velocity, max_vel) with end_acc = 0.
-  bool planOnce(const GoalPoint& start,
-                const std::vector<WayPoint>& sparse_waypoints,
-                const std::vector<NeighborTrajectory>& neighbors,
-                TimedTrajectory& out, double& final_cost,
-                const Eigen::Vector3d& start_vel = Eigen::Vector3d::Zero(),
-                const Eigen::Vector3d& start_acc = Eigen::Vector3d::Zero(),
-                bool final_segment = false);
+  PlanResult planOnce(const GoalPoint& start,
+                      const std::vector<WayPoint>& sparse_waypoints,
+                      const std::vector<NeighborTrajectory>& neighbors,
+                      TimedTrajectory& out, double& final_cost,
+                      const Eigen::Vector3d& start_vel = Eigen::Vector3d::Zero(),
+                      const Eigen::Vector3d& start_acc = Eigen::Vector3d::Zero(),
+                      bool final_segment = false);
 
   // Exposes the reciprocal clearance check for tests and gates.
   bool checkClearance(const TimedTrajectory& trajectory,

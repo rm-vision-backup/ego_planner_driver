@@ -148,6 +148,21 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 - `SafetyLogger` 有界队列 + 单写线程，覆盖写
   `/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner/UAVn-ego-planner.log`。
 
+## 结果分类（PlanResult，implementation_plan_26082722 §5）
+
+`planOnce()` 返回内部 `PlanResult`，只供本节点分流，不进入 `/exec_state`：
+
+| 结果 | 含义 | Node 行为 |
+|---|---|---|
+| `SUCCESS` | 完整轨迹生成成功 | 激活时刻复验 + clearance 复验 → 提交 `current_`、发布 intent、保持 `EXECUTING` |
+| `DEGENERATE_SEGMENT` | `start→target` 方向 < `segment_direction_epsilon`（0.05m） | 不提交、不推进、不失败计时、不触发制动；保留现有 `current_` 等待真实 odometry 推进/完成（§9.4） |
+| `RETRYABLE_FAILURE` | 普通有限数值失败（optimizer/clearance/动力学） | 保留现有轨迹，1s/事件 soft-landing 重试；连续 ≥10s（`plan_fail_timeout_s`）→ `EGO_PLAN_FAILED` |
+| `RESOURCE_LIMIT` | 样本/点数超限、checked arithmetic、`bad_alloc` | 同事务不重试不 yield → 立即 `EGO_PLAN_FAILED → executor HOLD → backend ALL HOLD`（§9.6） |
+
+- 短段/方向退化/final 段动力学不可行不得升级为紧急制动；`EMERGENCY_BRAKE` 仍只由 SafetyPredictor 紧急事件 + replan 失败 + TTC 门槛共同触发。
+- replan 线程最外层 `std::bad_alloc` containment（§9.9）：转为 `EGO_PLAN_FAILED`，不允许异常逃出进程。
+- `parameterizeToBspline` 改为 bounded single-QR（一次分解、x/y/z 三列 RHS、rank/residual/finite 校验、失败清空输出）。
+
 ## 轨迹生成（EgoPlannerCore::planOnce）
 
 - 起点 = 旧轨迹同刻 P/V/A/yaw（滚动连续，`sampleCurrentState`），首次 = 实际位置 + 零导数；
@@ -170,6 +185,11 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 | `planning_range` | 30.0 | 邻机轨迹纳入避碰的范围 |
 | `cruise_velocity` / `acceleration_limit` | 1.0 / 2.0 | 段末切线巡航速度 / 梯形时间加速度 |
 | `enable_rebound` / `enable_time_reparam` | false / false | 硬推 / 时间重参数化（默认关） |
+| `max_arc_samples` | 4096 | 多项式细折线采样上限（真实 `[0,T]` 域，0.02s 步长；§6.1） |
+| `max_parameterization_points` | 256 | 弧长重采样送入 B-spline 的点数上限（§6.3，64m@0.4m） |
+| `max_trajectory_samples` | 4096 | `TimedTrajectory` 离散样本上限（nominal step 保持 0.1s；§7） |
+| `max_neighbor_intent_samples` | 256 | 每条邻机 intent 保留样本上限（§10） |
+| `segment_direction_epsilon_m` | 0.05 | 方向有效性阈值（<0.05m → `DEGENERATE_SEGMENT`，非任务到达容差；§5.2） |
 | `replan_period_s` | 1.0 | 定时 replan 周期 |
 | `reach_thresh_m` / `max_advance_dist_m` / `arrival_reach_thresh_m` | 0.5 / 3.5 / 0.2 | 推进 / 推进上限 / 到达阈值 |
 | `no_replan_thresh_m` | 1.0 | 距最终目标该值内停止定时 replan |

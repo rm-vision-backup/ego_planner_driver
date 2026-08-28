@@ -1,6 +1,8 @@
 #include "ego_planner_driver/uniform_bspline.h"
 // removed: no ROS dependency in extracted kernel
 
+#include <cmath>
+
 namespace ego_planner
 {
 
@@ -208,30 +210,59 @@ namespace ego_planner
 
   // void UniformBspline::recomputeInit() {}
 
-  void UniformBspline::parameterizeToBspline(const double &ts, const vector<Eigen::Vector3d> &point_set,
+  bool UniformBspline::parameterizeToBspline(const double &ts, const vector<Eigen::Vector3d> &point_set,
                                              const vector<Eigen::Vector3d> &start_end_derivative,
+                                             std::size_t max_points,
                                              Eigen::MatrixXd &ctrl_pts)
   {
-    if (ts <= 0)
+    // 入口立即清空输出：失败/成功均不残留旧或半成品控制点。
+    ctrl_pts.resize(0, 0);
+
+    if (!(std::isfinite(ts)) || ts <= 0.0)
     {
       cout << "[B-spline]:time step error." << endl;
-      return;
+      return false;
     }
 
     if (point_set.size() <= 3)
     {
       cout << "[B-spline]:point set have only " << point_set.size() << " points." << endl;
-      return;
+      return false;
+    }
+
+    if (max_points < 4 || point_set.size() > max_points)
+    {
+      cout << "[B-spline]:point set size " << point_set.size()
+           << " outside [4, " << max_points << "]." << endl;
+      return false;
     }
 
     if (start_end_derivative.size() != 4)
     {
       cout << "[B-spline]:derivatives error." << endl;
+      return false;
     }
 
-    int K = point_set.size();
+    // size_t -> Eigen::Index/int conversions are safe after the max_points cap.
+    const Eigen::Index K = static_cast<Eigen::Index>(point_set.size());
+    for (Eigen::Index i = 0; i < K; ++i)
+    {
+      if (!point_set[static_cast<size_t>(i)].allFinite())
+      {
+        cout << "[B-spline]:non-finite point in point_set." << endl;
+        return false;
+      }
+    }
+    for (size_t i = 0; i < start_end_derivative.size(); ++i)
+    {
+      if (!start_end_derivative[i].allFinite())
+      {
+        cout << "[B-spline]:non-finite boundary derivative." << endl;
+        return false;
+      }
+    }
 
-    // write A
+    // write A (single shared system, once)
     Eigen::Vector3d prow(3), vrow(3), arow(3);
     prow << 1, 4, 1;
     vrow << -1, 0, 1;
@@ -239,7 +270,7 @@ namespace ego_planner
 
     Eigen::MatrixXd A = Eigen::MatrixXd::Zero(K + 4, K + 2);
 
-    for (int i = 0; i < K; ++i)
+    for (Eigen::Index i = 0; i < K; ++i)
       A.block(i, i, 1, 3) = (1 / 6.0) * prow.transpose();
 
     A.block(K, 0, 1, 3) = (1 / 2.0 / ts) * vrow.transpose();
@@ -248,36 +279,61 @@ namespace ego_planner
     A.block(K + 2, 0, 1, 3) = (1 / ts / ts) * arow.transpose();
     A.block(K + 3, K - 1, 1, 3) = (1 / ts / ts) * arow.transpose();
 
-    //cout << "A" << endl << A << endl << endl;
-
-    // write b
-    Eigen::VectorXd bx(K + 4), by(K + 4), bz(K + 4);
-    for (int i = 0; i < K; ++i)
+    // write b: (K+4) x 3, x/y/z in one RHS
+    Eigen::MatrixXd B(K + 4, 3);
+    for (Eigen::Index i = 0; i < K; ++i)
     {
-      bx(i) = point_set[i](0);
-      by(i) = point_set[i](1);
-      bz(i) = point_set[i](2);
+      B(i, 0) = point_set[static_cast<size_t>(i)](0);
+      B(i, 1) = point_set[static_cast<size_t>(i)](1);
+      B(i, 2) = point_set[static_cast<size_t>(i)](2);
     }
-
     for (int i = 0; i < 4; ++i)
     {
-      bx(K + i) = start_end_derivative[i](0);
-      by(K + i) = start_end_derivative[i](1);
-      bz(K + i) = start_end_derivative[i](2);
+      B(K + i, 0) = start_end_derivative[static_cast<size_t>(i)](0);
+      B(K + i, 1) = start_end_derivative[static_cast<size_t>(i)](1);
+      B(K + i, 2) = start_end_derivative[static_cast<size_t>(i)](2);
     }
 
-    // solve Ax = b
-    Eigen::VectorXd px = A.colPivHouseholderQr().solve(bx);
-    Eigen::VectorXd py = A.colPivHouseholderQr().solve(by);
-    Eigen::VectorXd pz = A.colPivHouseholderQr().solve(bz);
+    // single pivoted QR decomposition, 3-column solve (bounded dense QR:
+    // implementation_plan_26082722 §8; strict 256 default cap keeps the dense
+    // case small. SparseQR/banded solver is a separate optimization.)
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(A);
+    const Eigen::MatrixXd solution = qr.solve(B);
 
-    // convert to control pts
-    ctrl_pts.resize(3, K + 2);
-    ctrl_pts.row(0) = px.transpose();
-    ctrl_pts.row(1) = py.transpose();
-    ctrl_pts.row(2) = pz.transpose();
+    if (qr.info() != Eigen::Success)
+      return false;
+    if (!solution.allFinite())
+      return false;
+    // rank check: the solve reports rank; a rank-deficient system means the
+    // point set cannot determine the boundary-constrained spline.
+    if (qr.rank() < A.cols())
+    {
+      cout << "[B-spline]:rank-deficient parameterization." << endl;
+      return false;
+    }
+    // residual: verify the over-determined LS system did not diverge.  The
+    // (K+4)x(K+2) system carries boundary-velocity rows that a long route
+    // cannot satisfy exactly, so the least-squares residual is non-zero by
+    // design (§8.2).  A solve only "diverges" when the residual is comparable
+    // to the system scale ||A||*||solution|| (+||b||); any normal segment
+    // residual is orders of magnitude below that.  This rejects numerically
+    // broken solves (huge non-finite coordinates) without rejecting the 60 m
+    // regression path or normal short segments (§13.2).
+    const Eigen::MatrixXd residual = A * solution - B;
+    const double system_scale =
+        A.lpNorm<Eigen::Infinity>() * (solution.norm() + 1.0) + B.norm() + 1.0;
+    if (!std::isfinite(system_scale) || residual.norm() > 1e-3 * system_scale)
+    {
+      cout << "[B-spline]:residual too large." << endl;
+      return false;
+    }
+
+    // convert to control pts only after the complete solve succeeded.
+    // solution is (K+2) x 3; transposed here into (3 x K+2).
+    ctrl_pts = solution.transpose();
 
     // cout << "[B-spline]: parameterization ok." << endl;
+    return true;
   }
 
   double UniformBspline::getTimeSum()

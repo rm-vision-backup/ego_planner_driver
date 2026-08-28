@@ -85,6 +85,52 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.max_iterations = pnh_.param("max_iterations", 200);
   config.mem_size = pnh_.param("mem_size", 16);
   config.g_epsilon = pnh_.param("g_epsilon", 0.01);
+  // 资源安全边界（implementation_plan_26082722 §11）：与 launch 同步的五项
+  // 参数。fail-fast：count limit > 0 且不超过编译期绝对 hard limit，
+  // segment_direction_epsilon_m finite 且 > 0；危险配置拒绝启动不静默 clamp。
+  config.max_arc_samples = static_cast<std::size_t>(
+      pnh_.param("max_arc_samples", static_cast<int>(config.max_arc_samples)));
+  config.max_parameterization_points = static_cast<std::size_t>(
+      pnh_.param("max_parameterization_points",
+                 static_cast<int>(config.max_parameterization_points)));
+  config.max_trajectory_samples = static_cast<std::size_t>(
+      pnh_.param("max_trajectory_samples",
+                 static_cast<int>(config.max_trajectory_samples)));
+  config.max_neighbor_intent_samples = static_cast<std::size_t>(
+      pnh_.param("max_neighbor_intent_samples",
+                 static_cast<int>(config.max_neighbor_intent_samples)));
+  config.segment_direction_epsilon_m = pnh_.param(
+      "segment_direction_epsilon_m", config.segment_direction_epsilon_m);
+  max_arc_samples_ = config.max_arc_samples;
+  max_parameterization_points_ = config.max_parameterization_points;
+  max_trajectory_samples_ = config.max_trajectory_samples;
+  max_neighbor_intent_samples_ = config.max_neighbor_intent_samples;
+  segment_direction_epsilon_m_ = config.segment_direction_epsilon_m;
+  if (!(config.segment_direction_epsilon_m > 0.0) ||
+      !std::isfinite(config.segment_direction_epsilon_m))
+  {
+    ROS_FATAL("[%s] invalid segment_direction_epsilon_m=%f; refusing to start",
+              uav_id_.c_str(), config.segment_direction_epsilon_m);
+    ros::shutdown();
+    return;
+  }
+  if (config.max_arc_samples == 0 ||
+      config.max_arc_samples > kMaxArcSamplesAbsHard ||
+      config.max_parameterization_points == 0 ||
+      config.max_parameterization_points > kMaxParameterizationPointsAbsHard ||
+      config.max_trajectory_samples == 0 ||
+      config.max_trajectory_samples > kMaxTrajectorySamplesAbsHard ||
+      config.max_neighbor_intent_samples == 0 ||
+      config.max_neighbor_intent_samples > kMaxNeighborIntentSamplesAbsHard)
+  {
+    ROS_FATAL("[%s] resource limits outside [1, absolute hard]: "
+              "max_arc=%zu max_pts=%zu max_traj=%zu max_intent=%zu; refusing to start",
+              uav_id_.c_str(), config.max_arc_samples,
+              config.max_parameterization_points, config.max_trajectory_samples,
+              config.max_neighbor_intent_samples);
+    ros::shutdown();
+    return;
+  }
   // 规划层避碰门槛回固定 clearance（implementation_plan_26082602）：不再把
   // SafetyPredictor 动态距离参数同步给规划核心；监督层参数读入 safety_config_
   // （下方），规划层只消费 swarm_clearance×2 固定 gate。
@@ -371,8 +417,31 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
     }
     const std::vector<NeighborTrajectory> planning_neighbors =
         rebaseNeighbors(absolute_neighbors, assumed_activation);
-    if (!core_->planOnce(snap->start, snap->waypoints, planning_neighbors, traj, cost,
-                         snap->start_vel, snap->start_acc, snap->final_segment))
+    const PlanResult plan_result = core_->planOnce(
+        snap->start, snap->waypoints, planning_neighbors, traj, cost,
+        snap->start_vel, snap->start_acc, snap->final_segment);
+    if (plan_result == PlanResult::RESOURCE_LIMIT)
+    {
+      // §9.6：资源失败同一事务内不 activation retry、不 yield，立即安全收口
+      // 为 EGO_PLAN_FAILED（executor → HOLD → backend ALL HOLD）。
+      std::lock_guard<std::mutex> lock(mutex_);
+      captureHoldTargetLocked(nowFunc());
+      setState(kStatePlanFailed);
+      plan_fail_since_ = ros::Time();
+      ROS_ERROR("[%s] resource limit during replan; closing as EGO_PLAN_FAILED",
+                uav_id_.c_str());
+      return true;
+    }
+    if (plan_result == PlanResult::DEGENERATE_SEGMENT)
+    {
+      // §5.2/§9.4：planned start 到当前 target 方向退化。不提交新轨迹、不清
+      // 失败计时、不改状态；保留现有 current_ 及末端 P/V/A，等待真实 odometry
+      // 进入推进/到达门槛。返回 false 且不启动 plan_fail_since_。
+      ROS_DEBUG_THROTTLE(1.0, "[%s] degenerate segment; keeping current trajectory",
+                         uav_id_.c_str());
+      return false;
+    }
+    if (plan_result == PlanResult::RETRYABLE_FAILURE)
     {
       assumed_activation = nowFunc();
       continue;
@@ -403,8 +472,24 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
       }
     }
     // 常规 replan 失败 → 候选（SLOW/LEFT/RIGHT + right-of-way，replan 失败分支）。
-    if (snap && tryYieldReplan(*snap))
-      return true;
+    if (snap)
+    {
+      const YieldResult yield_result = tryYieldReplan(*snap);
+      if (yield_result == YieldResult::COMMITTED)
+        return true;
+      if (yield_result == YieldResult::RESOURCE_LIMIT)
+      {
+        // §9.6：候选生成内部资源失败 → 同一事务内立即收口，不进入软着陆。
+        std::lock_guard<std::mutex> lock(mutex_);
+        captureHoldTargetLocked(nowFunc());
+        setState(kStatePlanFailed);
+        plan_fail_since_ = ros::Time();
+        ROS_ERROR("[%s] resource limit during yield replan; closing as EGO_PLAN_FAILED",
+                  uav_id_.c_str());
+        return true;
+      }
+      // NOT_AVAILABLE：继续软着陆。
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     // 软着陆（26082700）：常规 replan 全失败不立即 PLAN_FAILED。保持当前轨迹
     // （继续执行到末端自然悬停），由 replanLoop 1s 定时/冲突事件继续重试；
@@ -445,8 +530,20 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
         yield_config_.clearance_factor * core_->config().swarm_clearance * 2.0;
     if (minClearanceWith(traj, activation_neighbors) < gate)
     {
-      if (tryYieldReplan(*snap))
+      const YieldResult yield_result = tryYieldReplan(*snap);
+      if (yield_result == YieldResult::COMMITTED)
         return true;
+      if (yield_result == YieldResult::RESOURCE_LIMIT)
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        captureHoldTargetLocked(nowFunc());
+        setState(kStatePlanFailed);
+        plan_fail_since_ = ros::Time();
+        ROS_ERROR("[%s] resource limit during margin yield replan; closing as EGO_PLAN_FAILED",
+                  uav_id_.c_str());
+        return true;
+      }
+      // 候选失败保持原轨迹（仍有 1m 硬门裕度），不 PLAN_FAILED。
     }
   }
   {
@@ -765,7 +862,9 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
       msg.uav_id == uav_id_ || msg.exec_target.empty() ||
       msg.frame_id != frame_id_ || !std::isfinite(msg.stamp) ||
       !std::isfinite(msg.clearance) || msg.clearance <= 0.0 ||
-      msg.t.size() != msg.sampled_traj.size() || msg.t.size() < 2)
+      msg.t.size() != msg.sampled_traj.size() || msg.t.size() < 2 ||
+      msg.t.size() > max_neighbor_intent_samples_ ||
+      msg.t.size() > kMaxNeighborIntentSamplesAbsHard)
     return false;
 
   // A trajectory epoch is its activation time. Reject already stale epochs and
@@ -1406,10 +1505,11 @@ void EgoPlannerDriverNode::commitYieldCandidate(const YieldCandidate& cand)
            uav_id_.c_str(), type, cand.min_clearance_m, cand.cost);
 }
 
-bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
+EgoPlannerDriverNode::YieldResult EgoPlannerDriverNode::tryYieldReplan(
+    const ReplanSnapshot& snap)
 {
   if (!enable_yield_candidates_ || !yield_generator_)
-    return false;
+    return YieldResult::NOT_AVAILABLE;
 
   // 1. right-of-way：找 primary peer（邻机轨迹到 start→goal 线段最近者）。
   std::string primary_peer;
@@ -1439,7 +1539,7 @@ bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
   const std::string my_identity = !uav_id_.empty() ? uav_id_ : exec_target_;
   if (!SafetyPredictor::parseNumericId(my_identity, my_id) ||
       !SafetyPredictor::parseNumericId(primary_peer, peer_id))
-    return false;  // UNKNOWN：不生成候选。
+    return YieldResult::NOT_AVAILABLE;  // UNKNOWN：不生成候选。
 
   // 非对称（26082621 迭代）：低 ID STAND_ON 只生成 SLOW 变速候选（减速等待/加速
   // 提前错开，不横向偏移——保持 nominal 语义）；高 ID YIELD 生成 SLOW/LEFT/RIGHT
@@ -1454,7 +1554,7 @@ bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
     if (ver != latest_neighbor_version_.end())
       primary_traj = ver->second.second;
     if (yield_committed_ && yield_peer_traj_id_ == primary_traj)
-      return false;
+      return YieldResult::NOT_AVAILABLE;
   }
 
   // 2. 生成候选：基于 nominal（无邻居规划）轨迹由生成器统一产出
@@ -1464,8 +1564,17 @@ bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
   double plan_cost = 0.0;
   bool nominal_ok = false;
   bool peer_hovering = false;
-  if (core_->planOnce(snap.start, snap.waypoints, {}, nominal, plan_cost,
-                      snap.start_vel, snap.start_acc, snap.final_segment))
+  const PlanResult nominal_result = core_->planOnce(
+      snap.start, snap.waypoints, {}, nominal, plan_cost,
+      snap.start_vel, snap.start_acc, snap.final_segment);
+  if (nominal_result == PlanResult::RESOURCE_LIMIT)
+  {
+    // §9.7：nominal/candidate planOnce 返回 RESOURCE_LIMIT 必须向上传播，
+    // 禁止降级成"无候选"后继续尝试其他档位或下一轮 activation retry。
+    ROS_ERROR("[%s] resource limit in yield nominal planOnce", uav_id_.c_str());
+    return YieldResult::RESOURCE_LIMIT;
+  }
+  if (nominal_result == PlanResult::SUCCESS)
   {
     nominal_ok = true;
     {
@@ -1494,7 +1603,7 @@ bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
              "nominal_ok=%d peer_hovering=%d)", uav_id_.c_str(),
              primary_peer.c_str(), stand_on ? 1 : 0, nominal_ok ? 1 : 0,
              peer_hovering ? 1 : 0);
-    return false;
+    return YieldResult::NOT_AVAILABLE;
   }
   std::sort(candidates.begin(), candidates.end(),
             [](const YieldCandidate& a, const YieldCandidate& b)
@@ -1505,7 +1614,7 @@ bool EgoPlannerDriverNode::tryYieldReplan(const ReplanSnapshot& snap)
   yield_peer_traj_id_ = primary_traj;
   ROS_WARN("[%s] yield replan committed (peer=%s)", uav_id_.c_str(),
            primary_peer.c_str());
-  return true;
+  return YieldResult::COMMITTED;
 }
 
 bool EgoPlannerDriverNode::isPeerHovering(const NeighborTrajectory& nb) const
@@ -1676,10 +1785,29 @@ void EgoPlannerDriverNode::replanLoop()
     if (!timed_out && !planning_requested_ && !emergency_pending_)
       continue;
     lock.unlock();
-    const bool committed = replanOnce(timed_out);  // 唯一提交者
+    // §9.9：replan 事务最外层窄范围 bad_alloc 边界。core 内部已把分配失败
+    // 收口为 RESOURCE_LIMIT；此处兜底 node 侧其他分配（current_ 复制、邻机
+    // 缓冲等）。转换为立即 EGO_PLAN_FAILED 安全收口，不允许异常逃出线程。
+    bool committed = false;
+    try
+    {
+      committed = replanOnce(timed_out);  // 唯一提交者
+    }
+    catch (const std::bad_alloc&)
+    {
+      {
+        std::lock_guard<std::mutex> catch_lock(mutex_);
+        captureHoldTargetLocked(nowFunc());
+        setState(kStatePlanFailed);
+        plan_fail_since_ = ros::Time();
+      }
+      ROS_ERROR("[%s] bad_alloc in replan thread; closing as EGO_PLAN_FAILED",
+                uav_id_.c_str());
+      committed = true;
+    }
     lock.lock();
     if (committed)
-      plan_fail_since_ = ros::Time();  // 成功提交（含 HOLD/制动/候选）→ 退出软着陆
+      plan_fail_since_ = ros::Time();  // 成功提交（含 HOLD/制动/候选/资源收口）→ 退出软着陆
   }
 }
 
