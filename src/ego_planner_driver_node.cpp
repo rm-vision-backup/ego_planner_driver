@@ -141,7 +141,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   no_replan_thresh_m_ = pnh_.param("no_replan_thresh_m", 1.0);
   reach_thresh_m_ = pnh_.param("reach_thresh_m", 0.5);
   max_advance_dist_m_ = pnh_.param("max_advance_dist_m", 3.5);
-  arrival_reach_thresh_m_ = pnh_.param("arrival_reach_thresh_m", 0.2);
+  arrival_reach_thresh_m_ = pnh_.param("arrival_reach_thresh_m", 0.5);
   activation_replan_attempts_ = std::max(
       1, pnh_.param("activation_replan_attempts", 3));
   setpoint_topic_ = pnh_.param("setpoint_out_topic", std::string("setpoint/ego"));
@@ -1313,7 +1313,7 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
     return;
   }
   // plan-exec 分支 A/B（每 tick）：推进（距当前目标 <0.5m 切下一 keypoint）与
-  // 到达（距最终关键点 <0.2m → COMPLETED）。推进时置 planning_requested_ 并
+  // 到达（距最终关键点 <0.5m → COMPLETED）。推进时置 planning_requested_ 并
   // 事件唤醒 replanLoop（单一入口）。
   if (exec_state_ == kStateExecuting && !emergency_braking_)
     checkArrival(current_->pts.back(), current_->yaw.back(), now);
@@ -1490,7 +1490,7 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
   const Eigen::Vector3d cur(local_pose_->pose.position.x,
                             local_pose_->pose.position.y,
                             local_pose_->pose.position.z);
-  // 分支 B：到达（||pos - 最终 keypoints|| < arrival_reach_thresh_m_ 0.2m）
+  // 分支 B：到达（||pos - 最终 keypoints|| < arrival_reach_thresh_m_ 0.5m）
   // → COMPLETED，冻结最终关键点位姿为 setpoint（executor 判成功；后续 HOLD/
   // 新目标由 onHold/onGoal 正常接管）。
   if (!waypoints_.empty() &&

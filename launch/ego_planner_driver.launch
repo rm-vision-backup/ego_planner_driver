@@ -20,11 +20,11 @@
     <param name="max_acc" value="6.0"/>
     <param name="replan_period_s" value="1.0"/>
     <!-- plan-exec A/B/C 分支阈值（implementation_plan_26082621）：到当前目标
-         <0.5m 切下一关键点、推进最远 3.5m、到达最终关键点 <0.2m → COMPLETED
-         （26082621 复盘：PX4 SITL 稳态偏差 0.13-0.17m，0.1m 太紧导致末段 HOLD）。 -->
+         <0.5m 切下一关键点、推进最远 3.5m、到达最终关键点 <0.5m → COMPLETED
+         （0.5m 为 260828 用户决策：15 机 prepare 实测终点偏差 0.29m 需覆盖）。 -->
     <param name="reach_thresh_m" value="0.5"/>
     <param name="max_advance_dist_m" value="3.5"/>
-    <param name="arrival_reach_thresh_m" value="0.2"/>
+    <param name="arrival_reach_thresh_m" value="0.5"/>
     <!-- Candidate activation-time reconciliation retries. Each retry advances
          neighbor intent epochs to the actual post-optimization activation. -->
     <param name="activation_replan_attempts" value="3"/>

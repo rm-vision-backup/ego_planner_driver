@@ -49,7 +49,7 @@
 HOLD(初始) ──arm+OFFBOARD──► TAKEOFF ──爬升到 takeoff_height_m(5m)──► HOLD
 HOLD ──goal/waypoints───────► EXECUTING
 EXECUTING ──分支A 推进───► EXECUTING（距当前目标<0.5m 切下一关键点，置位唤醒 replan）
-EXECUTING ──分支B 到达───► COMPLETED（距最终关键点<0.2m 稳定 1s）──► HOLD
+EXECUTING ──分支B 到达───► COMPLETED（距最终关键点<0.5m 稳定 1s）──► HOLD
 EXECUTING ──执行超时───────► EGO_EXEC_TIMEOUT ──(executor 收口)──► HOLD
 EXECUTING ──replan 全失败≥10s──► EGO_PLAN_FAILED ──(executor 收口)──► HOLD
 EXECUTING ──EMERGENCY+replan失败+ttc<1s──► EMERGENCY_BRAKE ──轨迹耗尽──► BRAKE_HOLD（锁存，不自动恢复）
@@ -72,7 +72,7 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 | 分支 | 条件 | 动作 |
 |---|---|---|
 | A 推进 | 距当前目标 `< reach_thresh_m_`(0.5m) | 切相邻下一关键点；过近(<0.5m)丢弃、最远 `max_advance_dist_m_`(3.5m) → 置 `planning_requested_` + 唤醒 |
-| B 到达 | 距最终关键点 `< arrival_reach_thresh_m_`(0.2m) 且稳定 `arrival_stable_s`(1.0s) | `COMPLETED` → 冻结终点点位为 HOLD（0.2m 为 SITL 稳态偏差 0.13–0.17m 复盘放宽） |
+| B 到达 | 距最终关键点 `< arrival_reach_thresh_m_`(0.5m) 且稳定 `arrival_stable_s`(1.0s) | `COMPLETED` → 冻结终点点位为 HOLD（0.5m 为 260828 用户决策由 0.2m 放宽，覆盖 15 机 prepare 实测 0.29m 终点偏差） |
 | C 定时 | `elapsed ≥ min(replan_period_s_=1.0, duration×0.85)` | 置 `planning_requested_`；距最终目标 `≤ no_replan_thresh_m_`(1.0m) 时停发，让末段自然走完触发 B |
 
 ## 单一 replan 入口（方案 A）
@@ -191,7 +191,7 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 | `max_neighbor_intent_samples` | 256 | 每条邻机 intent 保留样本上限（§10） |
 | `segment_direction_epsilon_m` | 0.05 | 方向有效性阈值（<0.05m → `DEGENERATE_SEGMENT`，非任务到达容差；§5.2） |
 | `replan_period_s` | 1.0 | 定时 replan 周期 |
-| `reach_thresh_m` / `max_advance_dist_m` / `arrival_reach_thresh_m` | 0.5 / 3.5 / 0.2 | 推进 / 推进上限 / 到达阈值 |
+| `reach_thresh_m` / `max_advance_dist_m` / `arrival_reach_thresh_m` | 0.5 / 3.5 / 0.5 | 推进 / 推进上限 / 到达阈值（0.5m 为 260828 用户决策由 0.2m 放宽） |
 | `no_replan_thresh_m` | 1.0 | 距最终目标该值内停止定时 replan |
 | `activation_replan_attempts` | 3 | 激活时刻对齐重试次数 |
 | `setpoint_rate_hz` / `local_pose_timeout_s` / `arrival_stable_s` | 30 / 1.0 / 1.0 | setpoint 频率 / pose 超时 / 到达稳定 |

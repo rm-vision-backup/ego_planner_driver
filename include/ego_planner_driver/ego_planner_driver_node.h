@@ -263,10 +263,10 @@ private:
   // plan-exec 循环 A/B/C 分支阈值（implementation_plan_26082621）：
   double reach_thresh_m_ = 0.5;         // 到当前目标 <0.5m → 切下一关键点
   double max_advance_dist_m_ = 3.5;     // 推进最远使用 3.5m 远的 keypoint
-  // 到达最终关键点阈值 0.2m（26082621 复盘放宽）：PX4 SITL 稳态位置偏差实测
-  // 0.13-0.17m，0.1m 阈值导致长距离任务末段停稳后永不触发 COMPLETED → 5s 超时
-  // HOLD；0.2m 匹配 executor position_tolerance_m=0.2 惯例，COMPLETED 可靠触发。
-  double arrival_reach_thresh_m_ = 0.2;
+  // 到达最终关键点阈值 0.5m（260828 用户决策，由 0.2m 放宽）：15 机 prepare
+  // 第 3 轮实测 UAV3 终点偏差 0.29m 停在 0.2m 判据外 → checkArrival 看门狗 HOLD
+  // → COMMAND_HELD；0.5m/arrival_stable_s=1.0s 锁存覆盖该偏差，COMPLETED 可靠触发。
+  double arrival_reach_thresh_m_ = 0.5;
   int activation_replan_attempts_ = 3;
   bool direct_control_active_ = false;
   volatile bool replan_loop_enabled_ = true;

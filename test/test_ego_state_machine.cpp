@@ -992,14 +992,14 @@ TEST(EgoStateMachine, DegenerateWhileFailingClosesAfterTimeout)
   EXPECT_FALSE(node.replanOnce());  // 挡路 peer → 失败 → plan_fail_since_ 启动
   EXPECT_FALSE(node.planFailSinceForTest().isZero());
 
-  // 推进时钟模拟轨迹执行（elapsed 接近 duration）：pose 固定 (4.7,0,5)
-  // （距最终点 (5,0,5) 0.3m > 0.2m 不算到达）。planned_start 采样 clamp 到
-  // 轨迹末端 (5,0,5) == target → core 返回 DEGENERATE_SEGMENT；此时已有失败
-  // 计时 → 走软着陆失败路径：不清计时、不提交、定时重试直到 10s 收口。
+  // 推进时钟模拟轨迹执行（elapsed 接近 duration）：pose 固定 (4.3,0,5)
+  // （距最终点 (5,0,5) 0.7m > 0.5m 到达阈值，不算到达）。planned_start 采样
+  // clamp 到轨迹末端 (5,0,5) == target → core 返回 DEGENERATE_SEGMENT；此时已有
+  // 失败计时 → 走软着陆失败路径：不清计时、不提交、定时重试直到 10s 收口。
   for (int i = 0; i < 14; ++i)
   {
     clock.advance(1.0);
-    node.injectLocalPose(makePose(4.7, 0.0, 5.0, clock.get()));
+    node.injectLocalPose(makePose(4.3, 0.0, 5.0, clock.get()));
     node.publishSetpointTick();  // 维持 setpoint 流（不触发 COMPLETED/HOLD 分支以外的干扰）
     EXPECT_FALSE(node.replanOnce(true)) << "iter " << i;
     // 收口前失败计时持续不清（收口后清零，由下方最终断言验证）。
@@ -1174,9 +1174,9 @@ TEST(EgoStateMachine, PlanExecAdvanceDiscardsTooCloseTargets)
 
 TEST(EgoStateMachine, PlanExecArrivalCompletesAtFinalKeypoint)
 {
-  // plan-exec 分支 B：距最终关键点 < arrival_reach_thresh_m_（0.2m，稳定窗口后）
-  // → COMPLETED，冻结目标位姿。0.15m 在旧 0.1m 阈值外、新 0.2m 阈值内（PX4 SITL
-  // 稳态偏差实测 0.13-0.17m，26082621 复盘放宽）。
+  // plan-exec 分支 B：距最终关键点 < arrival_reach_thresh_m_（0.5m，稳定窗口后）
+  // → COMPLETED，冻结目标位姿。0.15m 偏差在 0.5m 阈值内（260828 由 0.2m 放宽，
+  // 覆盖 15 机 prepare 实测 0.29m 终点偏差）。
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
@@ -1251,7 +1251,7 @@ TEST(EgoStateMachine, RollingSegmentsReachCompleted)
 
 TEST(EgoStateMachine, RollingSegmentsReachCompletedWithTrackingLag)
 {
-  // 模拟 SITL 跟踪滞后 0.05m（< arrival_reach_thresh_m 0.2m）：推进/到达判定
+  // 模拟 SITL 跟踪滞后 0.05m（< arrival_reach_thresh_m 0.5m）：推进/到达判定
   // 仍收敛到 COMPLETED。
   usleep(600 * 1000);
   FakeClock clock;
