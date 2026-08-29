@@ -1,0 +1,30 @@
+# Safety/TTC/stale/emergency 参数 canonical 默认（implementation_plan_26082916 §4）。
+# 加载方式：node 私有 namespace（~）。
+# 校验：所有 double finite；TTC 检查 emergency_ttc_s <= warning_ttc_s；
+# emergency_maximum_duration_s >= emergency_minimum_duration_s；枚举白名单 {active,shadow,off}。
+# peer_data_age_cap_s 为诊断参数：不参与安全决策（schema 注明）。
+
+safety_supervisor_mode: active
+safety_supervisor_rate_hz: 25.0
+collision_check_rate_hz: 10.0
+bias_valid_s: 120.0
+safety_prediction_horizon_s: 5.0
+safety_sample_period_s: 0.05
+protected_distance_m: 1.0
+safety_control_delay_s: 0.20
+safety_compute_budget_s: 0.05
+peer_data_age_cap_s: 2.0
+emergency_decel_mps2: 2.0
+warning_buffer_m: 0.35
+emergency_buffer_m: 0.10
+warning_ttc_s: 3.0
+emergency_ttc_s: 1.5
+minimum_prediction_window_s: 0.25
+safety_episode_release_s: 1.0
+emergency_replan_time_s: 1.0
+emergency_max_velocity_mps: 1.5
+emergency_jerk_mps3: 8.0
+emergency_sample_period_s: 0.02
+emergency_minimum_duration_s: 0.4
+emergency_maximum_duration_s: 12.0
+neighbor_intent_stale_s: 30.0

@@ -1,0 +1,10 @@
+# 资源安全边界参数 canonical 默认（implementation_plan_26082722 §11 / 26082916 §4）。
+# 加载方式：node 私有 namespace（~）。
+# 校验：count limit 整数 >0 且不超过编译期绝对 hard limit（core.h kMax*AbsHard）；
+# 非法配置 fail-fast 拒绝启动（不静默 clamp）。
+
+max_arc_samples: 4096
+max_parameterization_points: 256
+max_trajectory_samples: 4096
+max_neighbor_intent_samples: 256
+segment_direction_epsilon_m: 0.05

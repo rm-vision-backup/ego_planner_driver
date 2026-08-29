@@ -49,12 +49,6 @@ static constexpr const char* kStateEmergencyBrake = "EMERGENCY_BRAKE";
 static constexpr const char* kStateBrakeHold = "BRAKE_HOLD";
 
 constexpr double kSetpointRateHz = 30.0;
-// Intent freshness bound: peers keep their intent within [now-30s, now+30s]
-// of the trajectory epoch. The 5.0s bound was too tight for long rolling
-// trajectories (>5s execution) refreshed periodically with a fixed epoch —
-// peers rejected the refresh as stale and the dynamic safe clearance kept
-// the old (large) intent age.
-constexpr double kNeighborStaleS = 30.0;
 
 // PositionTarget type masks (mavros_msgs constants):
 //   EGO trajectory: position + velocity + acceleration + yaw, yaw rate ignored.
@@ -365,6 +359,11 @@ private:
   // trajectories so a stopped peer stream is still detected.
   ros::Timer collision_check_timer_;
   double collision_check_rate_hz_ = 10.0;
+  // Intent freshness bound: peers keep their intent within [now-30s, now+30s]
+  // of the trajectory epoch. Read from neighbor_intent_stale_s (canonical
+  // safety_defaults.yaml; 30.0 keeps the fixed-epoch long rolling refresh
+  // semantics of the former kNeighborStaleS constant).
+  double neighbor_intent_stale_s_ = 30.0;
   // Serializes traj_id_ increment + intent_pub_ publish across the replan
   // thread and the safety-timer emergency-brake commit.
   std::mutex intent_pub_mutex_;

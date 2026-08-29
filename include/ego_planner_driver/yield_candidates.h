@@ -17,6 +17,9 @@ struct YieldCandidateConfig
   // 1.2（26082621 迭代由 1.3 放宽）：提供机间距离抖动缓冲，同时让更多候选通过
   // （lateral 1.3 档 ≥1.2 可用）；也作为"常规规划裕度不足"的候选触发阈值（replanOnce B）。
   double clearance_factor = 1.2;
+  // 统一 clearance：yield gate 使用本机 swarm_clearance（与 core/node 同源），
+  // 不写死 0.5（implementation_plan_26082916 §4 消除内部 gate 漂移）。
+  double swarm_clearance = 0.5;
   double lateral_max_m = 2.2;   // LEFT/RIGHT 峰值横向偏移上限
   double slow_min_scale = 0.3;  // SLOW 最低时间缩放（速度 ×scale，时长 ÷scale）
   // 档位（26082621 迭代）：SLOW {0.5, 0.8, 1.2}（0.8/1.2 微调与加速）；

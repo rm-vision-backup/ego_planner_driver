@@ -80,7 +80,7 @@ bool YieldCandidateGenerator::computeMinClearance(
   overlap_end = -std::numeric_limits<double>::infinity();
   if (traj.pts.empty() || traj.pts.size() != traj.t.size())
     return false;
-  const double gate = config_.clearance_factor * 2.0 * 0.5;  // 1.3m 时空球
+  const double gate = config_.clearance_factor * 2.0 * config_.swarm_clearance;
   for (size_t i = 0; i < traj.t.size(); ++i)
   {
     const double glb_time = traj.t[i];
@@ -116,7 +116,7 @@ bool YieldCandidateGenerator::validate(const TimedTrajectory& traj,
   double center = 0.0, os = 0.0, oe = 0.0;
   if (!computeMinClearance(traj, neighbors, min_clear, center, os, oe))
     return false;
-  const double gate = config_.clearance_factor * 2.0 * 0.5;
+  const double gate = config_.clearance_factor * 2.0 * config_.swarm_clearance;
   if (min_clear < gate)
     return false;
   // 合法性：finite + 时间单调。动力学由时间轴生成保证（速度 ≤1.5 驱动缩放）。

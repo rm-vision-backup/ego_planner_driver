@@ -176,14 +176,24 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 - intent 时间契约：`stamp`=实际激活 epoch、`t[0]=0`、`t.back()=duration`、`frame_id=map`；
   规划完成后按实际激活时刻重新推进邻机时间轴，最多重试 3 次。
 
-## 参数（launch：`ego_planner_driver.launch` / `uav_executor_ego.launch`）
+## 参数（canonical YAML：`ego_planner_driver/config/{planner,safety,resource_limits}_defaults.yaml`）
+
+业务默认唯一来源为三份 canonical YAML（standalone `ego_planner_driver.launch` 与 wrapper
+`uav_executor_ego.launch` 加载同一来源，implementation_plan_26082916 §3/§4）。launch 只保留
+identity/path/明确 deployment override（`uav_id`/`exec_target`/`frame_id`/`setpoint_out_topic`/
+`safety_supervisor_mode`/`diagnostic_log_dir`/`diagnostic_log_queue_size`/`enable_rebound`）。
+身份参数位于公开命名空间 `<namespace>/`；规划/安全调参位于私有 `<node_name>/`。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `ts` / `max_vel` / `max_acc` | 0.4 / 1.0 / 6.0 | B-spline 节距 / 速度 / 加速度上限 |
+| `order` | 3 | B-spline 阶数（>=1） |
 | `swarm_clearance` | 0.5 | 每机安全半径，互惠使用 ×2 = 1.0m |
 | `planning_range` | 30.0 | 邻机轨迹纳入避碰的范围 |
+| `lambda_smooth` / `lambda_swarm` / `lambda_feasibility` / `lambda_terminal` | 1.0 / 1.0 / 0.5 / 1.0 | 代价权重（feasibility 统一 0.5） |
 | `cruise_velocity` / `acceleration_limit` | 1.0 / 2.0 | 段末切线巡航速度 / 梯形时间加速度 |
+| `feasibility_tolerance` | 0.05 | 速度/加速度超限容差（时间重参数化触发） |
+| `max_iterations` / `mem_size` / `g_epsilon` | 200 / 16 / 0.01 | L-BFGS 参数 |
 | `enable_rebound` / `enable_time_reparam` | false / false | 硬推 / 时间重参数化（默认关） |
 | `max_arc_samples` | 4096 | 多项式细折线采样上限（真实 `[0,T]` 域，0.02s 步长；§6.1） |
 | `max_parameterization_points` | 256 | 弧长重采样送入 B-spline 的点数上限（§6.3，64m@0.4m） |
@@ -194,6 +204,7 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 | `reach_thresh_m` / `max_advance_dist_m` / `arrival_reach_thresh_m` | 0.5 / 3.5 / 0.5 | 推进 / 推进上限 / 到达阈值（0.5m 为 260828 用户决策由 0.2m 放宽） |
 | `no_replan_thresh_m` | 1.0 | 距最终目标该值内停止定时 replan |
 | `activation_replan_attempts` | 3 | 激活时刻对齐重试次数 |
+| `plan_fail_timeout_s` / `replan_failure_fatal` | 10.0 / true | 软着陆失败收口超时 / 常规失败是否收口 |
 | `setpoint_rate_hz` / `local_pose_timeout_s` / `arrival_stable_s` | 30 / 1.0 / 1.0 | setpoint 频率 / pose 超时 / 到达稳定 |
 | `exec_timeout_margin_s` | 5.0 | 轨迹耗尽后收口余量 |
 | `takeoff_height_m` / `takeoff_ascend_speed` | 5.0 / 1.0 | 软起飞高度 / 上升速度 |
@@ -201,16 +212,23 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 | `bias_valid_s` | 120.0 | GPS bias 新鲜窗口 |
 | `safety_supervisor_mode` / `safety_supervisor_rate_hz` | active / 25.0 | 监督模式 / 频率；可显式设为 shadow / off |
 | `protected_distance_m` | 1.0 | EMERGENCY 物理距离 |
-| `emergency_ttc_s` / `emergency_replan_time_s` | 1.5 / 1.0 | EMERGENCY ttc / 制动前重规划窗口 |
+| `warning_ttc_s` / `emergency_ttc_s` | 3.0 / 1.5 | WARNING/EMERGENCY ttc（校验 emergency<=warning） |
+| `emergency_replan_time_s` | 1.0 | 制动前重规划窗口 |
 | `emergency_decel_mps2` / `emergency_max_velocity_mps` / `emergency_jerk_mps3` | 2.0 / 1.5 / 8.0 | 制动动力学 |
+| `emergency_minimum_duration_s` / `emergency_maximum_duration_s` | 0.4 / 12.0 | 制动时长下限/上限（校验 max>=min） |
 | `safety_prediction_horizon_s` / `safety_sample_period_s` | 5.0 / 0.05 | 监督预测窗 / 采样步长 |
+| `peer_data_age_cap_s` | 2.0 | 诊断参数，**不参与安全决策** |
+| `neighbor_intent_stale_s` | 30.0 | 邻机 intent 接收窗 `[now±stale]`（接入实际 stale 判断） |
 | `first_plan_wait_timeout_s` | 10.0 | SEQUENTIAL_START 首轮等待前驱超时 |
 | `enable_yield_candidates` | true | 让路候选开关 |
 | `yield_clearance_factor` / `yield_lateral_max_m` / `yield_slow_min_scale` | 1.2 / 2.2 / 0.3 | 候选门槛 / 横向上限 / SLOW 最低档 |
-| `yield_max_velocity_mps` | 2.5 | 候选/加速档速度上限（独立于制动 1.5） |
-| `diagnostic_log_dir` / `diagnostic_log_queue_size` | 见 launch / 2048 | 监督日志目录 / 队列 |
+| `yield_max_velocity_mps` / `yield_hovering_velocity_mps` | 2.5 / 0.2 | 候选速度上限 / 邻机近似悬停判定 |
+| `diagnostic_log_dir` / `diagnostic_log_queue_size` | 见 launch / 2048 | 监督日志目录 / 队列（launch override） |
 
-身份参数（`uav_id`/`exec_target`）位于公开命名空间 `<namespace>/`；规划调参位于私有 `<node_name>/`。
+> 26082916 迁移：`planning_horizon` 运行配置已删除（26082621 plan-exec 取代，见
+> 迁移表）；`neighbor_stale_policy`/`neighbor_missing_policy` 为从未被源码读取的
+> 假配置，已从 launch 删除；`lambda_feasibility` 全链路统一 0.5。
+> 所有浮点参数节点启动时校验 finite/范围，TTC 单调与资源上限 fail-fast（不 clamp）。
 
 ## 安全与验证
 

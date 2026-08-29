@@ -46,6 +46,15 @@ target_link_libraries(ego_planner_driver_node_lib ego_planner_core ${catkin_LIBR
 add_executable(ego_planner_driver_node src/ego_planner_driver_node_main.cpp)
 target_link_libraries(ego_planner_driver_node ego_planner_driver_node_lib ego_planner_core ${catkin_LIBRARIES})
 
+# canonical 配置与 launch 安装（implementation_plan_26082916 §3：具体 YAML 路径需核对
+# catkin install 再写 launch；$(find ego_planner_driver) 在 install 空间指向 share/<pkg>）
+install(DIRECTORY launch/
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+)
+install(DIRECTORY config/
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/config
+)
+
 if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(test_trajectory test/test_trajectory.cpp)
   target_link_libraries(test_trajectory ego_planner_driver_node_lib ego_planner_core ${catkin_LIBRARIES})

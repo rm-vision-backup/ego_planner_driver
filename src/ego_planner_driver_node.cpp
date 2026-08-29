@@ -81,7 +81,10 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   config.enable_time_reparam = pnh_.param("enable_time_reparam", false);
   config.cruise_velocity = pnh_.param("cruise_velocity", 1.0);
   config.acceleration_limit = pnh_.param("acceleration_limit", 2.0);
-  config.lambda_feasibility = pnh_.param("lambda_feasibility", 1.0);
+  config.lambda_feasibility = pnh_.param("lambda_feasibility", 0.5);  // 统一 0.5（26082916 §4）
+  config.lambda_terminal = pnh_.param("lambda_terminal", 1.0);
+  config.feasibility_tolerance = pnh_.param("feasibility_tolerance", 0.05);
+  config.order = pnh_.param("order", 3);
   config.max_iterations = pnh_.param("max_iterations", 200);
   config.mem_size = pnh_.param("mem_size", 16);
   config.g_epsilon = pnh_.param("g_epsilon", 0.01);
@@ -142,10 +145,11 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   reach_thresh_m_ = pnh_.param("reach_thresh_m", 0.5);
   max_advance_dist_m_ = pnh_.param("max_advance_dist_m", 3.5);
   arrival_reach_thresh_m_ = pnh_.param("arrival_reach_thresh_m", 0.5);
-  activation_replan_attempts_ = std::max(
-      1, pnh_.param("activation_replan_attempts", 3));
   setpoint_topic_ = pnh_.param("setpoint_out_topic", std::string("setpoint/ego"));
   frame_id_ = pnh_.param("frame_id", std::string("map"));
+  plan_fail_timeout_s_ = pnh_.param("plan_fail_timeout_s", 10.0);
+  replan_failure_fatal_ = pnh_.param("replan_failure_fatal", true);
+  activation_replan_attempts_ = pnh_.param("activation_replan_attempts", 3);
   // Identity parameters live in the public namespace (/UAV1/*) so the
   // Python driver and topology can discover them; planner tuning stays
   // private.
@@ -177,6 +181,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   episode_release_hysteresis_s_ = pnh_.param(
       "safety_episode_release_s", 1.0);
   emergency_replan_time_s_ = pnh_.param("emergency_replan_time_s", 1.0);
+  neighbor_intent_stale_s_ = pnh_.param("neighbor_intent_stale_s", 30.0);
   first_plan_wait_timeout_s_ = pnh_.param("first_plan_wait_timeout_s", 10.0);
   // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，26082621 迭代）。
   enable_yield_candidates_ = pnh_.param("enable_yield_candidates", false);
@@ -187,7 +192,11 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   // （emergency_max_velocity_mps 1.5 保持）。SLOW 1.2 加速档 + PX4 执行超调实测
   // 1.49-1.54，原 1.5 上限过紧；上限 2.5 与测试判定一致（写在本驱动，不靠验证脚本）。
   yield_config_.max_velocity_mps = pnh_.param("yield_max_velocity_mps", 2.5);
+  yield_config_.hovering_velocity_mps = pnh_.param(
+      "yield_hovering_velocity_mps", 0.2);
   yield_config_.max_acceleration_mps2 = config.max_acc;
+  // 统一 clearance：yield gate 与 core/node 同源（26082916 §4）。
+  yield_config_.swarm_clearance = config.swarm_clearance;
   yield_generator_.reset(new YieldCandidateGenerator(yield_config_));
   safety_predictor_.reset(new SafetyPredictor(safety_config_));
   EmergencyBrakeConfig brake_config;
@@ -196,13 +205,129 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   brake_config.max_jerk_mps3 = pnh_.param("emergency_jerk_mps3", 8.0);
   brake_config.nominal_deceleration_mps2 = safety_config_.emergency_decel_mps2;
   brake_config.sample_period_s = pnh_.param("emergency_sample_period_s", 0.02);
+  brake_config.minimum_duration_s = pnh_.param(
+      "emergency_minimum_duration_s", 0.4);
+  brake_config.maximum_duration_s = pnh_.param(
+      "emergency_maximum_duration_s", 12.0);
   emergency_brake_generator_.reset(new EmergencyBrakeGenerator(brake_config));
+  // 集中参数语义校验（implementation_plan_26082916 §4/§7）：所有浮点 finite；
+  // 时间/频率/速度/距离/TTC >0（允许 0 者单独登记）；TTC 单调
+  // emergency_ttc <= warning_ttc；emergency_max_duration >= min；资源整数+硬限；
+  // 枚举白名单。非法配置 fail-fast（不静默 clamp、不降级）。
+  auto require = [&](bool ok, const char* what, double v) -> bool {
+    if (ok)
+      return true;
+    ROS_FATAL("[%s] invalid %s=%g; refusing to start", uav_id_.c_str(), what, v);
+    ros::shutdown();
+    return false;
+  };
+  auto requirePos = [&](double v, const char* what) {
+    return require(std::isfinite(v) && v > 0.0, what, v);
+  };
+  auto requireNonNeg = [&](double v, const char* what) {
+    return require(std::isfinite(v) && v >= 0.0, what, v);
+  };
+  auto requireIntPos = [&](int v, const char* what) {
+    return require(v > 0, what, static_cast<double>(v));
+  };
+  // --- planner 算法/执行 ---
+  if (!require(config.order >= 1, "order", config.order)) return;
+  if (!(requirePos(config.ts, "ts") && requirePos(config.max_vel, "max_vel") &&
+        requirePos(config.max_acc, "max_acc") &&
+        requirePos(config.swarm_clearance, "swarm_clearance") &&
+        requirePos(config.planning_range, "planning_range") &&
+        requirePos(config.cruise_velocity, "cruise_velocity") &&
+        requirePos(config.acceleration_limit, "acceleration_limit") &&
+        requirePos(config.g_epsilon, "g_epsilon") &&
+        require(std::isfinite(config.lambda_smooth) && config.lambda_smooth >= 0.0,
+                "lambda_smooth", config.lambda_smooth) &&
+        require(std::isfinite(config.lambda_swarm) && config.lambda_swarm >= 0.0,
+                "lambda_swarm", config.lambda_swarm) &&
+        require(std::isfinite(config.lambda_feasibility) &&
+                    config.lambda_feasibility >= 0.0,
+                "lambda_feasibility", config.lambda_feasibility) &&
+        require(std::isfinite(config.lambda_terminal) &&
+                    config.lambda_terminal >= 0.0,
+                "lambda_terminal", config.lambda_terminal) &&
+        require(std::isfinite(config.feasibility_tolerance) &&
+                    config.feasibility_tolerance > 0.0 &&
+                    config.feasibility_tolerance < 1.0,
+                "feasibility_tolerance", config.feasibility_tolerance) &&
+        requireIntPos(config.max_iterations, "max_iterations") &&
+        requireIntPos(config.mem_size, "mem_size")))
+    return;
+  if (!(requirePos(replan_period_s_, "replan_period_s") &&
+        requirePos(no_replan_thresh_m_, "no_replan_thresh_m") &&
+        requirePos(reach_thresh_m_, "reach_thresh_m") &&
+        requirePos(max_advance_dist_m_, "max_advance_dist_m") &&
+        requirePos(arrival_reach_thresh_m_, "arrival_reach_thresh_m") &&
+        requirePos(plan_fail_timeout_s_, "plan_fail_timeout_s") &&
+        requirePos(setpoint_rate_, "setpoint_rate_hz") &&
+        requirePos(pose_timeout_, "local_pose_timeout_s") &&
+        requirePos(stable_s_, "arrival_stable_s") &&
+        requirePos(timeout_margin_, "exec_timeout_margin_s") &&
+        requireNonNeg(takeoff_height_, "takeoff_height_m") &&
+        requirePos(takeoff_ascend_speed_, "takeoff_ascend_speed") &&
+        requirePos(first_plan_wait_timeout_s_, "first_plan_wait_timeout_s") &&
+        require(activation_replan_attempts_ >= 1, "activation_replan_attempts",
+                activation_replan_attempts_)))
+    return;
+  // --- yield 候选 ---
+  if (!(require(std::isfinite(yield_config_.clearance_factor) &&
+                    yield_config_.clearance_factor >= 1.0,
+                "yield_clearance_factor", yield_config_.clearance_factor) &&
+        requirePos(yield_config_.lateral_max_m, "yield_lateral_max_m") &&
+        require(std::isfinite(yield_config_.slow_min_scale) &&
+                    yield_config_.slow_min_scale > 0.0 &&
+                    yield_config_.slow_min_scale <= 1.0,
+                "yield_slow_min_scale", yield_config_.slow_min_scale) &&
+        requirePos(yield_config_.max_velocity_mps, "yield_max_velocity_mps") &&
+        requireNonNeg(yield_config_.hovering_velocity_mps,
+                      "yield_hovering_velocity_mps")))
+    return;
+  // --- safety / TTC / emergency / stale ---
+  if (!(requirePos(safety_supervisor_rate_hz_, "safety_supervisor_rate_hz") &&
+        requirePos(collision_check_rate_hz_, "collision_check_rate_hz") &&
+        requirePos(bias_valid_s_, "bias_valid_s") &&
+        requirePos(safety_config_.prediction_horizon_s,
+                   "safety_prediction_horizon_s") &&
+        requirePos(safety_config_.sample_period_s, "safety_sample_period_s") &&
+        requirePos(safety_config_.protected_distance_m, "protected_distance_m") &&
+        requireNonNeg(safety_config_.control_delay_s, "safety_control_delay_s") &&
+        requirePos(safety_config_.local_compute_budget_s,
+                   "safety_compute_budget_s") &&
+        requireNonNeg(safety_config_.peer_data_age_cap_s, "peer_data_age_cap_s") &&
+        requirePos(safety_config_.emergency_decel_mps2, "emergency_decel_mps2") &&
+        requireNonNeg(safety_config_.warning_buffer_m, "warning_buffer_m") &&
+        requireNonNeg(safety_config_.emergency_buffer_m, "emergency_buffer_m") &&
+        requirePos(safety_config_.warning_ttc_s, "warning_ttc_s") &&
+        requirePos(safety_config_.emergency_ttc_s, "emergency_ttc_s") &&
+        require(safety_config_.emergency_ttc_s <= safety_config_.warning_ttc_s,
+                "emergency_ttc_s<=warning_ttc_s", safety_config_.emergency_ttc_s) &&
+        requirePos(safety_config_.minimum_prediction_window_s,
+                   "minimum_prediction_window_s") &&
+        requireNonNeg(episode_release_hysteresis_s_, "safety_episode_release_s") &&
+        requirePos(emergency_replan_time_s_, "emergency_replan_time_s") &&
+        requirePos(brake_config.max_velocity_mps, "emergency_max_velocity_mps") &&
+        requirePos(brake_config.max_jerk_mps3, "emergency_jerk_mps3") &&
+        requirePos(brake_config.sample_period_s, "emergency_sample_period_s") &&
+        requirePos(brake_config.minimum_duration_s,
+                   "emergency_minimum_duration_s") &&
+        requirePos(brake_config.maximum_duration_s,
+                   "emergency_maximum_duration_s") &&
+        require(brake_config.maximum_duration_s >=
+                    brake_config.minimum_duration_s,
+                "emergency_maximum_duration_s>=minimum",
+                brake_config.maximum_duration_s) &&
+        requirePos(neighbor_intent_stale_s_, "neighbor_intent_stale_s")))
+    return;
   if (safety_supervisor_mode_ != "off" && safety_supervisor_mode_ != "shadow" &&
       safety_supervisor_mode_ != "active")
   {
-    ROS_ERROR("[%s] invalid safety_supervisor_mode=%s; disabling supervisor",
+    ROS_FATAL("[%s] invalid safety_supervisor_mode=%s; refusing to start",
               uav_id_.c_str(), safety_supervisor_mode_.c_str());
-    safety_supervisor_mode_ = "off";
+    ros::shutdown();
+    return;
   }
   if (safety_supervisor_mode_ != "off")
   {
@@ -966,7 +1091,7 @@ bool EgoPlannerDriverNode::acceptNeighborIntentLocked(
   const double epoch = msg.stamp + correction;
   ensureNeighborBiasSubscribed(msg.uav_id);
   const double age = now.toSec() - epoch;
-  if (age > kNeighborStaleS || age < -kNeighborStaleS)
+  if (age > neighbor_intent_stale_s_ || age < -neighbor_intent_stale_s_)
     return false;
 
   constexpr double kTimeEpsilon = 1e-9;
@@ -1045,7 +1170,7 @@ EgoPlannerDriverNode::freshAbsoluteNeighborsLocked(const ros::Time& now) const
   result.reserve(inbox_.size());
   for (const auto& item : inbox_)
   {
-    if ((now - item.second.second).toSec() <= kNeighborStaleS)
+    if ((now - item.second.second).toSec() <= neighbor_intent_stale_s_)
     {
       NeighborTrajectory neighbor = item.second.first;
       neighbor.data_age_s = std::max(0.0, (now - item.second.second).toSec());
@@ -1555,7 +1680,7 @@ void EgoPlannerDriverNode::runCollisionCheckTick()
       yield_config_.clearance_factor * core_->config().swarm_clearance * 2.0;
   for (const auto& item : inbox_)
   {
-    if ((now - item.second.second).toSec() > kNeighborStaleS)
+    if ((now - item.second.second).toSec() > neighbor_intent_stale_s_)
       continue;
     NeighborTrajectory nb = item.second.first;
     nb.start_time -= base;
@@ -1614,7 +1739,7 @@ EgoPlannerDriverNode::YieldResult EgoPlannerDriverNode::tryYieldReplan(
     const ros::Time now = nowFunc();
     for (const auto& item : inbox_)
     {
-      if ((now - item.second.second).toSec() > kNeighborStaleS)
+      if ((now - item.second.second).toSec() > neighbor_intent_stale_s_)
         continue;
       const NeighborTrajectory& nb = item.second.first;
       for (const auto& p : nb.pts)

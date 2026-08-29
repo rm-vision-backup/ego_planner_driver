@@ -45,7 +45,7 @@ Eigen::Vector3d sampleNeighbor(const NeighborTrajectory& traj, double t_rel)
 // Uniform densification moved to the Python EgoSwarmDriver layer (plan B):
 // the driver builds command-specific layered keypoints and densifies them to
 // 2 m before publishing waypoints.  This core only parameterizes whatever
-// waypoints it receives (node truncates them to planning_horizon).
+// waypoints it receives (node truncates them by adjacent keypoint advance).
 
 // Trapezoidal time estimator for the min-snap segment duration T.
 // v0 = start velocity projected onto the segment direction (already clamped).
@@ -659,10 +659,9 @@ PlanResult EgoPlannerCore::planOnce(const GoalPoint& start,
       final_cost = 0.0;
       return PlanResult::SUCCESS;
     }
-    // Window end point: the last waypoint of this plan.  The node already
-    // truncated sparse_waypoints to planning_horizon; when final_segment the
-    // waypoints are the full remaining route and end_vel must be zero (static
-    // arrival).  Cruise segments keep end_vel = tangent * min(v_cruise, max_vel)
+    // Window end point: the last waypoint of this plan.  The node advances by
+    // adjacent keypoint (plan-exec loop); when final_segment the waypoints are
+    // the full remaining route and end_vel must be zero (static arrival).  Cruise segments keep end_vel = tangent * min(v_cruise, max_vel)
     // so the rolling replan's next segment joins velocity-continuously.
     const Eigen::Vector3d end_pt = sparse_waypoints.back().position;
     const Eigen::Vector3d dir = end_pt - start.position;

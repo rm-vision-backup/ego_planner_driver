@@ -1,0 +1,43 @@
+# Planner 核心算法/执行参数 canonical 默认（implementation_plan_26082916 §4）。
+# 加载方式：node 私有 namespace（~）；launch 仅保留 identity/path/明确 deployment override。
+# 校验：所有 double finite；时间/速度/距离/频率 >0；非法配置节点 fail-fast 拒绝启动。
+
+order: 3
+ts: 0.4
+max_vel: 1.0
+max_acc: 6.0
+swarm_clearance: 0.5
+planning_range: 30.0
+lambda_smooth: 1.0
+lambda_swarm: 1.0
+lambda_feasibility: 0.5
+lambda_terminal: 1.0
+enable_rebound: false
+enable_time_reparam: false
+cruise_velocity: 1.0
+acceleration_limit: 2.0
+feasibility_tolerance: 0.05
+max_iterations: 200
+mem_size: 16
+g_epsilon: 0.01
+replan_period_s: 1.0
+no_replan_thresh_m: 1.0
+reach_thresh_m: 0.5
+max_advance_dist_m: 3.5
+arrival_reach_thresh_m: 0.5
+activation_replan_attempts: 3
+plan_fail_timeout_s: 10.0
+replan_failure_fatal: true
+setpoint_rate_hz: 30.0
+local_pose_timeout_s: 1.0
+arrival_stable_s: 1.0
+exec_timeout_margin_s: 5.0
+takeoff_height_m: 5.0
+takeoff_ascend_speed: 1.0
+first_plan_wait_timeout_s: 10.0
+enable_yield_candidates: true
+yield_clearance_factor: 1.2
+yield_lateral_max_m: 2.2
+yield_slow_min_scale: 0.3
+yield_max_velocity_mps: 2.5
+yield_hovering_velocity_mps: 0.2

@@ -56,11 +56,6 @@ struct EgoPlannerConfig
   // Permitted ratio by which vel/acc may exceed limits before time reparam
   // triggers (upstream fsm: manager/feasibility_tolerance = 0.05).
   double feasibility_tolerance = 0.05;
-  // Receding-horizon planning range [m]: only the waypoints ahead of the
-  // current pose within planning_horizon are parameterized per plan, aligned
-  // with upstream ego-planner-swarm. <= 0 plans the full route at once
-  // (global-planning regression mode).
-  double planning_horizon = 0.0;
   // Per-aircraft clearance radius. Reciprocal checks use twice this value;
   // 0.5 m therefore enforces 1.0 m centre distance in every axis (symmetric
   // clearance sphere; the vertical axis was reduced from 2.0 m to 1.0 m).
@@ -70,7 +65,7 @@ struct EgoPlannerConfig
   double planning_range = 30.0; // neighbor trajectories beyond this are ignored
   double lambda_smooth = 1.0;
   double lambda_swarm = 1.0;
-  double lambda_feasibility = 1.0;
+  double lambda_feasibility = 0.5;  // 统一 authoritative default（26082916 §4）
   double lambda_terminal = 1.0;
   // Rebound hard push: after L-BFGS, control points that intrude a neighbor's
   // clearance are pushed out along the waypoint-normal direction (waypoints

@@ -13,95 +13,18 @@
   <param name="exec_target" value="$(arg exec_target)"/>
 
   <node pkg="ego_planner_driver" type="ego_planner_driver_node" name="ego_planner_driver" output="screen">
+    <!-- canonical 三份配置（implementation_plan_26082916 §3/§4，node 私有 namespace）：
+         planner_defaults.yaml=算法/执行、safety_defaults.yaml=Safety/TTC/stale/emergency、
+         resource_limits.yaml=资源上限。业务默认一律来自 YAML，launch 不保存第二套默认。 -->
+    <rosparam command="load" file="$(find ego_planner_driver)/config/planner_defaults.yaml" />
+    <rosparam command="load" file="$(find ego_planner_driver)/config/safety_defaults.yaml" />
+    <rosparam command="load" file="$(find ego_planner_driver)/config/resource_limits.yaml" />
+    <!-- 仅 identity/path/明确 deployment override：
+         frame_id/setpoint_out_topic=协议路径；safety_supervisor_mode=部署（默认 active，
+         诊断可 shadow）；diagnostic_log_dir/queue_size=日志路径与容量。 -->
     <param name="frame_id" value="map"/>
-    <!-- B-spline knot span: upstream ctrl_pt_dist/max_vel*1.5 = 0.4/1.0*1.5 = 0.6 s -->
-    <param name="ts" value="0.4"/>
-    <param name="max_vel" value="1.0"/>
-    <param name="max_acc" value="6.0"/>
-    <param name="replan_period_s" value="1.0"/>
-    <!-- plan-exec A/B/C 分支阈值（implementation_plan_26082621）：到当前目标
-         <0.5m 切下一关键点、推进最远 3.5m、到达最终关键点 <0.5m → COMPLETED
-         （0.5m 为 260828 用户决策：15 机 prepare 实测终点偏差 0.29m 需覆盖）。 -->
-    <param name="reach_thresh_m" value="0.5"/>
-    <param name="max_advance_dist_m" value="3.5"/>
-    <param name="arrival_reach_thresh_m" value="0.5"/>
-    <!-- Candidate activation-time reconciliation retries. Each retry advances
-         neighbor intent epochs to the actual post-optimization activation. -->
-    <param name="activation_replan_attempts" value="3"/>
-    <!-- 最终目标附近（no_replan_thresh_m 内）停止时间触发重规划，让最后一段
-         轨迹自然减速走完（对齐原版 fsm/thresh_no_replan_meter） -->
-    <param name="no_replan_thresh_m" value="1.0"/>
-    <!-- 候选 setpoint 话题（PositionTarget，relay 唯一出口，业务层不改 MAVROS 话题） -->
     <param name="setpoint_out_topic" value="/setpoint/ego"/>
-    <!-- Per-aircraft clearance radius; reciprocal hard center spacing is 2x. -->
-    <param name="swarm_clearance" value="0.5"/>
-    <param name="planning_range" value="30.0"/>
-    <param name="lambda_smooth" value="1.0"/>
-    <param name="lambda_swarm" value="1.0"/>
-    <!-- min-snap 重构：rebound 硬推与时间重参数化默认关闭（机间安全由执行层
-         运行时距离门禁兜底）；如需 A/B 对比或回退可改 enable_rebound/
-         enable_time_reparam。cruise_velocity 为滚动段末点切线巡航速度上限。 -->
-    <param name="enable_rebound" value="false"/>
-    <param name="enable_time_reparam" value="false"/>
-    <param name="cruise_velocity" value="1.0"/>
-    <param name="acceleration_limit" value="2.0"/>
-    <param name="lambda_feasibility" value="0.5"/>
-    <!-- 资源安全边界（implementation_plan_26082722 §11）：node 启动时 fail-fast
-         校验 count limit>0 且不超过编译期绝对 hard limit；危险配置拒绝启动。 -->
-    <param name="max_arc_samples" value="4096"/>
-    <param name="max_parameterization_points" value="256"/>
-    <param name="max_trajectory_samples" value="4096"/>
-    <param name="max_neighbor_intent_samples" value="256"/>
-    <param name="segment_direction_epsilon_m" value="0.05"/>
-    <param name="setpoint_rate_hz" value="30.0"/>
-    <param name="local_pose_timeout_s" value="1.0"/>
-    <param name="arrival_stable_s" value="1.0"/>
-    <param name="exec_timeout_margin_s" value="5.0"/>
-    <param name="takeoff_height_m" value="5.0"/>
-    <param name="takeoff_ascend_speed" value="1.0"/>
-    <!-- 监督层默认 active，接入重规划/制动兜底；需要仅记录诊断且不改变
-         状态、轨迹、intent 或 setpoint 行为时，可显式传入 shadow。 -->
     <param name="safety_supervisor_mode" value="$(arg safety_supervisor_mode)"/>
-    <param name="safety_supervisor_rate_hz" value="25.0"/>
-    <!-- 周期碰撞检查：10Hz，本机轨迹 vs fresh 邻机轨迹，< 固定 clearance → replan
-         （implementation_plan_26082602；intent 生成即发，无周期 5Hz 刷新）。 -->
-    <param name="collision_check_rate_hz" value="10.0"/>
-    <param name="bias_valid_s" value="120.0"/>
-    <param name="safety_prediction_horizon_s" value="5.0"/>
-    <param name="safety_sample_period_s" value="0.05"/>
-    <param name="protected_distance_m" value="1.0"/>
-    <param name="safety_control_delay_s" value="0.20"/>
-    <param name="safety_compute_budget_s" value="0.05"/>
-    <param name="peer_data_age_cap_s" value="2.0"/>
-    <param name="emergency_decel_mps2" value="2.0"/>
-    <param name="emergency_jerk_mps3" value="8.0"/>
-    <param name="emergency_max_velocity_mps" value="1.5"/>
-    <param name="emergency_sample_period_s" value="0.02"/>
-    <param name="warning_buffer_m" value="0.35"/>
-    <param name="emergency_buffer_m" value="0.10"/>
-    <param name="warning_ttc_s" value="3.0"/>
-    <param name="emergency_ttc_s" value="1.5"/>
-    <param name="minimum_prediction_window_s" value="0.25"/>
-    <param name="safety_episode_release_s" value="1.0"/>
-    <!-- 对齐原版 fsm/emergency_time=1.0s：EMERGENCY 先尝试重规划，预测越界
-         (ttc) 小于该值才立即受约束制动，否则交常规 replanLoop。 -->
-    <param name="emergency_replan_time_s" value="1.0"/>
-    <!-- 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，implementation_plan_26082602 §10）：
-         collisionCheckTick 检测冲突（min_clear < 1.2×clearance，yield_clearance_factor=1.2）
-         → 本机 YIELD（ID 小于 primary peer）生成候选，cost 最小者提交。 -->
-    <param name="enable_yield_candidates" value="true"/>
-    <param name="yield_clearance_factor" value="1.2"/>
-    <param name="yield_lateral_max_m" value="2.2"/>
-    <param name="yield_slow_min_scale" value="0.3"/>
-    <!-- 候选/加速档最大速度上限（26082621 迭代）：2.5 写在本驱动，独立于制动
-         （emergency_max_velocity_mps=1.5 保持）；与测试判定一致。 -->
-    <param name="yield_max_velocity_mps" value="2.5"/>
-    <!-- 对齐原版 SEQUENTIAL_START：首轮规划前等待前驱无人机 intent 超时（防
-         前驱缺失/失联时永久阻塞）；默认 10s。 -->
-    <param name="first_plan_wait_timeout_s" value="10.0"/>
-    <param name="neighbor_stale_policy" value="diagnose_only"/>
-    <param name="neighbor_intent_stale_s" value="2.0"/>
-    <param name="neighbor_missing_policy" value="continue_after_barrier"/>
     <param name="diagnostic_log_dir" value="/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner"/>
     <param name="diagnostic_log_queue_size" value="2048"/>
   </node>
