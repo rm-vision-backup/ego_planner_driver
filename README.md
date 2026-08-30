@@ -216,7 +216,7 @@ identity/path/明确 deployment override（`uav_id`/`exec_target`/`frame_id`/`se
 | `emergency_replan_time_s` | 1.0 | 制动前重规划窗口 |
 | `emergency_decel_mps2` / `emergency_max_velocity_mps` / `emergency_jerk_mps3` | 2.0 / 1.5 / 8.0 | 制动动力学 |
 | `emergency_minimum_duration_s` / `emergency_maximum_duration_s` | 0.4 / 12.0 | 制动时长下限/上限（校验 max>=min） |
-| `safety_prediction_horizon_s` / `safety_sample_period_s` | 5.0 / 0.05 | 监督预测窗 / 采样步长 |
+| `safety_prediction_horizon_s` / `safety_sample_period_s` | 3.0 / 0.05 | 监督预测窗（260830 由 5.0 缩短）/ 采样步长 |
 | `peer_data_age_cap_s` | 2.0 | 诊断参数，**不参与安全决策** |
 | `neighbor_intent_stale_s` | 30.0 | 邻机 intent 接收窗 `[now±stale]`（接入实际 stale 判断） |
 | `first_plan_wait_timeout_s` | 10.0 | SEQUENTIAL_START 首轮等待前驱超时 |

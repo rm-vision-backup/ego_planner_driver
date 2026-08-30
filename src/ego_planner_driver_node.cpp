@@ -166,7 +166,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
       "safety_supervisor_mode", std::string("active"));
   safety_supervisor_rate_hz_ = pnh_.param("safety_supervisor_rate_hz", 25.0);
   safety_config_.protected_distance_m = pnh_.param("protected_distance_m", 1.0);
-  safety_config_.prediction_horizon_s = pnh_.param("safety_prediction_horizon_s", 5.0);
+  safety_config_.prediction_horizon_s = pnh_.param("safety_prediction_horizon_s", 3.0);
   safety_config_.sample_period_s = pnh_.param("safety_sample_period_s", 0.05);
   safety_config_.control_delay_s = pnh_.param("safety_control_delay_s", 0.20);
   safety_config_.local_compute_budget_s = pnh_.param("safety_compute_budget_s", 0.05);

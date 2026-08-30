@@ -16,7 +16,7 @@ enum class SafetyLevel { SAFE, WARNING, EMERGENCY, INSUFFICIENT_DATA };
 struct SafetyPredictorConfig
 {
   double protected_distance_m = 1.0;
-  double prediction_horizon_s = 5.0;
+  double prediction_horizon_s = 3.0;
   double sample_period_s = 0.05;
   double control_delay_s = 0.20;
   double local_compute_budget_s = 0.05;

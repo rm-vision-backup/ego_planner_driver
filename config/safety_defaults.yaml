@@ -12,7 +12,8 @@ collision_check_rate_hz: 10.0          # 冲突检测频率（Hz，>0）：colli
 bias_valid_s: 120.0                    # GPS bias 新鲜度窗口（s，>0）：邻机 intent 时间戳修正有效时长，过期回退不修正
 
 # —— 预测与门槛 ——
-safety_prediction_horizon_s: 5.0       # 预测时域（s，>0）：SafetyPredictor 前向预测长度
+safety_prediction_horizon_s: 3.0       # 预测时域（s，>0）：SafetyPredictor 前向预测长度（260830 由 5.0 缩短：
+                                       #   15-UAV 回归显示 5s 窗外推 intent 尾段产生假 EMERGENCY）
 safety_sample_period_s: 0.05           # 预测采样步长（s，>0）：SafetyPredictor 采样间隔
 protected_distance_m: 1.0              # 受保护距离（m，>0，1m 三维门禁）：SafetyPredictor 最小机间距离判据
 safety_control_delay_s: 0.20           # 控制延迟补偿（s，>=0）：预测起点前移的控制链路延迟
