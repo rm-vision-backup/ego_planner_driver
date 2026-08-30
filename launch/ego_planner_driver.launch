@@ -6,7 +6,9 @@
        （backend 任务协议 / identity map）使用 A01-A15，由 executor 层映射。 -->
   <arg name="uav_id" default="UAV1"/>
   <arg name="exec_target" default="UAV1"/>
-  <arg name="safety_supervisor_mode" default="active"/>
+  <!-- safety_supervisor_mode 业务默认来自 safety_defaults.yaml（active）；launch arg
+       默认空，仅命令行显式传入时条件覆盖（implementation_plan_26083018 §3）。 -->
+  <arg name="safety_supervisor_mode" default=""/>
 
   <!-- 身份参数放全局（/uav_id、/exec_target），供 EgoSwarmDriver 与 bridge 发现。 -->
   <param name="uav_id" value="$(arg uav_id)"/>
@@ -21,10 +23,10 @@
     <rosparam command="load" file="$(find ego_planner_driver)/config/resource_limits.yaml" />
     <!-- 仅 identity/path/明确 deployment override：
          frame_id/setpoint_out_topic=协议路径；safety_supervisor_mode=部署（默认 active，
-         诊断可 shadow）；diagnostic_log_dir/queue_size=日志路径与容量。 -->
+         诊断可 shadow，经命令行显式覆盖）；diagnostic_log_dir/queue_size=日志路径与容量。 -->
     <param name="frame_id" value="map"/>
     <param name="setpoint_out_topic" value="/setpoint/ego"/>
-    <param name="safety_supervisor_mode" value="$(arg safety_supervisor_mode)"/>
+    <param name="safety_supervisor_mode" value="$(arg safety_supervisor_mode)" if="$(eval arg('safety_supervisor_mode') != '')"/>
     <param name="diagnostic_log_dir" value="/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner"/>
     <param name="diagnostic_log_queue_size" value="2048"/>
   </node>

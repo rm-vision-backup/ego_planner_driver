@@ -3,28 +3,39 @@
 # 校验：所有 double finite；TTC 检查 emergency_ttc_s <= warning_ttc_s；
 # emergency_maximum_duration_s >= emergency_minimum_duration_s；枚举白名单 {active,shadow,off}。
 # peer_data_age_cap_s 为诊断参数：不参与安全决策（schema 注明）。
+# 语义速查（消费者见每行注释；单位 SI）。
 
-safety_supervisor_mode: active
-safety_supervisor_rate_hz: 25.0
-collision_check_rate_hz: 10.0
-bias_valid_s: 120.0
-safety_prediction_horizon_s: 5.0
-safety_sample_period_s: 0.05
-protected_distance_m: 1.0
-safety_control_delay_s: 0.20
-safety_compute_budget_s: 0.05
-peer_data_age_cap_s: 2.0
-emergency_decel_mps2: 2.0
-warning_buffer_m: 0.35
-emergency_buffer_m: 0.10
-warning_ttc_s: 3.0
-emergency_ttc_s: 1.5
-minimum_prediction_window_s: 0.25
-safety_episode_release_s: 1.0
-emergency_replan_time_s: 1.0
-emergency_max_velocity_mps: 1.5
-emergency_jerk_mps3: 8.0
-emergency_sample_period_s: 0.02
-emergency_minimum_duration_s: 0.4
-emergency_maximum_duration_s: 12.0
-neighbor_intent_stale_s: 30.0
+# —— 监督调度 ——
+safety_supervisor_mode: active         # 安全监督模式（enum，白名单 {active,shadow,off}）：active=生效、shadow=只记录、off=关闭
+safety_supervisor_rate_hz: 25.0        # 安全监督 tick 频率（Hz，>0）：runSafetySupervisor 调度
+collision_check_rate_hz: 10.0          # 冲突检测频率（Hz，>0）：collisionCheckTick 采样频率
+bias_valid_s: 120.0                    # GPS bias 新鲜度窗口（s，>0）：邻机 intent 时间戳修正有效时长，过期回退不修正
+
+# —— 预测与门槛 ——
+safety_prediction_horizon_s: 5.0       # 预测时域（s，>0）：SafetyPredictor 前向预测长度
+safety_sample_period_s: 0.05           # 预测采样步长（s，>0）：SafetyPredictor 采样间隔
+protected_distance_m: 1.0              # 受保护距离（m，>0，1m 三维门禁）：SafetyPredictor 最小机间距离判据
+safety_control_delay_s: 0.20           # 控制延迟补偿（s，>=0）：预测起点前移的控制链路延迟
+safety_compute_budget_s: 0.05          # 单 tick 计算预算（s，>0）：监督计算超时保护
+peer_data_age_cap_s: 2.0               # 邻机数据年龄上限（s，>=0，诊断）：仅统计告警，不参与安全决策
+
+# —— 危险等级门槛 ——
+emergency_decel_mps2: 2.0              # 紧急减速幅度（m/s²，>0）：SafetyPredictor/制动加速度
+warning_buffer_m: 0.35                 # WARNING 距离缓冲（m，>=0）：warning 门槛 = protected + warning_buffer
+emergency_buffer_m: 0.10               # EMERGENCY 距离缓冲（m，>=0）：emergency 门槛 = protected + emergency_buffer
+warning_ttc_s: 3.0                     # WARNING TTC（s，>0）：预测碰撞时间低于该值进入 WARNING
+emergency_ttc_s: 1.5                   # EMERGENCY TTC（s，>0 且 <=warning_ttc_s）：预测碰撞时间低于该值进入 EMERGENCY
+minimum_prediction_window_s: 0.25      # 最短预测窗口（s，>0）：预测时间跨度下限
+safety_episode_release_s: 1.0          # 危险 episode 释放时间（s，>=0）：解除危险等级后的锁存保持时长
+emergency_replan_time_s: 1.0           # 紧急重规划周期（s，>0）：EMERGENCY 状态下重规划尝试间隔
+
+# —— 紧急制动轨迹 ——
+emergency_max_velocity_mps: 1.5        # 紧急制动速度上限（m/s，>0）：EmergencyBrake 速度约束
+emergency_jerk_mps3: 8.0               # 紧急制动 jerk 上限（m/s³，>0）：EmergencyBrake 平滑约束
+emergency_sample_period_s: 0.02        # 紧急制动采样步长（s，>0）：EmergencyBrake 采样
+emergency_minimum_duration_s: 0.4      # 紧急制动最短时长（s，>0）：制动轨迹最小时间
+emergency_maximum_duration_s: 12.0     # 紧急制动最长时长（s，>0 且 >=minimum）：制动轨迹最大时间
+
+# —— 邻机 intent 新鲜度 ——
+neighbor_intent_stale_s: 30.0          # 邻机 intent 接收窗（s，>0）：[now±stale] 外 intent 判 stale；
+                                       #   替换 26082916 前硬编码 kNeighborStaleS=30.0

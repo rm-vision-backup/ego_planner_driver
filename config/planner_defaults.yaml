@@ -1,43 +1,51 @@
 # Planner 核心算法/执行参数 canonical 默认（implementation_plan_26082916 §4）。
 # 加载方式：node 私有 namespace（~）；launch 仅保留 identity/path/明确 deployment override。
 # 校验：所有 double finite；时间/速度/距离/频率 >0；非法配置节点 fail-fast 拒绝启动。
+# 语义速查（消费者/作用见每行注释；单位统一 SI：m / m/s / m/s² / s / Hz）。
 
-order: 3
-ts: 0.4
-max_vel: 1.0
-max_acc: 6.0
-swarm_clearance: 0.5
-planning_range: 30.0
-lambda_smooth: 1.0
-lambda_swarm: 1.0
-lambda_feasibility: 0.5
-lambda_terminal: 1.0
-enable_rebound: false
-enable_time_reparam: false
-cruise_velocity: 1.0
-acceleration_limit: 2.0
-feasibility_tolerance: 0.05
-max_iterations: 200
-mem_size: 16
-g_epsilon: 0.01
-replan_period_s: 1.0
-no_replan_thresh_m: 1.0
-reach_thresh_m: 0.5
-max_advance_dist_m: 3.5
-arrival_reach_thresh_m: 0.5
-activation_replan_attempts: 3
-plan_fail_timeout_s: 10.0
-replan_failure_fatal: true
-setpoint_rate_hz: 30.0
-local_pose_timeout_s: 1.0
-arrival_stable_s: 1.0
-exec_timeout_margin_s: 5.0
-takeoff_height_m: 5.0
-takeoff_ascend_speed: 1.0
-first_plan_wait_timeout_s: 10.0
-enable_yield_candidates: true
-yield_clearance_factor: 1.2
-yield_lateral_max_m: 2.2
-yield_slow_min_scale: 0.3
-yield_max_velocity_mps: 2.5
-yield_hovering_velocity_mps: 0.2
+# —— 轨迹优化（EgoPlannerCore）——
+order: 3                            # B 样条阶数（int，>=1）：轨迹阶次，3 阶带 jerk 平滑
+ts: 0.4                             # 控制点时间间隔（s，>0）：B 样条控制点名义时距
+max_vel: 1.0                        # 名义速度上限（m/s，>0）：轨迹优化速度约束
+max_acc: 6.0                        # 名义加速度上限（m/s²，>0）：轨迹优化/制动加速度约束
+swarm_clearance: 0.5                # 机间安全距离（m，>0，安全）：calcSwarmCost/checkClearance/yield gate 使用；
+                                    #   执行层 1m 三维门禁由 executor 侧 min_center_distance_m 负责
+planning_range: 30.0                # 邻机 intent 过滤半径（m，>0）：filterByRange 只保留该距离内邻机
+lambda_smooth: 1.0                  # 平滑代价权重（无量纲，>=0）：combineCost 中光滑性项系数
+lambda_swarm: 1.0                   # 机间避碰代价权重（无量纲，>=0）：calcSwarmCost 项系数
+lambda_feasibility: 0.5             # 可行性代价权重（无量纲，>=0）：calcFeasibilityCost 项系数（26082916 统一 0.5）
+lambda_terminal: 1.0                # 终端代价权重（无量纲，>=0）：calcTerminalCost 项系数
+enable_rebound: false               # 邻机主动反弹开关（bool）：默认关，仅测试/诊断显式开启
+enable_time_reparam: false          # 时间轴重参数化开关（bool）：默认关；开则 setPhysicalLimits/checkFeasibility/lengthenTime
+cruise_velocity: 1.0                # 巡航速度（m/s，>0）：v_cruise，end_vel 幅值上限
+acceleration_limit: 2.0             # 梯形时间分配用加速度限制（m/s²，>0）：时间参数化梯形 T 计算
+feasibility_tolerance: 0.05         # 可行性容差（无量纲，(0,1)）：动力学可行性检查相对裕度
+max_iterations: 200                 # L-BFGS 最大迭代次数（int，>0）：优化终止条件
+mem_size: 16                        # L-BFGS 内存（int，>0）：历史梯度向量数
+g_epsilon: 0.01                     # L-BFGS 梯度停机阈值（无量纲，>0）：||g|| 小于该值提前收敛
+
+# —— 重规划与执行状态机（node）——
+replan_period_s: 1.0                # 定时重规划周期（s，>0）：replanLoop 周期；分支 C elapsed>=min(period,0.85*duration)
+no_replan_thresh_m: 1.0             # 免重规划距离（m，>0）：距最终目标 <=1m 停止时间重规划与退化完整剩余
+reach_thresh_m: 0.5                 # 推进判据（m，>0）：分支 A 距当前关键点 <0.5m 切相邻下一关键点
+max_advance_dist_m: 3.5             # 单次推进最远距离（m，>0）：过近(<0.5m)关键点丢弃、最远取该值
+arrival_reach_thresh_m: 0.5         # 到达判据（m，>0）：分支 B 距最终关键点 <0.5m 且稳定 arrival_stable_s -> COMPLETED
+                                    #   （260828 用户决策由 0.2m 放宽，覆盖 15 机 prepare 实测 0.29m 终点偏差）
+activation_replan_attempts: 3       # 激活重试次数（int，>=1）：激活时避碰 clearance 变化可有限重试次数
+plan_fail_timeout_s: 10.0           # 规划失败收口超时（s，>0，安全）：连续失败达该值才锁存安全目标并 EGO_PLAN_FAILED
+replan_failure_fatal: true          # 重规划失败是否致命（bool，安全）：true 时失败可收口失败状态
+setpoint_rate_hz: 30.0              # setpoint 发布频率（Hz，>0，冻结契约）：publishSetpoint 30Hz
+local_pose_timeout_s: 1.0           # 本机 local_pose 超时（s，>0）：超时判 stale/进入安全路径
+arrival_stable_s: 1.0               # 到达稳定时长（s，>0）：checkArrival 连续稳定窗口，满则 COMPLETED
+exec_timeout_margin_s: 5.0          # 执行超时余量（s，>0）：elapsed > duration + margin 触发看门狗
+takeoff_height_m: 5.0               # 软起飞目标高度（m，>=0）：TAKEOFF 状态上升至该高度后锁存 HOLD
+takeoff_ascend_speed: 1.0           # 软起飞爬升速度（m/s，>0）：TAKEOFF 垂直上升速率（legacy 名无 _mps 后缀）
+first_plan_wait_timeout_s: 10.0     # 首轮规划等待超时（s，>0）：SEQUENTIAL_START 等待前驱 intent 的最长等待
+
+# —— 让路候选（yield）——
+enable_yield_candidates: true       # 让路候选开关（bool）：true 时 yield gate 可生成 SLOW/LEFT/RIGHT 候选
+yield_clearance_factor: 1.2         # 让路候选验证门槛系数（无量纲，>=1，安全）：候选 min_clear >= factor×swarm_clearance
+yield_lateral_max_m: 2.2            # 让路横向偏移上限（m，>0）：LEFT/RIGHT 候选最大侧移量
+yield_slow_min_scale: 0.3           # SLOW 档最小速度比例（无量纲，(0,1]）：v_max×scale 的减速下限
+yield_max_velocity_mps: 2.5         # 让路候选速度上限（m/s，>0）：候选/加速档速度约束（与 verification --max-speed 一致）
+yield_hovering_velocity_mps: 0.2    # 邻机悬停判定速度阈值（m/s，>=0）：isPeerHovering |v|<该值视为悬停

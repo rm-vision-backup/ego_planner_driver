@@ -2,9 +2,10 @@
 # 加载方式：node 私有 namespace（~）。
 # 校验：count limit 整数 >0 且不超过编译期绝对 hard limit（core.h kMax*AbsHard）；
 # 非法配置 fail-fast 拒绝启动（不静默 clamp）。
+# 语义（单位见注释）：限制轨迹/采样数组上界，防 OOM/超长规划。
 
-max_arc_samples: 4096
-max_parameterization_points: 256
-max_trajectory_samples: 4096
-max_neighbor_intent_samples: 256
-segment_direction_epsilon_m: 0.05
+max_arc_samples: 4096                  # 弧长采样点数上限（int，[1,32768]）：折线/轨迹弧长离散点硬上界
+max_parameterization_points: 256       # 时间参数化控制点数上限（int，[1,1024]）：B 样条控制点硬上界
+max_trajectory_samples: 4096           # 轨迹采样点数上限（int，[1,65536]）：TimedTrajectory 采样硬上界
+max_neighbor_intent_samples: 256       # 邻机 intent 采样点数上限（int，[1,4096]）：邻机轨迹重采样硬上界
+segment_direction_epsilon_m: 0.05      # 段方向退化判据（m，>0 finite）：|seg| < 该值视为方向退化，禁止升级制动
