@@ -384,8 +384,8 @@ TEST(EgoStateMachine, YieldHighIdCommitsLateralCandidate)
 TEST(EgoStateMachine, YieldLowIdStandOnRequestsReplan)
 {
   // 本机 UAV1（ID 1 < peer UAV2 2）→ STAND_ON：collisionCheckTick 只置位；
-  // replanOnce 常规规划失败后 STAND_ON 只尝试 SLOW 变速候选（26082621 迭代），
-  // 悬停 peer 下 SLOW 无效（减速撞悬停点）→ 无候选 → PLAN_FAILED 收口。
+  // replanOnce 常规规划失败后 STAND_ON 无横向候选（SLOW 已移除 260830，
+  // 让 YIELD 侧让路）→ 无候选 → PLAN_FAILED 收口。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -547,7 +547,8 @@ TEST(EgoStateMachine, ReplanFailSoftLandingResetsOnCommit)
   ASSERT_TRUE(node.replanOnce());  // 首轮成功
   ASSERT_EQ(node.execState(), kStateExecuting);
 
-  // 注入悬停 peer 挡路 → 常规 replan 失败（STAND_ON 只 SLOW，悬停无解）→ 软着陆。
+  // 注入悬停 peer 挡路 → 常规 replan 失败（STAND_ON 无候选，SLOW 已移除 260830）
+  // → 软着陆。
   auto peer = makeIntent(100.0, 1, "UAV2");
   peer.t = {0.0, 20.0};
   peer.sampled_traj[0].position.x = 5.0;

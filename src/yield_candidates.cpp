@@ -181,43 +181,6 @@ TimedTrajectory YieldCandidateGenerator::extractRemainder(const TimedTrajectory&
   return out;
 }
 
-YieldCandidate YieldCandidateGenerator::makeSlow(
-    const TimedTrajectory& remaining, double remaining_nominal,
-    const std::vector<NeighborTrajectory>& neighbors) const
-{
-  // 变速档位 {0.5, 0.8, 1.2}（26082621 迭代）：0.5/0.8 减速等待错开、1.2 加速先过；
-  // 穿越时刻相对 peer 移动轨迹错开。最终速度 v_max×factor ≤ max_velocity_mps。
-  double v_max = 0.0;
-  for (const auto& v : remaining.vel)
-    v_max = std::max(v_max, v.norm());
-  const double slow_min = std::max(0.05, config_.slow_min_scale);
-  for (double scale : {0.5, 0.8, 1.2})
-  {
-    double factor = std::max(scale, slow_min);
-    // 速度约束（含加速档）：加速后不得超 max_velocity_mps。
-    if (v_max > 1e-9 && v_max * factor > config_.max_velocity_mps)
-      factor = config_.max_velocity_mps / v_max;
-    YieldCandidate cand;
-    cand.type = YieldCandidate::Type::SLOW;
-    cand.direction = YieldDirection::NONE;
-    cand.trajectory = remaining;
-    applyTimeScale(cand.trajectory, factor);
-    // ΔT 取绝对值（减速等待与加速提前都计入代价，26082621 迭代）。
-    cand.time_extension_s = std::fabs(cand.trajectory.duration - remaining_nominal);
-    cand.cost = remaining_nominal > 1e-6
-        ? cand.time_extension_s / remaining_nominal
-        : std::numeric_limits<double>::infinity();
-    double min_clear = 0.0;
-    if (validate(cand.trajectory, neighbors, min_clear))
-    {
-      cand.min_clearance_m = min_clear;
-      return cand;
-    }
-  }
-  YieldCandidate none;
-  return none;
-}
-
 YieldCandidate YieldCandidateGenerator::makeLateral(
     const TimedTrajectory& remaining, double remaining_nominal,
     const std::vector<NeighborTrajectory>& neighbors,
@@ -321,8 +284,7 @@ YieldCandidate YieldCandidateGenerator::makeLateral(
 
 std::vector<YieldCandidate> YieldCandidateGenerator::generate(
     const TimedTrajectory& current, double t_elapsed,
-    const std::vector<NeighborTrajectory>& neighbors, bool peer_hovering,
-    bool slow_only) const
+    const std::vector<NeighborTrajectory>& neighbors) const
 {
   std::vector<YieldCandidate> result;
   if (current.pts.empty())
@@ -336,28 +298,21 @@ std::vector<YieldCandidate> YieldCandidateGenerator::generate(
   computeMinClearance(remaining, neighbors, min_clear, conflict_center,
                       overlap_start, overlap_end);
 
-  // slow_only（26082621 迭代）：STAND_ON 侧只变速（SLOW），不横向偏移。
-  if (!peer_hovering)
-  {
-    const YieldCandidate slow = makeSlow(remaining, remaining_nominal, neighbors);
-    if (slow.cost < std::numeric_limits<double>::infinity())
-      result.push_back(slow);
-  }
-  if (!slow_only)
-  {
-    const YieldCandidate left = makeLateral(remaining, remaining_nominal, neighbors,
-                                            overlap_start, overlap_end,
-                                            YieldDirection::LEFT);
-    if (left.cost < std::numeric_limits<double>::infinity())
-      result.push_back(left);
-    const YieldCandidate right = makeLateral(remaining, remaining_nominal, neighbors,
-                                             overlap_start, overlap_end,
-                                             YieldDirection::RIGHT);
-    if (right.cost < std::numeric_limits<double>::infinity())
-      result.push_back(right);
-  }
+  // 仅横向绕开（SLOW 已移除 260830）：A05 复盘确认减速等待（SLOW）在邻机
+  // 非悬停交叉/对向场景无效且其轨迹会遮挡邻机预测窗（制造假 EMERGENCY），
+  // 因此让路候选收敛为 LEFT/RIGHT 横向偏移。
+  const YieldCandidate left = makeLateral(remaining, remaining_nominal, neighbors,
+                                          overlap_start, overlap_end,
+                                          YieldDirection::LEFT);
+  if (left.cost < std::numeric_limits<double>::infinity())
+    result.push_back(left);
+  const YieldCandidate right = makeLateral(remaining, remaining_nominal, neighbors,
+                                           overlap_start, overlap_end,
+                                           YieldDirection::RIGHT);
+  if (right.cost < std::numeric_limits<double>::infinity())
+    result.push_back(right);
 
-  // cost 升序（SLOW 无 dev 项 → 自然偏向 SLOW，不强制）。
+  // cost 升序（ΔT + dev/5.0）。
   std::sort(result.begin(), result.end(),
             [](const YieldCandidate& a, const YieldCandidate& b)
             { return a.cost < b.cost; });

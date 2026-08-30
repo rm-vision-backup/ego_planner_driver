@@ -43,9 +43,8 @@ takeoff_ascend_speed: 1.0           # 软起飞爬升速度（m/s，>0）：TAKE
 first_plan_wait_timeout_s: 10.0     # 首轮规划等待超时（s，>0）：SEQUENTIAL_START 等待前驱 intent 的最长等待
 
 # —— 让路候选（yield）——
-enable_yield_candidates: true       # 让路候选开关（bool）：true 时 yield gate 可生成 SLOW/LEFT/RIGHT 候选
+enable_yield_candidates: true       # 让路候选开关（bool）：true 时 yield gate 可生成 LEFT/RIGHT 候选
 yield_clearance_factor: 1.2         # 让路候选验证门槛系数（无量纲，>=1，安全）：候选 min_clear >= factor×swarm_clearance
 yield_lateral_max_m: 2.2            # 让路横向偏移上限（m，>0）：LEFT/RIGHT 候选最大侧移量
-yield_slow_min_scale: 0.3           # SLOW 档最小速度比例（无量纲，(0,1]）：v_max×scale 的减速下限
-yield_max_velocity_mps: 2.5         # 让路候选速度上限（m/s，>0）：候选/加速档速度约束（与 verification --max-speed 一致）
-yield_hovering_velocity_mps: 0.2    # 邻机悬停判定速度阈值（m/s，>=0）：isPeerHovering |v|<该值视为悬停
+yield_max_velocity_mps: 2.5         # 让路候选速度上限（m/s，>0）：候选速度约束（与 verification --max-speed 一致）
+
