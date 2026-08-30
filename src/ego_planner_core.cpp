@@ -930,10 +930,10 @@ PlanResult EgoPlannerCore::planOnce(const GoalPoint& start,
     // §3.2（260828 修复）：当前生产开关（rebound/time_reparam 均关闭）下用采样
     // 后实际欧氏峰值做动力学硬拒。阈值 2.5× 依据实测：正常 min-snap 过渡峰值
     // vmax≈1.49（巡航段）~1.999（6m final 段），PX4 执行超调实测 1.49-1.54，
-    // 候选档上限 2.5（yield_max_velocity_mps，SLOW 已移除 260830）；2.5× 不误伤
-    // 任何正常任务，仍远超病态输入（100 m/s 起始速度锚定使 vmax 达数十倍 →
-    // 拒绝）。禁止用逐轴 checkFeasibility 1.05 阈值（正常轨迹范数过渡 vmax≈1.26
-    // 也会误判 false）。rebound/time_reparam 开启场景仍由 lengthenTime 修正（原版 trust
+    // 候选 SLOW 档上限 2.5（yield_max_velocity_mps）；2.5× 不误伤任何正常任务，
+    // 仍远超病态输入（100 m/s 起始速度锚定使 vmax 达数十倍 → 拒绝）。禁止用
+    // 逐轴 checkFeasibility 1.05 阈值（正常轨迹范数过渡 vmax≈1.26 也会误判
+    // false）。rebound/time_reparam 开启场景仍由 lengthenTime 修正（原版 trust
     // 语义，不属本修复范围）。
     if (!config_.enable_rebound && !config_.enable_time_reparam)
     {

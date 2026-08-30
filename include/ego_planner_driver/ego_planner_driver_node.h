@@ -202,6 +202,8 @@ private:
   void collisionCheckTick(const ros::TimerEvent& event);
   // 提交候选让路轨迹（替换 current_ + 发布 intent）。调用方持 mutex_。
   void commitYieldCandidate(const YieldCandidate& cand);
+  // 判定 primary peer 是否近似悬停（末段速度 < hovering_velocity_mps）。
+  bool isPeerHovering(const NeighborTrajectory& nb) const;
   // 让路候选结果分类（implementation_plan_26082722 §9.7）。
   enum class YieldResult
   {
@@ -210,7 +212,7 @@ private:
     RESOURCE_LIMIT  // 候选生成内部出现资源失败，必须向上传播并 §9.6 立即收口
   };
   // 方案 A（§10 扩展）：replanOnce 规划失败（safe_candidate=false）时尝试让路候选：
-  // LEFT/RIGHT waypoints 横向偏移后重试 planOnce，
+  // SLOW 降 cruise_velocity / LEFT/RIGHT waypoints 横向偏移后重试 planOnce，
   // 验证 min_clear ≥ 1.2×clearance，cost 最小者提交。成功返回 COMMITTED。
   struct ReplanSnapshot
   {
@@ -300,10 +302,9 @@ private:
   std::size_t max_neighbor_intent_samples_ = 256;
   double segment_direction_epsilon_m_ = 0.05;
   ros::Time plan_fail_since_;  // 首次失败时刻（isZero = 当前不在软着陆失败中）
-  // 机间让路候选（LEFT/RIGHT + right-of-way，implementation_plan_26082602 §10，
-  // SLOW 已移除 260830）：collisionCheckTick 检测冲突（min_clear < 1.2×clearance，
-  // yield_clearance_factor=1.2）→ 本机 YIELD（ID 小于 primary peer）生成候选，
-  // cost 最小者提交发布；STAND_ON 交常规 replan。
+  // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，implementation_plan_26082602 §10）：
+  // collisionCheckTick 检测冲突（min_clear < 1.2×clearance，yield_clearance_factor=1.2）
+  // → 本机 YIELD（ID 小于 primary peer）生成候选，cost 最小者提交发布；STAND_ON 交常规 replan。
   YieldCandidateConfig yield_config_;
   std::unique_ptr<YieldCandidateGenerator> yield_generator_;
   bool enable_yield_candidates_ = false;

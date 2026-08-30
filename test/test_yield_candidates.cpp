@@ -56,17 +56,68 @@ NeighborTrajectory makeCrossingPeer(double start_time = -2.0)
 }
 }  // namespace
 
+TEST(YieldCandidates, SlowScalesTimeAndPreservesGeometry)
+{
+  YieldCandidateConfig cfg;
+  cfg.slow_min_scale = 0.5;
+  cfg.lateral_max_m = 2.0;
+  cfg.max_velocity_mps = 1.5;
+  YieldCandidateGenerator gen(cfg);
+  const TimedTrajectory current = makeLine(10.0, 1.0);
+  // 移动交叉 peer（非悬停）→ SLOW 候选生成。
+  const NeighborTrajectory peer = makeCrossingPeer(-2.0);
+  const auto candidates = gen.generate(current, 0.0, {peer}, false);
+  ASSERT_FALSE(candidates.empty());
+  bool saw_slow = false;
+  for (const auto& c : candidates)
+  {
+    if (c.type != YieldCandidate::Type::SLOW)
+      continue;
+    saw_slow = true;
+    // pts 几何不变（x 等距推进，y 保持 0），时间轴 ×1/scale（档位 {0.5,0.3}；
+    // slow_min_scale=0.5 → 最低档被钳到 0.5 → duration = 10/0.5 = 20s）。
+    ASSERT_EQ(c.trajectory.pts.size(), current.pts.size());
+    EXPECT_NEAR(c.trajectory.duration, 20.0, 0.5);
+    for (size_t i = 0; i < current.pts.size(); ++i)
+    {
+      EXPECT_NEAR(c.trajectory.pts[i].x(), current.pts[i].x(), 1e-6);
+      EXPECT_NEAR(c.trajectory.pts[i].y(), current.pts[i].y(), 1e-6);
+    }
+    EXPECT_NEAR(c.trajectory.t.front(), 0.0, 1e-9);
+    for (size_t i = 1; i < c.trajectory.t.size(); ++i)
+      EXPECT_GT(c.trajectory.t[i], c.trajectory.t[i - 1]);
+  }
+  EXPECT_TRUE(saw_slow);
+}
+
+TEST(YieldCandidates, HoveringPeerSkipsSlow)
+{
+  YieldCandidateConfig cfg;
+  YieldCandidateGenerator gen(cfg);
+  const TimedTrajectory current = makeLine(10.0, 1.0);
+  const NeighborTrajectory hover = makeHoverPeer(Eigen::Vector3d(5.0, 0.0, 5.0));
+  const auto candidates = gen.generate(current, 0.0, {hover}, true);  // peer_hovering
+  bool has_slow = false;
+  for (const auto& c : candidates)
+    if (c.type == YieldCandidate::Type::SLOW)
+      has_slow = true;
+  EXPECT_FALSE(has_slow);
+}
+
 TEST(YieldCandidates, LateralOffsetsConflictWindowOnly)
 {
   YieldCandidateConfig cfg;
   YieldCandidateGenerator gen(cfg);
   const TimedTrajectory current = makeLine(10.0, 1.0);
   const NeighborTrajectory hover = makeHoverPeer(Eigen::Vector3d(5.0, 0.0, 5.0));
-  const auto candidates = gen.generate(current, 0.0, {hover});
+  const auto candidates = gen.generate(current, 0.0, {hover}, true);
   ASSERT_FALSE(candidates.empty());
+  // 悬停 → 至少一个 LEFT/RIGHT 可行；时间轴不变。
   double max_dev = 0.0, dev_far = 0.0;
   for (const auto& c : candidates)
   {
+    if (c.type == YieldCandidate::Type::SLOW)
+      continue;
     // LEFT/RIGHT 可组合减速（速度驱动 + scale_wait）→ ΔT ≥ 0（时间轴可延长）。
     EXPECT_GE(c.time_extension_s, 0.0);
     for (size_t i = 0; i < c.trajectory.t.size(); ++i)
@@ -83,42 +134,74 @@ TEST(YieldCandidates, LateralOffsetsConflictWindowOnly)
   EXPECT_LT(dev_far, 1e-6);  // 窗口外无偏移（起点连续）
 }
 
-TEST(YieldCandidates, CostIncreasesWithLateralAndClearance)
+TEST(YieldCandidates, CostPrefersLateralOverLongSlow)
 {
   YieldCandidateConfig cfg;
+  cfg.slow_min_scale = 0.5;
   cfg.lateral_max_m = 2.2;
   YieldCandidateGenerator gen(cfg);
   const TimedTrajectory current = makeLine(10.0, 1.0);
   const NeighborTrajectory hover = makeHoverPeer(Eigen::Vector3d(5.0, 0.0, 5.0));
-  const auto candidates = gen.generate(current, 0.0, {hover});
+  const auto candidates = gen.generate(current, 0.0, {hover}, false);
   ASSERT_FALSE(candidates.empty());
-  // 所有候选通过 1.2m 门槛（26082621 迭代由 1.3 放宽）；LEFT/RIGHT 有 dev/5.0。
+  // 所有候选通过 1.2m 门槛（26082621 迭代由 1.3 放宽）；SLOW 有 ΔT、LEFT/RIGHT 有 dev。
   for (const auto& c : candidates)
   {
     EXPECT_GE(c.min_clearance_m, 1.2);
     EXPECT_GT(c.cost, 0.0);
-    EXPECT_GE(c.time_extension_s, 0.0);
+    if (c.type == YieldCandidate::Type::SLOW)
+      EXPECT_GT(c.time_extension_s, 0.0);
+    else
+      EXPECT_GE(c.time_extension_s, 0.0);
   }
 }
 
-TEST(YieldCandidates, GeneratesBothLeftAndRight)
+TEST(YieldCandidates, SlowOnlyGeneratesOnlySlowForStandOn)
 {
-  // SLOW 移除（260830）后候选收敛为 LEFT/RIGHT 横向偏移：悬停挡路 peer 下两侧
-  // 都应可行（C2 包络峰值 ≤ lateral_max_m）。
+  // 非对称（26082621 迭代）：STAND_ON 侧 slow_only=true 只生成 SLOW 变速候选，
+  // 不生成 LEFT/RIGHT 横向偏移；ΔT 取绝对值计入 cost。
   YieldCandidateConfig cfg;
+  cfg.slow_min_scale = 0.5;
+  cfg.lateral_max_m = 2.2;
   YieldCandidateGenerator gen(cfg);
   const TimedTrajectory current = makeLine(10.0, 1.0);
-  const NeighborTrajectory hover = makeHoverPeer(Eigen::Vector3d(5.0, 0.0, 5.0));
-  const auto candidates = gen.generate(current, 0.0, {hover});
+  const NeighborTrajectory peer = makeCrossingPeer(-2.0);
+  const auto candidates = gen.generate(current, 0.0, {peer}, false, true);
   ASSERT_FALSE(candidates.empty());
-  bool saw_left = false, saw_right = false;
+  bool saw_slow = false;
   for (const auto& c : candidates)
   {
-    if (c.direction == YieldDirection::LEFT) saw_left = true;
-    if (c.direction == YieldDirection::RIGHT) saw_right = true;
+    EXPECT_EQ(c.type, YieldCandidate::Type::SLOW);  // 无 LEFT/RIGHT
+    EXPECT_NEAR(c.time_extension_s,
+                std::fabs(c.trajectory.duration - 10.0), 1e-6);  // ΔT 绝对值
+    EXPECT_GT(c.cost, 0.0);
+    saw_slow = true;
   }
-  EXPECT_TRUE(saw_left);
-  EXPECT_TRUE(saw_right);
+  EXPECT_TRUE(saw_slow);
+}
+
+TEST(YieldCandidates, SlowAccelerateGearDoesNotExceedSpeedLimit)
+{
+  // 加速档 1.2（26082621 迭代）：时间轴缩短（duration < nominal）且速度受
+  // max_velocity_mps(1.5) 约束。用快速直线（1.3 m/s）验证 1.2 档被 clamp 后
+  // 轨迹速度不超 1.5。
+  YieldCandidateConfig cfg;
+  cfg.slow_min_scale = 0.1;
+  cfg.max_velocity_mps = 1.5;
+  YieldCandidateGenerator gen(cfg);
+  const TimedTrajectory current = makeLine(10.0, 1.3);
+  // peer 悬停在本机路径 x=5（减速/保持速度档都撞，加速先过也不能避让悬停点）——
+  // 本用例只验证加速档的动力学合法性：构造一个 peer 使 0.5/0.8 档有效即可，
+  // 加速档由代码路径覆盖（因子 clamp 逻辑）。
+  const NeighborTrajectory peer = makeCrossingPeer(-2.0);
+  const auto candidates = gen.generate(current, 0.0, {peer}, false, true);
+  ASSERT_FALSE(candidates.empty());
+  for (const auto& c : candidates)
+  {
+    ASSERT_TRUE(c.type == YieldCandidate::Type::SLOW);
+    for (size_t i = 0; i < c.trajectory.vel.size(); ++i)
+      EXPECT_LE(c.trajectory.vel[i].norm(), 1.5 + 1e-6);
+  }
 }
 
 }  // namespace ego_planner_driver

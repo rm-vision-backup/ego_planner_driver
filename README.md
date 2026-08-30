@@ -109,17 +109,17 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 提交段安全校验：提交锁内用最新邻机 intent 复验 1m 硬门；`safety_generation_` 防晚到结果覆盖
 制动/候选。常规 replan/候选/制动提交均清空 `plan_fail_since_`（退出软着陆计时）。
 
-## 让路候选（replan 失败分支，LEFT/RIGHT + right-of-way）
+## 让路候选（replan 失败分支，SLOW/LEFT/RIGHT + right-of-way）
 
-- **right-of-way**：`parseNumericId` 数字比较。低 ID `STAND_ON` 不生成横向候选
-  （保持 nominal，交常规 replan）；高 ID `YIELD` 生成 LEFT/RIGHT 候选。episode 内锁存方向与
+- **right-of-way**：`parseNumericId` 数字比较。低 ID `STAND_ON` 只生成 SLOW 变速候选
+  （`slow_only`，不横向偏移）；高 ID `YIELD` 生成 SLOW/LEFT/RIGHT 全候选。episode 内锁存方向与
   primary peer 轨迹版本（防重复提交）。
+- **SLOW**：几何不变，时间轴缩放 `{0.5, 0.8, 1.2}`（含加速档；0.5/0.8 减速等待、1.2 加速先过）。
+  邻机近似悬停（末速 < `hovering_velocity_mps`=0.2）跳过 SLOW。速度上限 `yield_max_velocity_mps`(2.5)。
 - **LEFT/RIGHT**：横向 plateau 偏移 `{1.3, 1.8, 2.2}` m × 时间缩放 `{0.7, 0.5}`；方向取远离
   peer 时空重叠时段的法向分量，平台覆盖重叠全程 + C2 过渡。
 - **验证门槛**：全时域 vs 全部 fresh 邻机同刻 `min_clear ≥ 1.2×clearance`；
   `cost = |ΔT|/T_nominal + lateral/5.0`（dev 权重 26082700 由 /2.0 下调），选 cost 最小者提交。
-- **SLOW 已移除（260830）**：A05 复盘确认减速等待（SLOW）在邻机非悬停交叉/对向场景
-  无效，且其轨迹会遮挡邻机预测窗制造假 EMERGENCY；让路候选收敛为 LEFT/RIGHT 横向偏移。
 - 候选**只**在 `replanOnce()` 内生成/提交（10Hz 独立提交已删除，提交唯一化）。
 
 ## 机间避碰（规划层）
@@ -221,8 +221,8 @@ identity/path/明确 deployment override（`uav_id`/`exec_target`/`frame_id`/`se
 | `neighbor_intent_stale_s` | 30.0 | 邻机 intent 接收窗 `[now±stale]`（接入实际 stale 判断） |
 | `first_plan_wait_timeout_s` | 10.0 | SEQUENTIAL_START 首轮等待前驱超时 |
 | `enable_yield_candidates` | true | 让路候选开关 |
-| `yield_clearance_factor` / `yield_lateral_max_m` | 1.2 / 2.2 | 候选门槛 / 横向上限 |
-| `yield_max_velocity_mps` | 2.5 | 候选速度上限（SLOW 已移除 260830） |
+| `yield_clearance_factor` / `yield_lateral_max_m` / `yield_slow_min_scale` | 1.2 / 2.2 / 0.3 | 候选门槛 / 横向上限 / SLOW 最低档 |
+| `yield_max_velocity_mps` / `yield_hovering_velocity_mps` | 2.5 / 0.2 | 候选速度上限 / 邻机近似悬停判定 |
 | `diagnostic_log_dir` / `diagnostic_log_queue_size` | 见 launch / 2048 | 监督日志目录 / 队列（launch override） |
 
 > 26082916 迁移：`planning_horizon` 运行配置已删除（26082621 plan-exec 取代，见

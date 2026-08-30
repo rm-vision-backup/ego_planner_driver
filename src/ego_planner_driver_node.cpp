@@ -183,14 +183,17 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   emergency_replan_time_s_ = pnh_.param("emergency_replan_time_s", 1.0);
   neighbor_intent_stale_s_ = pnh_.param("neighbor_intent_stale_s", 30.0);
   first_plan_wait_timeout_s_ = pnh_.param("first_plan_wait_timeout_s", 10.0);
-  // 机间让路候选（LEFT/RIGHT + right-of-way，26082621 迭代；SLOW 已移除 260830）。
+  // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，26082621 迭代）。
   enable_yield_candidates_ = pnh_.param("enable_yield_candidates", false);
   yield_config_.clearance_factor = pnh_.param("yield_clearance_factor", 1.2);
   yield_config_.lateral_max_m = pnh_.param("yield_lateral_max_m", 2.2);
+  yield_config_.slow_min_scale = pnh_.param("yield_slow_min_scale", 0.3);
   // 最大速度限制（26082621 迭代）：候选/加速档允许的轨迹速度上限，独立于制动
-  // （emergency_max_velocity_mps 1.5 保持）。LEFT/RIGHT 减速档 + PX4 执行超调实测
+  // （emergency_max_velocity_mps 1.5 保持）。SLOW 1.2 加速档 + PX4 执行超调实测
   // 1.49-1.54，原 1.5 上限过紧；上限 2.5 与测试判定一致（写在本驱动，不靠验证脚本）。
   yield_config_.max_velocity_mps = pnh_.param("yield_max_velocity_mps", 2.5);
+  yield_config_.hovering_velocity_mps = pnh_.param(
+      "yield_hovering_velocity_mps", 0.2);
   yield_config_.max_acceleration_mps2 = config.max_acc;
   // 统一 clearance：yield gate 与 core/node 同源（26082916 §4）。
   yield_config_.swarm_clearance = config.swarm_clearance;
@@ -274,7 +277,13 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
                     yield_config_.clearance_factor >= 1.0,
                 "yield_clearance_factor", yield_config_.clearance_factor) &&
         requirePos(yield_config_.lateral_max_m, "yield_lateral_max_m") &&
-        requirePos(yield_config_.max_velocity_mps, "yield_max_velocity_mps")))
+        require(std::isfinite(yield_config_.slow_min_scale) &&
+                    yield_config_.slow_min_scale > 0.0 &&
+                    yield_config_.slow_min_scale <= 1.0,
+                "yield_slow_min_scale", yield_config_.slow_min_scale) &&
+        requirePos(yield_config_.max_velocity_mps, "yield_max_velocity_mps") &&
+        requireNonNeg(yield_config_.hovering_velocity_mps,
+                      "yield_hovering_velocity_mps")))
     return;
   // --- safety / TTC / emergency / stale ---
   if (!(requirePos(safety_supervisor_rate_hz_, "safety_supervisor_rate_hz") &&
@@ -601,7 +610,7 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
   if (!safe_candidate)
   {
     // 方案 Y：EMERGENCY 尝试路径失败不收口，由 Y 方案判定制动/PLAN_FAILED
-    // （跳过候选——ttc 紧时直接判制动，不做 LEFT/RIGHT 浪费时间）。
+    // （跳过候选——ttc 紧时直接判制动，不做 SLOW/LEFT/RIGHT 浪费时间）。
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (emergency_pending_)
@@ -613,7 +622,7 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
         return false;
       }
     }
-    // 常规 replan 失败 → 候选（LEFT/RIGHT + right-of-way，replan 失败分支）。
+    // 常规 replan 失败 → 候选（SLOW/LEFT/RIGHT + right-of-way，replan 失败分支）。
     if (snap)
     {
       const YieldResult yield_result = tryYieldReplan(*snap);
@@ -1560,7 +1569,7 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
     return;
 
   // 监督层只保留 EMERGENCY 检测（L3 精简）：WARNING 级冲突交给规划层
-  // （calcSwarmCost 固定 1m 软惩罚绕开）；让路候选（LEFT/RIGHT）与
+  // （calcSwarmCost 固定 1m 软惩罚绕开）；让路候选（SLOW/LEFT/RIGHT）与
   // YIELD/STAND_ON 角色判定在 replan 失败分支（tryYieldReplan）处理。
   if (prediction.level != SafetyLevel::EMERGENCY)
     return;
@@ -1708,7 +1717,8 @@ void EgoPlannerDriverNode::commitYieldCandidate(const YieldCandidate& cand)
   setState(kStateExecuting);
   publishIntent(*current_, plan_start_,
                 swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
-  const char* type = cand.direction == YieldDirection::LEFT ? "LEFT" : "RIGHT";
+  const char* type = cand.type == YieldCandidate::Type::SLOW ? "SLOW"
+                     : cand.direction == YieldDirection::LEFT ? "LEFT" : "RIGHT";
   ROS_WARN("[%s] yield committed: %s min_clear=%.2f cost=%.3f",
            uav_id_.c_str(), type, cand.min_clearance_m, cand.cost);
 }
@@ -1749,9 +1759,9 @@ EgoPlannerDriverNode::YieldResult EgoPlannerDriverNode::tryYieldReplan(
       !SafetyPredictor::parseNumericId(primary_peer, peer_id))
     return YieldResult::NOT_AVAILABLE;  // UNKNOWN：不生成候选。
 
-  // 非对称（26082621 迭代，SLOW 已移除 260830）：低 ID STAND_ON 不生成横向候选
-  // （保持 nominal，交常规 replan / YIELD 侧让路）；高 ID YIELD 生成 LEFT/RIGHT
-  // 横向偏移候选。episode 内锁存角色与方向。
+  // 非对称（26082621 迭代）：低 ID STAND_ON 只生成 SLOW 变速候选（减速等待/加速
+  // 提前错开，不横向偏移——保持 nominal 语义）；高 ID YIELD 生成 SLOW/LEFT/RIGHT
+  // 全候选。episode 内锁存角色与方向。
   const bool stand_on = my_id <= peer_id;
 
   // episode 锁存：已提交候选且 primary peer 轨迹版本未变 → 保持（不重复提交）。
@@ -1765,21 +1775,13 @@ EgoPlannerDriverNode::YieldResult EgoPlannerDriverNode::tryYieldReplan(
       return YieldResult::NOT_AVAILABLE;
   }
 
-  // SLOW 已移除（260830）：STAND_ON 侧不再有任何候选（原仅 SLOW 变速），保持
-  // nominal，让 YIELD 侧负责横向让路。
-  if (stand_on)
-  {
-    ROS_WARN("[%s] yield replan: stand_on keeps nominal, no candidate (peer=%s)",
-             uav_id_.c_str(), primary_peer.c_str());
-    return YieldResult::NOT_AVAILABLE;
-  }
-
   // 2. 生成候选：基于 nominal（无邻居规划）轨迹由生成器统一产出
-  //    LEFT/RIGHT（横向 C2 偏移），验证 1.2m 门槛。
+  //    SLOW（时间缩放错开）/ LEFT/RIGHT（横向 C2 偏移），验证 1.2m 门槛。
   std::vector<YieldCandidate> candidates;
   TimedTrajectory nominal, traj;
   double plan_cost = 0.0;
   bool nominal_ok = false;
+  bool peer_hovering = false;
   const PlanResult nominal_result = core_->planOnce(
       snap.start, snap.waypoints, {}, nominal, plan_cost,
       snap.start_vel, snap.start_acc, snap.final_segment);
@@ -1793,18 +1795,32 @@ EgoPlannerDriverNode::YieldResult EgoPlannerDriverNode::tryYieldReplan(
   if (nominal_result == PlanResult::SUCCESS)
   {
     nominal_ok = true;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const ros::Time now = nowFunc();
+      const auto it = inbox_.find(primary_peer);
+      if (it != inbox_.end())
+      {
+        NeighborTrajectory nb = it->second.first;
+        nb.start_time -= snap.now.toSec();
+        peer_hovering = isPeerHovering(nb);
+      }
+    }
     // neighbors 是绝对 epoch，需 rebase 到 nominal 轨迹时间轴（snap.now）。
     std::vector<NeighborTrajectory> neighbors = snap.neighbors;
     for (auto& nb : neighbors)
       nb.start_time -= snap.now.toSec();
-    candidates = yield_generator_->generate(nominal, 0.0, neighbors);
+    candidates = yield_generator_->generate(nominal, 0.0, neighbors,
+                                            peer_hovering, stand_on);
   }
 
   if (candidates.empty())
   {
-    // 诊断（26082621 迭代）：YIELD 候选全无效时记录原因。
-    ROS_WARN("[%s] yield replan: no valid candidate (peer=%s nominal_ok=%d)",
-             uav_id_.c_str(), primary_peer.c_str(), nominal_ok ? 1 : 0);
+    // 诊断（26082621 迭代）：STAND_ON/YIELD 候选全无效时记录原因。
+    ROS_WARN("[%s] yield replan: no valid candidate (peer=%s stand_on=%d "
+             "nominal_ok=%d peer_hovering=%d)", uav_id_.c_str(),
+             primary_peer.c_str(), stand_on ? 1 : 0, nominal_ok ? 1 : 0,
+             peer_hovering ? 1 : 0);
     return YieldResult::NOT_AVAILABLE;
   }
   std::sort(candidates.begin(), candidates.end(),
@@ -1817,6 +1833,18 @@ EgoPlannerDriverNode::YieldResult EgoPlannerDriverNode::tryYieldReplan(
   ROS_WARN("[%s] yield replan committed (peer=%s)", uav_id_.c_str(),
            primary_peer.c_str());
   return YieldResult::COMMITTED;
+}
+
+bool EgoPlannerDriverNode::isPeerHovering(const NeighborTrajectory& nb) const
+{
+  if (nb.pts.size() < 2 || nb.t.size() != nb.pts.size())
+    return false;
+  const size_t n = nb.pts.size();
+  const double dt = nb.t.back() - nb.t[n - 2];
+  if (dt <= 1e-6)
+    return false;
+  const double v = (nb.pts.back() - nb.pts[n - 2]).norm() / dt;
+  return v < yield_config_.hovering_velocity_mps;
 }
 
 bool EgoPlannerDriverNode::firstPlanReadyLocked(const ros::Time& now) const
