@@ -1,6 +1,34 @@
 # Offboard 新状态机设计（2026-09-02）
 
-本文逐步整理 `swarm_uav_executor` 与 `ego_planner_driver` 的新状态机设计。当前章节只记录已经确认的系统分层和任务受理边界；后续状态、切换条件和状态内动作在逐条确认后追加。
+本文逐步整理 `swarm_uav_executor` 与 `ego_planner_driver` 的新状态机设计。任务名称与固定命令按《实物无人机上下层 TCP/IP 接口对接方案》区分：任务名称表示高层目的，可以任意命名；`MOVE_TO`、`FOLLOW_ROUTE`、`FAULT_EXIT`、`HOVER`、`HOLD` 等是固定的 `command` 字段。
+
+---
+
+## 0. 尚待确认的反馈细节
+
+以下反馈和联动细节尚未最终确认，暂不作为已经实现的状态机事实：
+
+- `SUCCESS` 是否只对应 `COMPLETED_HOLD`
+  - `HOVER` command 是否以 `COMPLETED_HOLD` 作为成功终态
+- 普通失败和 `EMERGENCY_HOLD` 是否使用不同错误码
+  - 规划失败、跟随失败、超时、通信失败是否分别编码
+  - `EMERGENCY_HOLD` 是否使用独立安全故障码
+- executor 是持续反馈，还是只在状态变化时反馈
+  - `ACCEPTED`、`START`、终态是否足够
+  - 是否还要持续上报 ego 当前状态
+- 单机失败如何触发批次级失败和全组安全动作
+  - executor 只反馈本机 `FAILURE`，还是主动触发组级 `HOLD`
+  - tcp_to_ros 是否负责汇总 `FAILED` 和传播全组 `HOLD`
+
+当前暂定的反馈边界：
+
+```text
+executor 监控 ego driver
+        │
+        ├─ 正常完成/进入 COMPLETED_HOLD → 向 tcp_to_ros 反馈成功结果
+        ├─ 普通执行失败                 → 向 tcp_to_ros 反馈 FAILURE
+        └─ 进入 EMERGENCY_HOLD          → 反馈安全故障/FAILURE
+```
 
 ---
 
@@ -12,12 +40,10 @@
 ┌──────────────────────────────────────────────────────────────────────┐
 │                         tcp_to_ros / GCS                             │
 │                                                                      │
-│  · 接收批次任务                                                     │
-│  · 执行批次级 prepare、排程和任务协调                               │
-│  · 向各 UAV executor 发送单机任务请求                               │
-│  · 接收各 UAV 的 ACCEPTED / START / SUCCESS / FAILURE 等反馈         │
+│  · 接收批次任务、执行批次级 prepare、排程和任务协调                 │
+│  · 按 assignments 向各 UAV executor 发送单机任务请求                 │
+│  · 汇总各 UAV 的 ACCEPTED / START / SUCCESS / FAILURE 等反馈         │
 └──────────────────────────────┬───────────────────────────────────────┘
-                               │
                                │ bridge 转发任务与状态话题/服务
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -25,16 +51,10 @@
 │                                                                      │
 │  任务接入与任务适配层                                                │
 │                                                                      │
-│  · 接收 tcp_to_ros 发来的单机任务                                   │
-│  · 校验、保存并返回 ACCEPTED                                        │
-│  · 等待 GCS 后续发送 START                                          │
-│  · 按任务类型整理 ego driver 所需输入                               │
-│  · 向 ego driver 提供 waypoints、leader ID、offset、HOVER/HOLD 信息  │
-│  · 启动任务执行线程                                                  │
-│  · 监控 ego driver 状态和本机运动结果                               │
-│  · 向 tcp_to_ros 反馈 ACCEPTED、START、SUCCESS、FAILURE 等结果       │
+│  · 接收、校验、保存单机任务并返回 ACCEPTED，等待 GCS 后续发送 START  │
+│  · 按固定 command 整理 ego driver 所需信息并启动对应动作线程         │
+│  · 监控 ego driver 状态和本机运动结果，向 tcp_to_ros 反馈结果         │
 └───────────────┬──────────────────────────────┬───────────────────────┘
-                │                              │
                 │ 提供不同任务信息             │ 接收 ego 状态/结果
                 ▼                              │
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -42,23 +62,21 @@
 │                                                                      │
 │  飞行控制与内部状态机层                                              │
 │                                                                      │
-│  · 接收 executor 提供的任务信息                                     │
-│  · 根据收到的信息自行进行内部状态转换                               │
-│  · EGO_EXECUTING：使用 ego 算法自主导航                             │
-│  · PI_EXECUTING：使用 PI 控制跟随 leader                             │
-│  · COMPLETED_HOLD：正常完成/悬停后的可退出保持                       │
-│  · EMERGENCY_HOLD：安全故障后的锁存保持                             │
-│  · 向 executor 提供当前状态和执行结果                               │
+│  · 接收 executor 提供的信息，并根据这些输入自行完成内部状态转换     │
+│    · EGO_EXECUTING：使用 ego 算法自主导航                            │
+│    · PI_EXECUTING：使用 PI 控制跟随 leader                            │
+│    · COMPLETED_HOLD：正常完成/悬停后的可退出保持                      │
+│    · EMERGENCY_HOLD：安全故障后的锁存保持                            │
+│  · 向 executor 提供当前状态和执行结果                                │
 └──────────────────────────────┬───────────────────────────────────────┘
-                               │
                                │ setpoint / position / velocity control
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                              PX4                                     │
 │                                                                      │
-│  · 接收 offboard 控制 setpoint                                      │
-│  · 执行位置、速度或相关飞行控制                                     │
-│  · 遥控器切换 onboard 后可接管                                       │
+│  · 接收 offboard 控制 setpoint                                       │
+│  · 执行位置、速度或相关飞行控制                                      │
+│  · 遥控器切换 onboard 后可接管                                        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -67,10 +85,9 @@
 ```text
 executor 不直接发送“切换 ego 状态”的专用命令
 
-executor 接收任务
+executor 接收固定 command
     │
-    ├─ 识别任务类型
-    ├─ 整理任务内容
+    ├─ 处理 command 内容
     ├─ 发布 ego 所需信息
     └─ 启动对应 driver 执行路径
             │
@@ -79,153 +96,120 @@ ego driver 根据收到的信息
 自行进行内部状态转换
 ```
 
-因此，文档中的“使 ego driver 进入某状态”表示：
+“使 ego driver 进入某状态”表示：
 
 ```text
-executor 提供了足够且正确的输入
+executor 提供足够且正确的输入
     → ego driver 按自身状态机转换到预期状态
 ```
 
-并不表示 executor 绕过 ego driver、直接写入或强制设置其内部状态。
+这不表示 executor 绕过 ego driver、直接写入或强制设置其内部状态。
 
 ---
 
-## 2. ACCEPTED/START 机制
+## 2. swarm_uav_executor 细节
 
-### 2.1 命名约定
-
-本文使用：
+### 2.1 任务名称、固定 command 与 ACCEPTED/START
 
 ```text
-ACCEPTED/START 机制
-```
+上层任务名称
+    = 任意名称，表示高层目的
+    = 例如 prepare、coverage-segment-1、fault-exit、recovery、hold-end
 
-避免把 executor 的单机任务受理阶段称为 `PREPARE`，因为 `prepare` 已经用于 tcp_to_ros 的批次任务协调。
+固定 command
+    = 协议规定的具体动作
+    = MOVE_TO、FOLLOW_ROUTE、FAULT_EXIT、HOVER、HOLD
 
-```text
-批次任务 prepare
-    = GCS/tcp_to_ros 层面的批次排程、整批受理和启动协调
-
-单机 ACCEPTED
-    = 某一架 UAV 的 executor 已校验并保存任务，等待启动
+ACCEPTED
+    = executor 已校验并保存该 UAV 的单机任务，等待 START
+    = 不表示已经开始运动，也不表示 ego 已进入执行状态
 
 START
-    = GCS 命令 executor 启动已 ACCEPTED 的单机任务
+    = GCS 要求 executor 启动已经 ACCEPTED 的单机任务
 ```
 
-### 2.2 ACCEPTED 阶段
+### 2.2 ACCEPTED/START 流程
 
 ```text
-GCS / tcp_to_ros
+上层任务名称 + 固定 command + assignments
         │
-        │ 单机任务请求
         ▼
-executor 接收任务
+tcp_to_ros 执行批次级协调/排程
         │
-        ├─ 校验请求和任务内容
-        ├─ 检查本机 executor 是否可用
-        ├─ 将任务转换为内部 goal
-        ├─ 调用 driver 的受理检查
+        │ 向各 UAV executor 发送单机任务请求
+        ▼
+executor 接收单机任务
+        │
+        ├─ 校验请求、command、uav_id 和任务参数
+        ├─ 检查 executor/driver 是否可用
+        ├─ 将请求转换为内部 goal
         ├─ 保存任务记录
         └─ 返回 ACCEPTED
                 │
                 ▼
         任务已受理，但尚未开始运动
-```
-
-`ACCEPTED` 的语义是：
-
-```text
-“本机 executor 已接受该任务，并已具备等待 START 的条件。”
-```
-
-它不表示：
-
-```text
-· 任务已经开始执行
-· ego 已经进入 EGO_EXECUTING
-· PI 跟随已经开始
-· 任务已经成功完成
-```
-
-### 2.3 START 阶段
-
-```text
-GCS / tcp_to_ros
-        │
-        │ 等待批次协调完成
-        │ 按计划发送 START
-        ▼
+                │
+                │ GCS 等待批次协调完成并按计划发送 START
+                ▼
 executor 收到 START
         │
         ├─ 查找对应 ACCEPTED 任务
-        ├─ 检查任务仍未启动且未终止
+        ├─ 检查任务未启动且未终止
         ├─ 启动本机动作线程
-        ├─ 向对应 driver 提供任务输入
+        ├─ 向对应 driver 提供 command 对应的输入
         └─ 返回 START accepted / started
-                │
-                ▼
-        driver 开始根据任务类型运行
 ```
 
-START 的职责是启动已经 ACCEPTED 的任务，而不是重新解析或重新受理任务。
+START 的职责是启动已经 ACCEPTED 的单机任务，而不是重新解析或重新受理任务。
 
-### 2.4 当前完整链路
+### 2.3 批次任务与单机执行链路
 
 ```text
-批次任务
-   │
-   ▼
+批次任务名称，例如 prepare
+        │
+        ▼
 tcp_to_ros 执行批次 prepare / 排程
-   │
-   ├─ 某 UAV-1 ──单机任务请求──► executor-1 ──► ACCEPTED
-   ├─ 某 UAV-2 ──单机任务请求──► executor-2 ──► ACCEPTED
-   └─ ...
-   │
-   ▼
+        │
+        ├─ 单机任务请求 ─► executor-1 ─► ACCEPTED
+        ├─ 单机任务请求 ─► executor-2 ─► ACCEPTED
+        └─ ...
+        │
+        ▼
 全部或规定参与者 ACCEPTED
-   │
-   ▼
+        │
+        ▼
 tcp_to_ros 按批次协调结果发送 START
-   │
-   ├─ executor-1 ──► 启动任务
-   ├─ executor-2 ──► 启动任务
-   └─ ...
-   │
-   ▼
-各 executor 根据任务类型向 ego driver 提供不同输入
-   │
-   ▼
-ego driver 自行进入预期运行状态
+        │
+        ├─ executor-1 ─► 启动对应 command
+        ├─ executor-2 ─► 启动对应 command
+        └─ ...
+        │
+        ▼
+各 executor 向 ego driver 提供 command 对应的信息
+        │
+        ▼
+ego driver 自行进入预期状态
 ```
 
----
+### 2.4 导航命令
 
-## 3. executor 的任务分类与 ego 预期状态
-
-executor 不直接写入 ego 的内部状态，而是按任务类型提供不同信息，使 ego driver 进入相应的预期状态。
-
-### 3.1 导航任务：EGO_EXECUTING
-
-适用任务：
+适用 command：
 
 ```text
 MOVE_TO
 FAULT_EXIT
 FOLLOW_ROUTE（leader）
-以及其他包含航点、由本机自主导航的任务
+以及其他“本机根据航点自主运动”的固定 command
 ```
-
-流程：
 
 ```text
 ACCEPTED/START
         │
         ▼
-executor 解析任务航点
+executor 读取 command 的航点参数
         │
-        ├─ 根据任务内容生成 waypoints 序列
-        ├─ 进行必要的航点处理/密化
+        ├─ 生成 ego 可使用的 waypoints 序列
+        ├─ 执行必要的航点处理/密化
         └─ 向 ego driver 发布 waypoints 等信息
                 │
                 ▼
@@ -238,38 +222,35 @@ executor 解析任务航点
         使用 ego 算法执行自主导航
 ```
 
-`EGO_EXECUTING` 与 `PI_EXECUTING` 的核心区别：
+示例：
 
 ```text
-EGO_EXECUTING
-    = ego 算法根据目标航点自主规划和执行
-
-PI_EXECUTING
-    = PI 控制根据 leader 和 offset 跟随
+任务名称：prepare       command：MOVE_TO
+任务名称：fault-exit   command：FAULT_EXIT
 ```
 
-### 3.2 跟随任务：PI_EXECUTING
+二者的任务名称不同，但都可以通过航点输入使 ego driver 进入 `EGO_EXECUTING`。
 
-适用任务：
+### 2.5 跟随命令
+
+适用 command：
 
 ```text
 FOLLOW_ROUTE（follower）
 ```
 
-流程：
-
 ```text
 ACCEPTED/START
         │
         ▼
-executor 解析跟随任务
+executor 读取 follower 参数
         │
         ├─ 提供 leader ID（UAVn）
         ├─ 提供本机相对 leader 的 offset
         └─ 向 ego driver 发布跟随所需信息
                 │
                 ▼
-        ego driver 根据跟随信息自行转换状态
+        ego driver 根据 leader/offset 自行转换状态
                 │
                 ▼
              PI_EXECUTING
@@ -278,15 +259,18 @@ executor 解析跟随任务
         使用 PI 控制跟随 leader
 ```
 
-### 3.3 悬停任务：COMPLETED_HOLD
+```text
+EGO_EXECUTING = 以 waypoints 为输入，使用 ego 算法自主导航
+PI_EXECUTING  = 以 leader ID 和 offset 为输入，使用 PI 控制跟随
+```
 
-适用任务：
+### 2.6 悬停命令
+
+适用 command：
 
 ```text
 HOVER
 ```
-
-流程：
 
 ```text
 ACCEPTED/START
@@ -301,129 +285,78 @@ ego driver 执行悬停/保持动作
       COMPLETED_HOLD
 ```
 
-`COMPLETED_HOLD` 是正常流程中的保持状态，允许后续切换到其他合法状态。
-
 ```text
 COMPLETED_HOLD
       │
-      ├─ 新的导航任务 ─► EGO_EXECUTING
-      ├─ 新的跟随任务 ─► PI_EXECUTING
-      ├─ 新的 HOVER   ─► COMPLETED_HOLD
-      └─ 安全 HOLD     ─► EMERGENCY_HOLD
+      ├─ 允许新的 MOVE_TO / FAULT_EXIT command
+      ├─ 允许新的 FOLLOW_ROUTE command
+      ├─ 允许再次执行 HOVER command
+      └─ 收到安全 HOLD 或安全事件时转入 EMERGENCY_HOLD
 ```
 
-具体切换条件和状态内动作待后续逐条确认。
+### 2.7 安全命令
 
-### 3.4 安全任务：EMERGENCY_HOLD
-
-适用任务：
+适用 command：
 
 ```text
 HOLD
 ```
 
-流程：
-
 ```text
-收到安全 HOLD 请求或安全事件
+收到 HOLD command 或确认的安全事件
         │
         ▼
 executor 提供安全保持所需信息
         │
         ▼
-ego driver 自行转换状态
+ego driver 根据自身状态机转换
         │
         ▼
       EMERGENCY_HOLD
 ```
 
-`EMERGENCY_HOLD` 与 `COMPLETED_HOLD` 的区别：
-
 ```text
 COMPLETED_HOLD
-    = 正常完成/悬停
-    = 允许切换到其他状态
+    = 正常完成/HOVER 后的保持状态
+    = 允许切换到其他普通状态
 
 EMERGENCY_HOLD
-    = 安全故障后的锁存保持
-    = 不允许普通任务、START 或自动 replan 退出
+    = 安全故障后的锁存保持状态
+    = 不允许普通 command、START 或自动 replan 退出
     = 只能通过遥控器切换到 onboard 模式后人工接管
 ```
 
-期望结构：
-
 ```text
 EMERGENCY_HOLD
         │
-        ├─ 拒绝新的普通任务启动
-        ├─ 拒绝自动恢复到 EGO_EXECUTING
-        ├─ 拒绝自动恢复到 PI_EXECUTING
-        └─ 保持当前安全位置/悬停控制
+        ├─ 停止正常自主导航
+        ├─ 停止 PI 跟随
+        ├─ 保持当前安全位置/悬停
+        ├─ 拒绝普通 command 的自动启动
+        └─ 拒绝自动恢复到 EGO_EXECUTING 或 PI_EXECUTING
 
-        直到：
-        遥控器切换到 onboard 模式
-                │
-                ▼
-        人工接管，且不再依赖 offboard 程序
+        直到：遥控器切换 onboard → 人工接管
 ```
 
----
-
-## 4. executor 的反馈职责
-
-### 4.1 向 tcp_to_ros 反馈 ACCEPTED/START
+### 2.8 executor 监控和反馈
 
 ```text
-单机任务请求
-        │
-        ▼
-executor 校验并保存
-        │
-        ▼
-返回 ACCEPTED
-        │
-        ▼
-等待 GCS START
-        │
-        ▼
-收到 START 后启动任务
-        │
-        ▼
-返回 START accepted / started
-```
-
-这组反馈用于 tcp_to_ros 判断：
-
-```text
-· 本机是否已经接受任务
-· 本机是否可以进入启动阶段
-· 本机是否已经启动动作线程
-· 批次任务是否可以继续协调
-```
-
-### 4.2 监控 ego 状态并反馈运动结果
-
-```text
-ego driver 状态/结果
+ego driver 状态/运动结果
         │
         ▼
 executor 监控
         │
-        ├─ 正常完成
-        │      └─ 向 tcp_to_ros 反馈 SUCCESS
-        │
-        ├─ 进入 COMPLETED_HOLD
-        │      └─ 作为正常完成/保持结果反馈
+        ├─ 正常完成/COMPLETED_HOLD
+        │      └─ 向 tcp_to_ros 反馈成功结果
         │
         ├─ 普通执行失败
         │      └─ 向 tcp_to_ros 反馈 FAILURE
         │
-        └─ 进入 EMERGENCY_HOLD
-               ├─ 反馈安全故障/FAILURE
-               └─ 记录本机进入锁存安全状态
+        └─ EMERGENCY_HOLD
+               └─ 反馈安全故障/FAILURE，记录锁存状态
 ```
 
-这里的本机运动结果可以理解为 executor 对 ego driver 结果的任务级封装：
+本机运动结果可抽象为：
 
 ```text
 MotionResult
@@ -432,19 +365,11 @@ MotionResult
     + message
 ```
 
-后续需要继续确认：
-
-```text
-· SUCCESS 是否只对应 COMPLETED_HOLD
-· FAILURE 是否区分普通规划失败和 EMERGENCY_HOLD
-· EMERGENCY_HOLD 是否需要专门的状态反馈码
-· executor 是否持续反馈状态，还是只在状态变化时反馈
-· tcp_to_ros 是否负责把单机 FAILURE 传播为批次级失败和全组安全动作
-```
+TCP 接口的线上状态应使用协议规定的 `ACCEPTED`、`COMPLETED`、`FAILED`；`SUCCESS`、`FAILURE` 是 executor/runtime 内部的任务结果语义，具体映射仍见第 0 章。
 
 ---
 
-## 5. 当前已确认的状态机骨架
+## 3. 当前已确认的状态机骨架
 
 ```text
                          ACCEPTED/START
@@ -452,26 +377,38 @@ MotionResult
           ┌────────────────────┼────────────────────┐
           │                    │                    │
           ▼                    ▼                    ▼
-       导航任务             跟随任务              HOVER
+   MOVE_TO / FAULT_EXIT   FOLLOW_ROUTE leader   FOLLOW_ROUTE follower
           │                    │                    │
-          ▼                    ▼                    ▼
-   executor 发布          executor 发布       executor 发布
-   waypoints 等信息       leader + offset      HOVER 信息
-          │                    │                    │
-          ▼                    ▼                    ▼
-   EGO_EXECUTING         PI_EXECUTING       COMPLETED_HOLD
-          │                    │                    │
-          │                    │                    ├─允许普通状态切换
-          │                    │                    │
-          └────────────┬───────┴────────────────────┘
-                       │
-                       │ 安全 HOLD / 安全事件
-                       ▼
-                EMERGENCY_HOLD
-                       │
-                       ├─锁存
-                       ├─不允许普通状态退出
-                       └─仅遥控器切换 onboard 后人工接管
+          └──────────────┬─────┘                    │
+                         ▼                          ▼
+              executor 发布 waypoints       executor 发布 leader + offset
+                         │                          │
+                         ▼                          ▼
+                  EGO_EXECUTING                PI_EXECUTING
+                         │                          │
+                         └──────────────┬───────────┘
+                                        │ 正常完成/停止
+                                        ▼
+                                 COMPLETED_HOLD
+                                        │
+                         ┌──────────────┼──────────────┐
+                         │              │              │
+                         ▼              ▼              ▼
+                  新自主导航       新跟随 command    HOVER command
+                         │              │              │
+                         ▼              ▼              ▼
+                  EGO_EXECUTING    PI_EXECUTING   COMPLETED_HOLD
+
+任意可运行状态 ── HOLD command / 安全事件 ──► EMERGENCY_HOLD
 ```
 
-此图是当前设计骨架，不代表所有切换条件、失败分支和全组联动细节已经确定。后续内容将在状态机每条边的功能描述确认后继续补充。
+```text
+EMERGENCY_HOLD
+        │
+        ├─ 锁存
+        ├─ 不允许普通 command 或 START 退出
+        ├─ 不允许自动 replan 恢复普通执行
+        └─ 仅遥控器切换 onboard 后人工接管
+```
+
+此图是当前设计骨架，不代表所有切换条件、失败分支、反馈码和全组联动细节已经确定；这些内容在第 0 章确认后继续补充。
