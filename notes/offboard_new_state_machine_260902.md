@@ -746,13 +746,17 @@ C 分支不直接提交新轨迹；B 分支不区分普通 `REPLAN_REQUEST` 的�
 ```text
 publishSetpoint() 周期运行
         │
-        ├─ 读取当前已提交轨迹 current_
-        ├─ 根据执行时间采样位置、速度、加速度和 yaw
-        ├─ 发布当前轨迹 setpoint 给 PX4
-        └─ 提供 waypointTracker 所需的当前位姿和执行时间
+        ├─ current_ 存在
+        │      ├─ 根据执行时间采样位置、速度、加速度和 yaw
+        │      ├─ 发布当前轨迹 setpoint 给 PX4
+        │      └─ 提供 waypointTracker 所需的当前位姿和执行时间
+        │
+        └─ current_ 不存在
+               └─ 继续发布进入 EGO_EXECUTING 前锁存的 HOLD setpoint
+                   直到首条轨迹成功提交或状态退出
 ```
 
-A 分支的职责是维持当前轨迹的实时执行，不负责提交新轨迹，也不直接决定普通 replan 或 brake。
+A 分支只维持安全、连续的 setpoint 输出：已有轨迹时执行 `current_`；首次规划尚未完成时保持原悬停目标。它不负责产生规划请求、提交新轨迹或决定普通 replan、complete、brake。
 
 ```text
 A. 轨迹执行分支
@@ -761,41 +765,27 @@ A. 轨迹执行分支
     = keep the current execution loop alive
 ```
 
-### 4.2 B. 轨迹更新分支
+### 4.2 B. 轨迹更新与请求仲裁分支
 
-B 分支是唯一执行 `replanOnce()` 并提交新轨迹的分支。
-
-```text
-B. 轨迹更新分支
-        │
-        ├─ replanTimer 产生的 REPLAN_REQUEST
-        ├─ waypointsTracker 产生的 REPLAN_REQUEST
-        └─ collisionChecker 产生的 REPLAN_REQUEST
-                │
-                ▼
-       请求仲裁器确认无更高优先级请求
-                │
-                ▼
-             replanOnce()
-                │
-        ┌───────┴────────┐
-        │                │
-        ▼                ▼
-       成功             失败
-        │                │
-        ├─ 替换 current_  └─ 失败后的重试/结束策略待第 0 章确认
-        ├─ 更新轨迹激活时间
-        ├─ 发布新 intent
-        └─ 保持 EGO_EXECUTING
-```
-
-B 分支不根据请求来自定时器、waypointTracker 还是 collisionChecker 选择不同的规划算法：
+B 分支接收 C 分支产生的动作请求并执行统一仲裁。请求仲裁器属于 B 分支，位于 `replanOnce()` 上游；完整优先级和状态转换见第 4.4 节。
 
 ```text
-REPLAN_REQUEST
-    → 统一进入 replanOnce()
-    → 统一执行规划、验证、提交和结果处理
+replanTimer ──────────► REPLAN_REQUEST ─┐
+waypointsTracker ─────► REPLAN_REQUEST  ├─► B 分支收集/合并请求
+waypointsTracker ─────► COMPLETE_REQUEST│          │
+collisionChecker ─────► REPLAN_REQUEST  │          ▼
+emergencyDog ─────────► BRAKE_REQUEST ──┘       请求仲裁
+                                                   │
+                                                   └─ REPLAN
+                                                        │
+                                                        ▼
+                                                   replanOnce()
+                                                        │
+                                                        └─ 处理轨迹更新结果
+                                                           保持 EGO_EXECUTING
 ```
+
+B 分支不根据普通 `REPLAN_REQUEST` 的来源选择不同规划算法。C 分支不直接调用 `replanOnce()`；`replanOnce()` 也不负责请求优先级仲裁。
 
 ### 4.3 C. 条件触发分支
 
@@ -808,30 +798,37 @@ C 分支只产生请求，不直接修改 `current_` 或提交新轨迹。
 ```text
 replanTimer 周期检查
         │
-        ▼
-读取当前最新已提交轨迹的年龄
-        │
-        │ trajectory_age = now - current_ 的激活时间
+        ├─ 已有 REPLAN_REQUEST 待仲裁
+        │  或 replanOnce() 正在运行
+        │      └─ 不重复产生请求
         │
         ├─ current_ 不存在
-        │      └─ 不产生请求
+        │      └─ 产生 REPLAN_REQUEST
+        │          用于进入 EGO_EXECUTING 后建立首条轨迹
         │
-        ├─ trajectory_age < 1s
-        │      └─ 不产生请求
-        │
-        └─ trajectory_age >= 1s
-                └─ 产生 REPLAN_REQUEST
+        └─ current_ 存在
+               │
+               ├─ trajectory_age < 1s
+               │      └─ 不产生请求
+               │
+               └─ trajectory_age >= 1s
+                      └─ 产生 REPLAN_REQUEST
+                          用于更新执行中的轨迹
 ```
 
-它不是“每隔 1 秒无条件调用一次 `replanOnce()`”，而是：
+`replanTimer` 统一触发首次规划和按轨迹年龄更新：
 
 ```text
-周期检查轨迹年龄
-    → 年龄达到 1s 后产生 REPLAN_REQUEST
-    → B 分支消费请求并调用 replanOnce()
+current_ 不存在
+    → 请求建立首条轨迹
+
+current_ 存在且年龄达到 1s
+    → 请求更新现有轨迹
 ```
 
-同一条轨迹年龄达到 1 秒后的重复请求抑制，以及 `replanOnce()` 失败后的重试/结束策略，暂不在本章定案，统一保留在第 0 章待确认。
+首次规划不增加独立状态或独立规划入口。进入 `EGO_EXECUTING` 后，A 分支先继续发布原锁存 HOLD setpoint；`replanTimer` 产生普通 `REPLAN_REQUEST`，由 B 分支仲裁后调用同一个 `replanOnce()`。请求待仲裁或规划运行期间抑制同类重复请求。
+
+`replanOnce()` 失败后的再次请求间隔和结果处理仍由第 5 章讨论。
 
 #### 4.3.2 waypointsTracker
 
@@ -961,41 +958,92 @@ BRAKE_REQUEST 被接受
 ```text
 进入 EGO_EXECUTING
         │
+        ├─────────────────────────────────────────────────────────┐
+        │                                                         │
+        ▼                                                         │
+┌──────────────────────────────────────────────────────┐          │
+│ A. 轨迹执行分支                                       │          │
+│    current_ 存在：采样轨迹并发布 PX4 setpoint         │          │
+│    current_ 不存在：继续发布锁存 HOLD setpoint        │          │
+│    提供当前 pose 和执行时间                           │          │
+└──────────────────────────────────────────────────────┘          │
+                                                                  │
+        ┌─────────────────────────────────────────────────────────┘
         ▼
 ┌──────────────────────────────────────────────────────┐
-│ A. publishSetpoint                                    │
-│    持续采样 current_，发布 PX4 setpoint               │
-│    提供当前 pose 和执行时间                            │
+│ C. 条件触发分支                                       │
+│    replanTimer：无 current_ → REPLAN_REQUEST          │
+│    replanTimer：轨迹年龄 >= 1s → REPLAN_REQUEST      │
+│    waypointsTracker：推进 → REPLAN_REQUEST            │
+│    waypointsTracker：到达 end_pt → COMPLETE_REQUEST  │
+│    collisionChecker：新 intent 冲突 → REPLAN_REQUEST │
+│    emergencyDog：pose 门禁 → BRAKE_REQUEST            │
+│                                                       │
+│    只产生请求，不直接改变状态或提交轨迹               │
 └──────────────────────┬───────────────────────────────┘
-                       │
+                       │ requests
                        ▼
 ┌──────────────────────────────────────────────────────┐
-│ C. 条件触发                                            │
-│    replanTimer：轨迹年龄 >= 1s → REPLAN_REQUEST       │
-│    waypointsTracker：推进 → REPLAN_REQUEST             │
-│    waypointsTracker：到达 end_pt → COMPLETE_REQUEST   │
-│    collisionChecker：新 intent 冲突 → REPLAN_REQUEST  │
-│    emergencyDog：pose 门禁 → BRAKE_REQUEST             │
-└──────────────────────┬───────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│ 请求仲裁器                                             │
-│    BRAKE > COMPLETE > REPLAN                          │
-└───────────────┬──────────────┬────────────────────────┘
-                │              │
-                ▼              ▼
-          EMERGENCY_HOLD   COMPLETED_HOLD
-                │
-                └──────────────┐
-                               ▼
-┌──────────────────────────────────────────────────────┐
-│ B. 轨迹更新                                            │
-│    REPLAN_REQUEST → replanOnce()                      │
-│    成功：替换 current_、更新时间、发布 intent           │
-│    失败：按失败策略重试或结束                            │
-│    成功后继续 EGO_EXECUTING                            │
-└──────────────────────────────────────────────────────┘
+│ B. 轨迹更新与请求仲裁分支                             │
+│                                                       │
+│    收集/合并请求                                      │
+│            │                                          │
+│            ▼                                          │
+│    仲裁：BRAKE > COMPLETE > REPLAN                   │
+└────────────┬──────────────┬───────────────┬───────────┘
+             │              │               │
+          BRAKE          COMPLETE         REPLAN
+             │              │               │
+             ▼              ▼               ▼
+  ┌────────────────┐ ┌────────────────┐ ┌────────────────────────┐
+  │ EMERGENCY_HOLD │ │ COMPLETED_HOLD │ │ replanOnce()           │
+  │                │ │                │ │ 处理轨迹更新结果       │
+  │ 退出            │ │ 退出            │ │ 保持 EGO_EXECUTING    │
+  │ EGO_EXECUTING  │ │ EGO_EXECUTING  │ └────────────────────────┘
+  └────────────────┘ └────────────────┘
 ```
 
-本章确定了 `EGO_EXECUTING` 内部的职责拆分和请求优先级；尚未确定的 `replanOnce()` 失败重试策略、普通失败错误码细分和 PI_EXECUTING 完成反馈边界仍记录在第 0 章。
+仲裁结果边界以第 4.4 节为准。`replanOnce()` 只接收 B 分支仲裁产生的 `REPLAN` 响应，不负责状态退出请求的仲裁。尚未确定的失败重试策略、普通失败错误码细分和 `PI_EXECUTING` 完成反馈边界仍记录在第 0 章。
+
+---
+
+## 5. 新状态机的 replanOnce() 内部设计
+
+本章用于逐项确定新状态机中轨迹更新动作的职责、输入、输出及其与其他状态动作的边界。讨论按第 5.0 节顺序进行：一个问题形成明确结论后，再讨论下一个问题。未形成结论的内容不作为最终设计。
+
+### 5.0 待讨论问题
+
+1. **失败重试与多源重规划请求如何协调**
+   - 当前实现包含约 1 秒周期重试和最长约 10 秒的连续失败累计。
+   - 长时间失败处理占用统一重规划入口，可能与 `replanTimer`、`waypointsTracker`、`collisionChecker` 等频繁、多源 `REPLAN_REQUEST` 冲突。
+   - 需确定请求合并、失败退避、再次尝试和新请求抢占旧失败上下文的结构。
+
+2. **重规划动作是否应保证成功输出**
+   - 是否应把超时失败、紧急制动、状态退出全部移出重规划动作。
+   - 是否可以要求每次重规划一定输出一条可提交轨迹；若无法生成新轨迹，旧轨迹、悬停轨迹或无输出应如何定义。
+   - 需区分“规划计算失败”“没有新轨迹”和“状态机失败退出”。
+
+3. **`EGO_EXECUTING` 轨迹更新动作的最终逻辑结构**
+   - 结合本文件既定三分支结构和当前 `ego_planner_driver` 实现，确定轨迹更新动作的输入快照、规划、验证、提交及返回结果。
+   - 评估 `replanOnce()` 命名是否仍准确；可选名称包括 `tryReplan()`、`computeTrajectoryUpdate()` 或 `processReplanRequest()`。
+
+4. **与其他状态动作的耦合和冲突**
+   - 检查 `TAKEOFF`、`PI_EXECUTING`、`COMPLETED_HOLD`、`EMERGENCY_HOLD` 的动作函数是否共享 `current_`、setpoint 发布、HOLD 目标、计时器、请求标志或轨迹提交入口。
+   - 明确状态切换时如何取消在途规划，防止旧规划结果覆盖新状态。
+
+5. **多源请求的语义和去重粒度**
+   - `replanTimer`、waypoint 推进、邻机轨迹冲突产生的请求是否只需合并为一个 pending bit。
+   - 是否需要保存最新 waypoint 代次、邻机 intent 版本或原因集合，避免丢失比旧请求更新的输入。
+
+6. **首次轨迹与执行中更新是否使用同一动作**
+   - 进入 `EGO_EXECUTING` 时可能尚无 `current_`；执行中重规划则通常已有可继续执行的旧轨迹。
+   - 需确定二者能否共享同一输入/输出契约，以及首次规划失败时允许保持什么 setpoint。
+
+7. **并发计算结果的有效性判定**
+   - 规划期间可能发生 waypoint 推进、收到更新邻机 intent、状态切换或 `BRAKE_REQUEST`。
+   - 需确定提交时使用哪些 generation/version 检查，并规定过期结果只能丢弃、不能提交。
+
+8. **轨迹更新结果类型**
+   - 需决定返回 `bool`，还是返回可区分 `UPDATED`、`KEEP_CURRENT`、`STALE`、`NO_SOLUTION`、`RESOURCE_ERROR` 等语义的结果类型。
+   - 结果只描述轨迹更新事务，不直接承担状态机终态转换。
+
