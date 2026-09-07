@@ -25,15 +25,17 @@ mem_size: 16                        # L-BFGS 内存（int，>0）：历史梯度
 g_epsilon: 0.01                     # L-BFGS 梯度停机阈值（无量纲，>0）：||g|| 小于该值提前收敛
 
 # —— 重规划与执行状态机（node）——
-replan_period_s: 1.0                # 定时重规划周期（s，>0）：replanLoop 周期；分支 C elapsed>=min(period,0.85*duration)
+replan_period_s: 1.0                # 定时重规划周期（s，>0）：replanLoop 常态周期；分支 C elapsed>=min(period,0.85*duration)
+replan_retry_period_s: 0.6          # retry 重规划周期（s，>0，变更 C 26090802）：失败/retry 态下 replanLoop 的等待周期
+max_same_input_retries: 5           # 同输入最大重试次数（int，>0，变更 C 26090802）：相同输入签名（目标/intent 未变）连续失败达该值
+                                    #   收口 EGO_PLAN_FAILED；输入变化或成功提交清零（替代 plan_fail_timeout_s 时间窗）
 no_replan_thresh_m: 1.0             # 免重规划距离（m，>0）：距最终目标 <=1m 停止时间重规划与退化完整剩余
 reach_thresh_m: 0.5                 # 推进判据（m，>0）：分支 A 距当前关键点 <0.5m 切相邻下一关键点
 max_advance_dist_m: 3.5             # 单次推进最远距离（m，>0）：过近(<0.5m)关键点丢弃、最远取该值
 arrival_reach_thresh_m: 0.5         # 到达判据（m，>0）：分支 B 距最终关键点 <0.5m 且稳定 arrival_stable_s -> COMPLETED
                                     #   （260828 用户决策由 0.2m 放宽，覆盖 15 机 prepare 实测 0.29m 终点偏差）
 activation_replan_attempts: 3       # 激活重试次数（int，>=1）：激活时避碰 clearance 变化可有限重试次数
-plan_fail_timeout_s: 10.0           # 规划失败收口超时（s，>0，安全）：连续失败达该值才锁存安全目标并 EGO_PLAN_FAILED
-replan_failure_fatal: true          # 重规划失败是否致命（bool，安全）：true 时失败可收口失败状态
+replan_failure_fatal: true          # 重规划失败是否致命（bool，安全）：true 时同输入连续失败可收口失败状态
 setpoint_rate_hz: 30.0              # setpoint 发布频率（Hz，>0，冻结契约）：publishSetpoint 30Hz
 local_pose_timeout_s: 1.0           # 本机 local_pose 超时（s，>0）：超时判 stale/进入安全路径
 arrival_stable_s: 1.0               # 到达稳定时长（s，>0）：checkArrival 连续稳定窗口，满则 COMPLETED

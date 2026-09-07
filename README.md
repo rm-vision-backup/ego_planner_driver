@@ -51,13 +51,12 @@ HOLD ──goal/waypoints───────► EXECUTING
 EXECUTING ──分支A 推进───► EXECUTING（距当前目标<0.5m 切下一关键点，置位唤醒 replan）
 EXECUTING ──分支B 到达───► COMPLETED（距最终关键点<0.5m 稳定 1s）──► HOLD
 EXECUTING ──执行超时───────► EGO_EXEC_TIMEOUT ──(executor 收口)──► HOLD
-EXECUTING ──replan 全失败≥10s──► EGO_PLAN_FAILED ──(executor 收口)──► HOLD
-EXECUTING ──EMERGENCY+replan失败+ttc<1s──► EMERGENCY_BRAKE ──轨迹耗尽──► BRAKE_HOLD（锁存，不自动恢复）
-EXECUTING ──EMERGENCY+replan失败+ttc≥1s──► EGO_PLAN_FAILED（立即）──► HOLD
+EXECUTING ──同输入 replan 失败 ≥max_same_input_retries(5)──► EGO_PLAN_FAILED ──(executor 收口)──► HOLD
+任意态 ──实时 3D 门禁 / 组级安全指令──► BRAKE_HOLD（直接锁存悬停，无制动轨迹，仅人工/遥控接管退出）
 ```
 
 - 状态集：`HOLD / TAKEOFF / EXECUTING / COMPLETED / EGO_PLAN_FAILED /
-  EGO_EXEC_TIMEOUT / EMERGENCY_BRAKE / BRAKE_HOLD`（8 个；`POSE_STALE` 与 `NEGOTIATING` 已删除）。
+  EGO_EXEC_TIMEOUT / BRAKE_HOLD`（7 个；`EMERGENCY_BRAKE` 制动轨迹路径已删除，`POSE_STALE` 与 `NEGOTIATING` 已删除）。
 - `HOLD` 锁存进入时位置/yaw 为 setpoint，不随 pose 漂移（删 POSE_STALE 后无 pose 过期态；
   pose 过期期间不发布无效 setpoint，pose 恢复后自愈）。
 - `TAKEOFF`：arm+OFFBOARD 沿后从当前 z 以 `takeoff_ascend_speed` 软上升到 `takeoff_height_m`，
@@ -85,7 +84,7 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 | 定时 replan（分支 C） | 1s | `planning_requested_=true` |
 | 周期碰撞检查 `collisionCheckTick` | 10Hz | `current_` vs fresh 邻机同刻距离 < `1.2×swarm_clearance×2`(1.2m) → `planning_requested_=true` |
 | 推进（分支 A） | 每 tick | 切关键点时 `planning_requested_=true` |
-| 监督 EMERGENCY（方案 Y） | 25Hz | 只置 `emergency_pending_`（记录 primary peer + ttc）+ 唤醒 |
+| 监督 EMERGENCY（变更 D/E 26090802） | 25Hz | 只置 `emergency_pending_`（完成让位标记）+ `planning_requested_`（“需立即绕开”的 replan/预警）+ 唤醒；**不再经预测路径直接锁存制动** |
 
 `replanLoop` 处理：HOLD → TAKEOFF/直接控制跳过 → SEQUENTIAL_START 首轮排序
 （leader(id≤1)/已收前驱 intent/超时 `first_plan_wait_timeout_s`(10s) 才放行首轮）→
@@ -94,20 +93,22 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 ## replanOnce（唯一提交者，按优先级）
 
 ```
-① EMERGENCY 且常规 replan 失败：
-     ttc < emergency_replan_time_s(1.0s) → 受约束制动（EMERGENCY_BRAKE → BRAKE_HOLD，方案 Y）
-     ttc ≥ 1.0s                          → EGO_PLAN_FAILED（立即收口）
-② 常规 replan（planOnce，激活时刻对齐 ≤3 次重试）：
+① 常规 replan（planOnce，激活时刻对齐 ≤3 次重试）：
      checkClearance（固定 swarm_clearance×2=1m 硬门，规划/激活/提交三处）→ 提交
-③ 常规规划"成功但裕度不足"：min_clear < 1.2m → tryYieldReplan 生成候选替换（失败保持原轨迹）
-④ 常规 replan 失败：tryYieldReplan 候选（right-of-way）→ 成功提交
-⑤ 软着陆（26082700）：全失败不立即 PLAN_FAILED——保持当前轨迹执行（末端自然悬停），
-   由 1s 定时/冲突/推进事件继续重试；连续失败 ≥ plan_fail_timeout_s(10s) 才 EGO_PLAN_FAILED
-   （EMERGENCY 分支保持立即收口）
+② 常规规划"成功但裕度不足"：min_clear < 1.2m → tryYieldReplan 生成候选替换（失败保持原轨迹）
+③ 常规 replan 失败：tryYieldReplan 候选（right-of-way）→ 成功提交
+④ retry（变更 C 26090802）：全失败不立即 PLAN_FAILED——保持当前轨迹执行（末端自然悬停），
+   由 replanLoop 周期（失败/retry 态 replan_retry_period_s=0.6s，常态 1s）/事件继续重试；
+   相同输入签名连续失败 ≥ max_same_input_retries(5) 才 EGO_PLAN_FAILED
+   （输入变化或成功提交清零计数）
+⑤ BRAKE_HOLD 直接锁存不在此产生：SafetyPredictor EMERGENCY 只触发更早 replan/预警与
+   完成让位；直接锁存仅由 executor 实时 3D 门禁 / 组级安全指令（/brake_hold，onBrakeHold）触发
 ```
 
-提交段安全校验：提交锁内用最新邻机 intent 复验 1m 硬门；`safety_generation_` 防晚到结果覆盖
-制动/候选。常规 replan/候选/制动提交均清空 `plan_fail_since_`（退出软着陆计时）。
+提交段安全校验：提交锁内用最新邻机 intent 复验 1m 硬门；`safety_generation_` 防晚到结果覆盖；
+变更 B：快照后 `waypoint_consumed_` 已推进（`snap->target_consumed != waypoint_consumed_`）→ 丢弃
+过期结果、不发布 intent、不清 pending，以新目标重跑。成功提交/输入变化均清空 retry 失败计数。
+`BRAKE_HOLD` 锁存后 `onGoal`/`onWaypoints`/`onHold`/`direct_control` 均不可转出（锁存守卫）。
 
 ## 让路候选（replan 失败分支，SLOW/LEFT/RIGHT + right-of-way）
 
@@ -156,10 +157,11 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 |---|---|---|
 | `SUCCESS` | 完整轨迹生成成功 | 激活时刻复验 + clearance 复验 → 提交 `current_`、发布 intent、保持 `EXECUTING` |
 | `DEGENERATE_SEGMENT` | `start→target` 方向 < `segment_direction_epsilon`（0.05m） | 不提交、不推进、不失败计时、不触发制动；保留现有 `current_` 等待真实 odometry 推进/完成（§9.4） |
-| `RETRYABLE_FAILURE` | 普通有限数值失败（optimizer/clearance/动力学） | 保留现有轨迹，1s/事件 soft-landing 重试；连续 ≥10s（`plan_fail_timeout_s`）→ `EGO_PLAN_FAILED` |
+| `RETRYABLE_FAILURE` | 普通有限数值失败（optimizer/clearance/动力学） | 保留现有轨迹，replanLoop 周期重试（常态 1s / retry 态 0.6s）；相同输入连续 ≥`max_same_input_retries`(5) → `EGO_PLAN_FAILED` |
 | `RESOURCE_LIMIT` | 样本/点数超限、checked arithmetic、`bad_alloc` | 同事务不重试不 yield → 立即 `EGO_PLAN_FAILED → executor HOLD → backend ALL HOLD`（§9.6） |
 
-- 短段/方向退化/final 段动力学不可行不得升级为紧急制动；`EMERGENCY_BRAKE` 仍只由 SafetyPredictor 紧急事件 + replan 失败 + TTC 门槛共同触发。
+- 短段/方向退化/final 段动力学不可行不得升级为紧急制动；`BRAKE_HOLD` 直接锁存只由 executor 实时 3D
+  门禁 / 组级安全指令触发（变更 D/E），SafetyPredictor 预测只作 replan/预警与完成让位输入。
 - replan 线程最外层 `std::bad_alloc` containment（§9.9）：转为 `EGO_PLAN_FAILED`，不允许异常逃出进程。
 - `parameterizeToBspline` 改为 bounded single-QR（一次分解、x/y/z 三列 RHS、rank/residual/finite 校验、失败清空输出）。
 
@@ -204,7 +206,7 @@ identity/path/明确 deployment override（`uav_id`/`exec_target`/`frame_id`/`se
 | `reach_thresh_m` / `max_advance_dist_m` / `arrival_reach_thresh_m` | 0.5 / 3.5 / 0.5 | 推进 / 推进上限 / 到达阈值（0.5m 为 260828 用户决策由 0.2m 放宽） |
 | `no_replan_thresh_m` | 1.0 | 距最终目标该值内停止定时 replan |
 | `activation_replan_attempts` | 3 | 激活时刻对齐重试次数 |
-| `plan_fail_timeout_s` / `replan_failure_fatal` | 10.0 / true | 软着陆失败收口超时 / 常规失败是否收口 |
+| `replan_retry_period_s` / `max_same_input_retries` / `replan_failure_fatal` | 0.6 / 5 / true | retry 周期 / 同输入连续失败上限（替代 `plan_fail_timeout_s` 时间窗）/ 失败是否可收口 |
 | `setpoint_rate_hz` / `local_pose_timeout_s` / `arrival_stable_s` | 30 / 1.0 / 1.0 | setpoint 频率 / pose 超时 / 到达稳定 |
 | `exec_timeout_margin_s` | 5.0 | 轨迹耗尽后收口余量 |
 | `takeoff_height_m` / `takeoff_ascend_speed` | 5.0 / 1.0 | 软起飞高度 / 上升速度 |
@@ -213,9 +215,7 @@ identity/path/明确 deployment override（`uav_id`/`exec_target`/`frame_id`/`se
 | `safety_supervisor_mode` / `safety_supervisor_rate_hz` | active / 25.0 | 监督模式 / 频率；可显式设为 shadow / off |
 | `protected_distance_m` | 1.0 | EMERGENCY 物理距离 |
 | `warning_ttc_s` / `emergency_ttc_s` | 3.0 / 1.5 | WARNING/EMERGENCY ttc（校验 emergency<=warning） |
-| `emergency_replan_time_s` | 1.0 | 制动前重规划窗口 |
-| `emergency_decel_mps2` / `emergency_max_velocity_mps` / `emergency_jerk_mps3` | 2.0 / 1.5 / 8.0 | 制动动力学 |
-| `emergency_minimum_duration_s` / `emergency_maximum_duration_s` | 0.4 / 12.0 | 制动时长下限/上限（校验 max>=min） |
+| `emergency_decel_mps2` | 2.0 | SafetyPredictor 动态门槛制动余量 |
 | `safety_prediction_horizon_s` / `safety_sample_period_s` | 3.0 / 0.05 | 监督预测窗（260830 由 5.0 缩短）/ 采样步长 |
 | `peer_data_age_cap_s` | 2.0 | 诊断参数，**不参与安全决策** |
 | `neighbor_intent_stale_s` | 30.0 | 邻机 intent 接收窗 `[now±stale]`（接入实际 stale 判断） |

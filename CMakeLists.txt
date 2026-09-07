@@ -32,7 +32,6 @@ add_library(ego_planner_core
   src/polynomial_traj.cpp
   src/safety_predictor.cpp
   src/safety_logger.cpp
-  src/emergency_brake.cpp
   src/yield_candidates.cpp
 )
 target_link_libraries(ego_planner_core ${catkin_LIBRARIES})
@@ -64,10 +63,8 @@ if(CATKIN_ENABLE_TESTING)
   target_link_libraries(test_safety_predictor ego_planner_core ${catkin_LIBRARIES})
   catkin_add_gtest(test_yield_candidates test/test_yield_candidates.cpp)
   target_link_libraries(test_yield_candidates ego_planner_core ${catkin_LIBRARIES})
-  catkin_add_gtest(test_emergency_brake test/test_emergency_brake.cpp)
-  target_link_libraries(test_emergency_brake ego_planner_core ${catkin_LIBRARIES})
-  catkin_add_gtest(test_closed_loop_dynamics test/test_closed_loop_dynamics.cpp)
-  target_link_libraries(test_closed_loop_dynamics ego_planner_core ${catkin_LIBRARIES})
+  # 变更 D（26090802）：制动直接锁存 BRAKE_HOLD，无制动轨迹生成器/受控制动中间态
+  # （test_emergency_brake / test_closed_loop_dynamics 依赖该生成器，已随路径删除）。
   # 短末段内存回归（implementation_plan_26082722 §13.1）：父进程 fork 受限 worker
   # （RLIMIT_AS / RLIMIT_CPU / wall timeout），统计分类矩阵与 RSS 检查点。
   catkin_add_gtest(test_short_final_segment test/test_short_final_segment.cpp)

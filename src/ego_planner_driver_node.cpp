@@ -147,7 +147,9 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   arrival_reach_thresh_m_ = pnh_.param("arrival_reach_thresh_m", 0.5);
   setpoint_topic_ = pnh_.param("setpoint_out_topic", std::string("setpoint/ego"));
   frame_id_ = pnh_.param("frame_id", std::string("map"));
-  plan_fail_timeout_s_ = pnh_.param("plan_fail_timeout_s", 10.0);
+  // 变更 C：去 plan_fail_timeout_s 时间窗，失败收口改用“同输入连续失败计数”。
+  replan_retry_period_s_ = pnh_.param("replan_retry_period_s", 0.6);
+  max_same_input_retries_ = pnh_.param("max_same_input_retries", 5);
   replan_failure_fatal_ = pnh_.param("replan_failure_fatal", true);
   activation_replan_attempts_ = pnh_.param("activation_replan_attempts", 3);
   // Identity parameters live in the public namespace (/UAV1/*) so the
@@ -180,7 +182,6 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
       "minimum_prediction_window_s", 0.25);
   episode_release_hysteresis_s_ = pnh_.param(
       "safety_episode_release_s", 1.0);
-  emergency_replan_time_s_ = pnh_.param("emergency_replan_time_s", 1.0);
   neighbor_intent_stale_s_ = pnh_.param("neighbor_intent_stale_s", 30.0);
   first_plan_wait_timeout_s_ = pnh_.param("first_plan_wait_timeout_s", 10.0);
   // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，26082621 迭代）。
@@ -199,17 +200,6 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   yield_config_.swarm_clearance = config.swarm_clearance;
   yield_generator_.reset(new YieldCandidateGenerator(yield_config_));
   safety_predictor_.reset(new SafetyPredictor(safety_config_));
-  EmergencyBrakeConfig brake_config;
-  brake_config.max_velocity_mps = pnh_.param("emergency_max_velocity_mps", 1.5);
-  brake_config.max_acceleration_mps2 = config.max_acc;
-  brake_config.max_jerk_mps3 = pnh_.param("emergency_jerk_mps3", 8.0);
-  brake_config.nominal_deceleration_mps2 = safety_config_.emergency_decel_mps2;
-  brake_config.sample_period_s = pnh_.param("emergency_sample_period_s", 0.02);
-  brake_config.minimum_duration_s = pnh_.param(
-      "emergency_minimum_duration_s", 0.4);
-  brake_config.maximum_duration_s = pnh_.param(
-      "emergency_maximum_duration_s", 12.0);
-  emergency_brake_generator_.reset(new EmergencyBrakeGenerator(brake_config));
   // 集中参数语义校验（implementation_plan_26082916 §4/§7）：所有浮点 finite；
   // 时间/频率/速度/距离/TTC >0（允许 0 者单独登记）；TTC 单调
   // emergency_ttc <= warning_ttc；emergency_max_duration >= min；资源整数+硬限；
@@ -261,7 +251,8 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
         requirePos(reach_thresh_m_, "reach_thresh_m") &&
         requirePos(max_advance_dist_m_, "max_advance_dist_m") &&
         requirePos(arrival_reach_thresh_m_, "arrival_reach_thresh_m") &&
-        requirePos(plan_fail_timeout_s_, "plan_fail_timeout_s") &&
+        requirePos(replan_retry_period_s_, "replan_retry_period_s") &&
+        requireIntPos(max_same_input_retries_, "max_same_input_retries") &&
         requirePos(setpoint_rate_, "setpoint_rate_hz") &&
         requirePos(pose_timeout_, "local_pose_timeout_s") &&
         requirePos(stable_s_, "arrival_stable_s") &&
@@ -307,18 +298,6 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
         requirePos(safety_config_.minimum_prediction_window_s,
                    "minimum_prediction_window_s") &&
         requireNonNeg(episode_release_hysteresis_s_, "safety_episode_release_s") &&
-        requirePos(emergency_replan_time_s_, "emergency_replan_time_s") &&
-        requirePos(brake_config.max_velocity_mps, "emergency_max_velocity_mps") &&
-        requirePos(brake_config.max_jerk_mps3, "emergency_jerk_mps3") &&
-        requirePos(brake_config.sample_period_s, "emergency_sample_period_s") &&
-        requirePos(brake_config.minimum_duration_s,
-                   "emergency_minimum_duration_s") &&
-        requirePos(brake_config.maximum_duration_s,
-                   "emergency_maximum_duration_s") &&
-        require(brake_config.maximum_duration_s >=
-                    brake_config.minimum_duration_s,
-                "emergency_maximum_duration_s>=minimum",
-                brake_config.maximum_duration_s) &&
         requirePos(neighbor_intent_stale_s_, "neighbor_intent_stale_s")))
     return;
   if (safety_supervisor_mode_ != "off" && safety_supervisor_mode_ != "shadow" &&
@@ -359,6 +338,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
   intent_sub_ = nh_.subscribe("neighbor_intent", 10, &EgoPlannerDriverNode::onNeighborIntent, this);
   own_bias_sub_ = nh_.subscribe("gps_bias", 1, &EgoPlannerDriverNode::onOwnBias, this);
   hold_sub_ = nh_.subscribe("hold", 1, &EgoPlannerDriverNode::onHold, this);
+  brake_hold_sub_ = nh_.subscribe("brake_hold", 1, &EgoPlannerDriverNode::onBrakeHold, this);
   mavros_state_sub_ = nh_.subscribe("/mavros/state", 1, &EgoPlannerDriverNode::onMavrosState, this);
   direct_control_sub_ = nh_.subscribe("direct_control_active", 1,
                                       &EgoPlannerDriverNode::onDirectControl, this);
@@ -479,15 +459,19 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
       return false;
     // 单一 replan 入口（方案 A）：planning_requested_（1s 定时/10Hz 冲突/推进）
     // 或 emergency_pending_（监督 EMERGENCY 事件）任一置位即执行一轮。
-    // timed_trigger=true：replanLoop 1s 定时超时（软着陆失败重试的固定节奏）。
-    // steady_target_ 拦截例外：软着陆失败中（plan_fail_since_ 非零）即使 HOLD 捕获
+    // timed_trigger=true：replanLoop 周期超时（定时重试的固定节奏）。
+    // steady_target_ 拦截例外：retry 失败中（plan_fail_since_ 非零）即使 HOLD
     // 已锁存 steady_target_ 也放行定时重试（否则 HOLD 状态首轮失败无法恢复/无法
-    // 在 10s 超时后收口）；成功提交后 plan_fail_since_ 清空恢复拦截语义。
+    // 收口）；成功提交后 plan_fail_since_ 清空恢复拦截语义。
     if ((!timed_trigger && !planning_requested_ && !emergency_pending_) ||
         !pending_goal_ ||
         // §3.1：退化等待中（arrival_pending_）steady_target_ 可能被 HOLD 捕获
         // 锁存，必须放行定时补判，否则同点目标永远停在 HOLD。
         (steady_target_ && plan_fail_since_.isZero() && !arrival_pending_))
+      return false;
+    // BRAKE_HOLD 锁存守卫（变更 D）：锁存后常规 replan 不再产生（无 pending goal
+    // /steady_target_ 拦截已保证；此处显式再防御，防止 resetRun 类异常路径）。
+    if (exec_state_ == kStateBrakeHold)
       return false;
     planning_requested_ = false;
     const ros::Time now = nowFunc();
@@ -532,6 +516,8 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
       data.final_segment = false;
     }
     data.neighbors = freshAbsoluteNeighborsLocked(now);
+    // 变更 B：记录快照时的目标代次，提交前用于丢弃基于过期目标的规划结果。
+    data.target_consumed = waypoint_consumed_;
     snap = ReplanSnapshot(std::move(data));
   }
   if (!snap)
@@ -572,8 +558,8 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
       // 由 snapshot 前的 fresh odometry（handleArrivalBeforeSnapshotLocked）推进/
       // 到达。返回 false 且不启动 plan_fail_since_。
       // §3.1（260828 修复）：已有 plan_fail_since_ 后持续退化必须走普通可重试
-      // 失败路径（soft-landing 计时），否则失败计时既不清除也不收口，任务无法
-      // 按 plan_fail_timeout_s_ 终止。
+      // 失败路径（retry 计数收口），否则失败状态既不清除也不收口，任务无法
+      // 按 max_same_input_retries_ 终止。
       bool failing = false;
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -588,9 +574,9 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
       }
       ROS_WARN_THROTTLE(1.0,
                         "[%s] degenerate segment while replan failing; "
-                        "falling through to soft-landing closure",
+                        "falling through to retry closure",
                         uav_id_.c_str());
-      break;  // 进入 safe_candidate=false 软着陆失败路径（10s 收口）
+      break;  // 进入 safe_candidate=false retry 失败路径（同输入计数收口）
     }
     if (plan_result == PlanResult::RETRYABLE_FAILURE)
     {
@@ -609,19 +595,10 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
   }
   if (!safe_candidate)
   {
-    // 方案 Y：EMERGENCY 尝试路径失败不收口，由 Y 方案判定制动/PLAN_FAILED
-    // （跳过候选——ttc 紧时直接判制动，不做 SLOW/LEFT/RIGHT 浪费时间）。
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (emergency_pending_)
-      {
-        if (tryEmergencyBrakeLocked())
-          return true;
-        captureHoldTargetLocked(nowFunc());
-        setState(kStatePlanFailed);
-        return false;
-      }
-    }
+    // 变更 D/E（26090802）：预测 EMERGENCY 不再在此直接制动锁存（SafetyPredictor
+    // EMERGENCY 只置 emergency_pending_+planning_requested_ 作 replan/预警与
+    // “完成让位”标记）；常规 replan 失败按 retry 计数处理，真实锁存由 executor
+    // 实时 3D 门禁 / 组级安全指令经 onBrakeHold 触发。
     // 常规 replan 失败 → 候选（SLOW/LEFT/RIGHT + right-of-way，replan 失败分支）。
     if (snap)
     {
@@ -630,45 +607,58 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
         return true;
       if (yield_result == YieldResult::RESOURCE_LIMIT)
       {
-        // §9.6：候选生成内部资源失败 → 同一事务内立即收口，不进入软着陆。
+        // §9.6：候选生成内部资源失败 → 同一事务内立即收口，不进入 retry。
         std::lock_guard<std::mutex> lock(mutex_);
         captureHoldTargetLocked(nowFunc());
         setState(kStatePlanFailed);
         plan_fail_since_ = ros::Time();
+        same_input_failure_count_ = 0;
+        last_failure_signature_valid_ = false;
         ROS_ERROR("[%s] resource limit during yield replan; closing as EGO_PLAN_FAILED",
                   uav_id_.c_str());
         return true;
       }
-      // NOT_AVAILABLE：继续软着陆。
+      // NOT_AVAILABLE：继续 retry。
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    // 软着陆（26082700）：常规 replan 全失败不立即 PLAN_FAILED。保持当前轨迹
-    // （继续执行到末端自然悬停），由 replanLoop 1s 定时/冲突事件继续重试；
-    // 连续失败超过 plan_fail_timeout_s_（10s）才收口 EGO_PLAN_FAILED（executor
-    // 收口后经 backend 对全组活动机发 HOLD）。EMERGENCY 分支保持立即收口
-    // （安全关键路径不变）。
+    // 变更 C（26090802）：常规 replan 全失败不立即 PLAN_FAILED。保持当前轨迹
+    // （继续执行到末端自然悬停），由 replanLoop 周期（失败/retry 态用
+    // replan_retry_period_s_=0.6s）/冲突事件继续重试；相同输入签名连续失败达到
+    // max_same_input_retries_（5）才收口 EGO_PLAN_FAILED（executor 收口后经
+    // backend 对全组活动机发 HOLD）。输入变化或成功提交清零计数。
     const ros::Time now = nowFunc();
     if (plan_fail_since_.isZero())
       plan_fail_since_ = now;
+    const uint64_t signature = replanInputSignatureLocked();
+    if (last_failure_signature_valid_ && last_failure_signature_ == signature)
+    {
+      ++same_input_failure_count_;
+    }
+    else
+    {
+      last_failure_signature_ = signature;
+      last_failure_signature_valid_ = true;
+      same_input_failure_count_ = 1;
+    }
     if (replan_failure_fatal_ &&
-        (now - plan_fail_since_).toSec() >= plan_fail_timeout_s_)
+        static_cast<int>(same_input_failure_count_) >= max_same_input_retries_)
     {
       captureHoldTargetLocked(now);
       setState(kStatePlanFailed);
       plan_fail_since_ = ros::Time();
-      ROS_WARN("[%s] replan failed for %.1fs, closing as EGO_PLAN_FAILED",
-               uav_id_.c_str(), plan_fail_timeout_s_);
+      same_input_failure_count_ = 0;
+      last_failure_signature_valid_ = false;
+      ROS_WARN("[%s] replan failed on same input %d consecutive retries, "
+               "closing as EGO_PLAN_FAILED",
+               uav_id_.c_str(), max_same_input_retries_);
     }
     else
     {
       ROS_WARN_THROTTLE(1.0,
-                        "[%s] replan failed, soft-landing (retry on 1s timer/event, "
-                        "%.1fs until EGO_PLAN_FAILED)",
-                        uav_id_.c_str(),
-                        plan_fail_since_.isZero()
-                            ? plan_fail_timeout_s_
-                            : (plan_fail_timeout_s_ -
-                               (now - plan_fail_since_).toSec()));
+                        "[%s] replan failed, retry %zu/%d on same input "
+                        "(retry period %.2fs)",
+                        uav_id_.c_str(), same_input_failure_count_,
+                        max_same_input_retries_, replan_retry_period_s_);
     }
     return false;
   }
@@ -701,18 +691,29 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
     std::lock_guard<std::mutex> lock(mutex_);
     if (hold_requested_)
       return true;
-    if (emergency_braking_ || snap->safety_generation != safety_generation_)
+    if (snap->safety_generation != safety_generation_)
       return false;
+    // 变更 B：规划期间目标已推进 → 候选基于过期目标 → 丢弃、不发布 intent、
+    // 不清 pending/retry 计数，立即以新目标重跑。
+    if (snap->target_consumed != waypoint_consumed_)
+    {
+      planning_requested_ = true;
+      replan_cv_.notify_all();
+      return false;
+    }
     const std::vector<NeighborTrajectory> commit_neighbors = rebaseNeighbors(
         freshAbsoluteNeighborsLocked(completed_at), completed_at);
     if (!core_->checkClearance(traj, commit_neighbors,
                                core_->config().swarm_clearance * 2.0))
     {
-      // 提交时最新邻机轨迹使本段不安全：EMERGENCY 优先制动，否则 PLAN_FAILED。
-      if (emergency_pending_ && tryEmergencyBrakeLocked())
-        return true;
+      // 提交时最新邻机轨迹使本段不安全 → PLAN_FAILED 收口（变更 D/E：直接锁存
+      // BRAKE_HOLD 只由 executor 实时 3D 门禁 / 组级安全指令触发，不由预测 replan
+      // 提交产生）。
       captureHoldTargetLocked(completed_at);
       setState(kStatePlanFailed);
+      plan_fail_since_ = ros::Time();
+      same_input_failure_count_ = 0;
+      last_failure_signature_valid_ = false;
       return false;
     }
     // The freshly generated trajectory owns a relative time axis beginning at
@@ -722,7 +723,9 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
     plan_start_ = completed_at;
     arrival_since_.reset();
     steady_target_.reset();
-    plan_fail_since_ = ros::Time();  // 常规 replan 提交 = 软着陆恢复（退出失败计时）
+    plan_fail_since_ = ros::Time();  // 常规 replan 提交 = retry 恢复（退出失败态）
+    same_input_failure_count_ = 0;
+    last_failure_signature_valid_ = false;
     // 常规 replan 成功 → 清除 EMERGENCY 事件（监督层对提交后新轨迹重新评估）。
     emergency_pending_ = false;
     emergency_peer_id_.clear();
@@ -772,7 +775,7 @@ bool EgoPlannerDriverNode::handleArrivalBeforeSnapshotLocked(const ros::Time& no
   // 返回 false；若 arrival_pending_ 已置（退化等待中，steady_target_ 可能是
   // 等待期间被 pose 捕获锁存）必须忽略并继续判定到达，否则同点目标永远停在
   // HOLD。
-  if (current_ || emergency_braking_ || hold_requested_ ||
+  if (current_ || hold_requested_ || emergency_pending_ ||
       (steady_target_ && !arrival_pending_))
     return false;  // 有轨迹时分支 A/B 由 publishSetpoint tick 的 checkArrival 处理
   if (!local_pose_ || !local_pose_stamp_ ||
@@ -798,6 +801,10 @@ bool EgoPlannerDriverNode::handleArrivalBeforeSnapshotLocked(const ros::Time& no
   {
     if (!arrival_since_)
       arrival_since_ = now;
+    // 变更 A：安全事件（emergency_pending_）置位时完成转换让位，不清标志，
+    // 交 replan 线程处理（不掩盖安全事件）。
+    if (emergency_pending_)
+      return false;
     if ((now - *arrival_since_).toSec() >= stable_s_)
     {
       steady_target_ = HoldTarget{waypoints_.back().position, goal_yaw_};
@@ -806,6 +813,8 @@ bool EgoPlannerDriverNode::handleArrivalBeforeSnapshotLocked(const ros::Time& no
       arrival_pending_ = false;
       plan_start_ = ros::Time(0);
       emergency_pending_ = false;
+      same_input_failure_count_ = 0;
+      last_failure_signature_valid_ = false;
       setState(kStateCompleted);
       ROS_INFO("[%s] real arrival at final keypoint (no current_) -> COMPLETED",
                uav_id_.c_str());
@@ -822,54 +831,57 @@ bool EgoPlannerDriverNode::handleArrivalBeforeSnapshotLocked(const ros::Time& no
   return false;
 }
 
-// 方案 Y：EMERGENCY 且 ttc 紧急（< emergency_replan_time_s_）时生成并提交受约束
-// 制动轨迹（EMERGENCY_BRAKE → 轨迹耗尽 → BRAKE_HOLD 锁存）。持 mutex_。
-// 返回 true = 已提交制动/fallback；false = 不制动（ttc 充足 → 调用方 PLAN_FAILED）。
-bool EgoPlannerDriverNode::tryEmergencyBrakeLocked()
+// 变更 D（26090802）：直接锁存悬停 BRAKE_HOLD（无制动轨迹中间态）。唯一触发
+// 源 = executor 实时 3D 门禁事件 / 组级安全指令（onBrakeHold）。持 mutex_。
+void EgoPlannerDriverNode::sendBrakeHold()
 {
-  if (!emergency_pending_)
-    return false;
-  emergency_pending_ = false;
-  const std::string peer = emergency_peer_id_;
-  emergency_peer_id_.clear();
-  if (!(emergency_peer_ttc_ < emergency_replan_time_s_))
-    return false;  // ttc 充足：由调用方收口（PLAN_FAILED / 等待）
+  std::lock_guard<std::mutex> lock(mutex_);
+  lockBrakeHoldLocked(nowFunc());
+}
 
-  TrajectorySample start;
-  if (current_ &&
-      current_->samplePVA(std::max(0.0, (nowFunc() - plan_start_).toSec()), start))
+void EgoPlannerDriverNode::onBrakeHold(const std_msgs::Empty::ConstPtr&)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  lockBrakeHoldLocked(nowFunc());
+}
+
+void EgoPlannerDriverNode::lockBrakeHoldLocked(const ros::Time& now)
+{
+  if (exec_state_ == kStateBrakeHold)
+    return;
+  // 在当前安全位置锁存 steady_target_（优先当前轨迹同刻采样，其次 fresh pose；
+  // 无 fresh pose 时保留已有锁存目标）。
+  if (!steady_target_)
   {
-    TimedTrajectory braking;
-    if (emergency_brake_generator_ &&
-        emergency_brake_generator_->generate(start, braking))
+    if (current_ && !plan_start_.isZero())
     {
-      ++safety_generation_;
-      current_.reset(new TimedTrajectory(braking));
-      plan_start_ = nowFunc();
-      arrival_since_.reset();
-      steady_target_.reset();
-      emergency_braking_ = true;
-      plan_fail_since_ = ros::Time();  // 制动提交 = 软着陆结束
-      setState(kStateEmergencyBrake);
-      publishIntent(braking, plan_start_,
-                    swarm_uav_interfaces::UavTrajectoryIntent::PHASE_BRAKING);
-      ROS_ERROR("[%s] emergency brake committed for peer=%s (scheme Y)",
-                uav_id_.c_str(), peer.empty() ? "unknown" : peer.c_str());
-      return true;
+      TrajectorySample sample;
+      const double elapsed = (now - plan_start_).toSec();
+      if (current_->samplePVA(std::max(0.0, elapsed), sample))
+        steady_target_ = HoldTarget{sample.pos, sample.yaw};
     }
-    // 生成器失败：立即中止 nominal，在当前样本位置锁存 fallback BRAKE_HOLD。
-    ++safety_generation_;
-    current_.reset();
-    plan_start_ = ros::Time(0);
-    emergency_braking_ = false;
-    plan_fail_since_ = ros::Time();  // fallback BRAKE_HOLD = 软着陆结束
-    steady_target_ = HoldTarget{start.pos, start.yaw};
-    setState(kStateBrakeHold);
-    ROS_ERROR("[%s] emergency brake generation failed; nominal aborted to "
-              "fallback BRAKE_HOLD", uav_id_.c_str());
-    return true;
+    if (!steady_target_)
+    {
+      const bool captured = captureHoldTargetLocked(now);
+      if (!captured && exec_state_ != kStateBrakeHold)
+        ROS_WARN("[%s] brake-hold without fresh pose; holding last known target", uav_id_.c_str());
+    }
   }
-  return false;  // 当前轨迹不可采样：调用方 PLAN_FAILED 收口。
+  ++safety_generation_;
+  current_.reset();
+  plan_start_ = ros::Time(0);
+  arrival_since_.reset();
+  arrival_pending_ = false;
+  emergency_pending_ = false;
+  emergency_peer_id_.clear();
+  planning_requested_ = false;
+  yield_committed_ = false;
+  yield_peer_traj_id_ = -1;
+  plan_fail_since_ = ros::Time();
+  same_input_failure_count_ = 0;
+  last_failure_signature_valid_ = false;
+  setState(kStateBrakeHold);
+  ROS_ERROR("[%s] direct BRAKE_HOLD latch (real-time gate / group safety)", uav_id_.c_str());
 }
 
 bool EgoPlannerDriverNode::sampleCurrentState(Eigen::Vector3d& pos,
@@ -977,6 +989,12 @@ size_t EgoPlannerDriverNode::setpointCount() const
 void EgoPlannerDriverNode::onGoal(const geometry_msgs::PointStamped::ConstPtr& msg)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  // 变更 D 锁存守卫：BRAKE_HOLD 拒绝新目标（保持锁存，仅人工/遥控接管退出）。
+  if (exec_state_ == kStateBrakeHold)
+  {
+    ROS_WARN_THROTTLE(2.0, "[%s] onGoal ignored while BRAKE_HOLD latched", uav_id_.c_str());
+    return;
+  }
   pending_goal_ = GoalPoint{Eigen::Vector3d(msg->point.x, msg->point.y, msg->point.z), goal_yaw_};
   waypoints_.assign(1, WayPoint{pending_goal_->position, goal_yaw_});
   // 单点目标：waypoints_[0] 即目标（无 start 关键点）。
@@ -997,6 +1015,12 @@ void EgoPlannerDriverNode::onGoalYaw(const std_msgs::Float64::ConstPtr& msg)
 void EgoPlannerDriverNode::onWaypoints(const geometry_msgs::PolygonStamped::ConstPtr& msg)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  // 变更 D 锁存守卫：BRAKE_HOLD 拒绝新航点（保持锁存）。
+  if (exec_state_ == kStateBrakeHold)
+  {
+    ROS_WARN_THROTTLE(2.0, "[%s] onWaypoints ignored while BRAKE_HOLD latched", uav_id_.c_str());
+    return;
+  }
   std::vector<WayPoint> wp;
   for (const auto& p : msg->polygon.points)
     wp.push_back(WayPoint{Eigen::Vector3d(p.x, p.y, p.z), goal_yaw_});
@@ -1180,9 +1204,54 @@ EgoPlannerDriverNode::freshAbsoluteNeighborsLocked(const ros::Time& now) const
   return result;
 }
 
+// 变更 C：规划输入签名（FNV-1a）。组成 = waypoint_consumed_ + 最终目标位置 +
+// 各 fresh 邻机 (epoch, traj_id)。用于判定“相同输入连续失败”：任一成员变化
+// （目标推进/新 intent/身份变化）即新签名，重计失败计数。
+uint64_t EgoPlannerDriverNode::replanInputSignatureLocked() const
+{
+  uint64_t hash = 1469598103934665603ull;  // FNV offset basis
+  auto mix = [&hash](uint64_t value) {
+    hash ^= value;
+    hash *= 1099511628211ull;
+  };
+  mix(static_cast<uint64_t>(waypoint_consumed_));
+  {
+    const uint64_t g = static_cast<uint64_t>(
+        std::llround(goal_yaw_ * 1e6));
+    mix(g);
+  }
+  if (!waypoints_.empty())
+  {
+    const WayPoint& back = waypoints_.back();
+    mix(static_cast<uint64_t>(waypoints_.size()));
+    mix(static_cast<uint64_t>(std::llround(back.position.x() * 1e6)));
+    mix(static_cast<uint64_t>(std::llround(back.position.y() * 1e6)));
+    mix(static_cast<uint64_t>(std::llround(back.position.z() * 1e6)));
+  }
+  for (const auto& item : latest_neighbor_version_)
+  {
+    uint64_t id_hash = 1469598103934665603ull;
+    for (const char c : item.first)
+    {
+      id_hash ^= static_cast<unsigned char>(c);
+      id_hash *= 1099511628211ull;
+    }
+    mix(id_hash);
+    mix(static_cast<uint64_t>(std::llround(item.second.first * 1e6)));
+    mix(static_cast<uint64_t>(item.second.second));
+  }
+  return hash;
+}
+
 void EgoPlannerDriverNode::onHold(const std_msgs::Empty::ConstPtr&)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  // 变更 D 锁存守卫：BRAKE_HOLD 下普通 HOLD 仅保持（不转 HOLD/不清锁存）。
+  if (exec_state_ == kStateBrakeHold)
+  {
+    ROS_DEBUG_THROTTLE(2.0, "[%s] onHold while BRAKE_HOLD latched; staying latched", uav_id_.c_str());
+    return;
+  }
   hold_requested_ = true;
   planning_requested_ = false;
   emergency_pending_ = false;
@@ -1200,6 +1269,14 @@ void EgoPlannerDriverNode::onMavrosState(const mavros_msgs::State::ConstPtr& msg
 void EgoPlannerDriverNode::setDirectControlActive(bool active)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  // 变更 D 锁存守卫：BRAKE_HOLD 下 direct_control 接管被拒绝（保持锁存）。
+  if (active && exec_state_ == kStateBrakeHold)
+  {
+    ROS_WARN_THROTTLE(2.0,
+                      "[%s] direct control rejected while BRAKE_HOLD latched",
+                      uav_id_.c_str());
+    return;
+  }
   direct_control_active_ = active;
   if (direct_control_active_)
   {
@@ -1255,11 +1332,13 @@ void EgoPlannerDriverNode::resetRun()
   // trajectory state (sampleCurrentState guards on current_).
   current_.reset();
   plan_start_ = ros::Time(0);
-  emergency_braking_ = false;
   emergency_pending_ = false;
   emergency_peer_id_.clear();
   yield_committed_ = false;
   yield_peer_traj_id_ = -1;
+  // 变更 C：新目标/普通 HOLD = 新输入，失败计数清零。
+  same_input_failure_count_ = 0;
+  last_failure_signature_valid_ = false;
 }
 
 void EgoPlannerDriverNode::setState(const std::string& state)
@@ -1427,20 +1506,12 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
     publishPositionTarget(current_->pts.back().x(), current_->pts.back().y(),
                           current_->pts.back().z(), current_->yaw.back(), kMaskHold);
   }
-  // 制动轨迹耗尽 → BRAKE_HOLD 锁存制动终点（方案 Y 由 replan 线程提交）。
-  if (elapsed >= current_->duration && emergency_braking_)
-  {
-    steady_target_ = HoldTarget{current_->pts.back(), current_->yaw.back()};
-    current_.reset();
-    plan_start_ = ros::Time(0);
-    emergency_braking_ = false;
-    setState(kStateBrakeHold);
-    return;
-  }
+  // 变更 D/E：无制动轨迹路径（原方案 Y 的 braking→BRAKE_HOLD 耗尽逻辑已删除）；
+  // BRAKE_HOLD 由 onBrakeHold（executor 实时门禁/组级指令）直接锁存。
   // plan-exec 分支 A/B（每 tick）：推进（距当前目标 <0.5m 切下一 keypoint）与
   // 到达（距最终关键点 <0.5m → COMPLETED）。推进时置 planning_requested_ 并
   // 事件唤醒 replanLoop（单一入口）。
-  if (exec_state_ == kStateExecuting && !emergency_braking_)
+  if (exec_state_ == kStateExecuting)
     checkArrival(current_->pts.back(), current_->yaw.back(), now);
   if (!current_)
     return;  // checkArrival 已提交 COMPLETED（清空 current_）
@@ -1451,7 +1522,7 @@ void EgoPlannerDriverNode::publishSetpoint(const ros::TimerEvent&)
       (Eigen::Vector3d(local_pose_->pose.position.x, local_pose_->pose.position.y,
                        local_pose_->pose.position.z) -
        waypoints_.back().position).norm() <= no_replan_thresh_m_;
-  if (!planning_requested_ && !hold_requested_ && !near_final && !emergency_braking_)
+  if (!planning_requested_ && !hold_requested_ && !near_final)
   {
     const double replan_trigger = std::min(replan_period_s_,
                                            current_->duration * 0.85);
@@ -1574,13 +1645,14 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
   if (prediction.level != SafetyLevel::EMERGENCY)
     return;
 
-  // 方案 Y（implementation_plan_26082621）：EMERGENCY 只置 emergency_pending_
-  // （记录 primary peer + ttc）并事件唤醒 replanLoop；不直接 replan/制动/改
-  // current_。制动由 replan 线程在"常规 replan 失败且 ttc < emergency_replan_
-  // time_s"时提交（提交唯一化，消除监督回调与 replan 线程的多路径竞争）。
+  // 变更 D/E（26090802）：监督层 EMERGENCY 只置 emergency_pending_（完成让位
+  // 标记 + primary peer/ttc 诊断）+ planning_requested_（“需立即绕开”的 replan
+  // 预警输入，比 10Hz collisionCheckTick 更早），并事件唤醒 replanLoop。不再经
+  // emergency_pending_→制动路径进入 BRAKE_HOLD；直接锁存只由 executor 实时 3D
+  // 门禁 / 组级安全指令（onBrakeHold）触发。
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (emergency_braking_ || !current_ || plan_start_.isZero() ||
+    if (!current_ || plan_start_.isZero() ||
         plan_start_ != activation || hold_requested_)
       return;
     emergency_pending_ = true;
@@ -1592,8 +1664,9 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
         emergency_peer_ttc_ = pair.ttc_s;
         break;
       }
+    planning_requested_ = true;
     replan_cv_.notify_all();
-    ROS_WARN("[%s] EMERGENCY detected (peer=%s, ttc=%.2fs); replan thread will handle",
+    ROS_WARN("[%s] EMERGENCY predicted (peer=%s, ttc=%.2fs); requesting immediate replan",
              uav_id_.c_str(), emergency_peer_id_.c_str(), emergency_peer_ttc_);
   }
 }
@@ -1601,10 +1674,10 @@ void EgoPlannerDriverNode::runSafetySupervisor(const ros::TimerEvent&)
 void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double yaw,
                                         const ros::Time& now)
 {
-  if (emergency_braking_ || !current_)
+  if (!current_)
   {
     arrival_since_.reset();
-    return;  // 制动期间不推进/不判到达（制动耗尽 → BRAKE_HOLD）
+    return;
   }
   if (!local_pose_ || !local_pose_stamp_ ||
       (now - *local_pose_stamp_).toSec() > pose_timeout_)
@@ -1623,6 +1696,13 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
   {
     if (!arrival_since_)
       arrival_since_ = now;
+    // 变更 A：安全事件（emergency_pending_）置位时完成转换让位，不清标志，
+    // 交 replan 线程处理（不掩盖安全事件）。replan 提交成功/普通 HOLD 会清标志。
+    if (emergency_pending_)
+    {
+      arrival_since_.reset();
+      return;
+    }
     if ((now - *arrival_since_).toSec() >= stable_s_)
     {
       steady_target_ = HoldTarget{waypoints_.back().position, yaw};
@@ -1630,6 +1710,8 @@ void EgoPlannerDriverNode::checkArrival(const Eigen::Vector3d& target, double ya
       arrival_since_.reset();
       plan_start_ = ros::Time(0);
       emergency_pending_ = false;
+      same_input_failure_count_ = 0;
+      last_failure_signature_valid_ = false;
       setState(kStateCompleted);
     }
     return;
@@ -1656,6 +1738,9 @@ void EgoPlannerDriverNode::processHoldLocked()
   hold_requested_ = false;
   const ros::Time now = nowFunc();
   captureHoldTargetLocked(now);
+  // 变更 C：普通 HOLD = 输入变化，retry 失败计数清零。
+  same_input_failure_count_ = 0;
+  last_failure_signature_valid_ = false;
 }
 
 void EgoPlannerDriverNode::collisionCheckTick(const ros::TimerEvent&)
@@ -1666,7 +1751,7 @@ void EgoPlannerDriverNode::collisionCheckTick(const ros::TimerEvent&)
 void EgoPlannerDriverNode::runCollisionCheckTick()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!current_ || plan_start_.isZero() || hold_requested_ || emergency_braking_)
+  if (!current_ || plan_start_.isZero() || hold_requested_)
     return;
   const ros::Time now = nowFunc();
   const double base = plan_start_.toSec();
@@ -1711,9 +1796,10 @@ void EgoPlannerDriverNode::commitYieldCandidate(const YieldCandidate& cand)
   current_.reset(new TimedTrajectory(cand.trajectory));
   plan_start_ = nowFunc();
   arrival_since_.reset();
-  plan_fail_since_ = ros::Time();  // 候选提交 = 软着陆恢复（退出失败计时）
+  plan_fail_since_ = ros::Time();  // 候选提交 = retry 恢复（退出失败态）
+  same_input_failure_count_ = 0;
+  last_failure_signature_valid_ = false;
   steady_target_.reset();
-  emergency_braking_ = false;
   setState(kStateExecuting);
   publishIntent(*current_, plan_start_,
                 swarm_uav_interfaces::UavTrajectoryIntent::PHASE_ACTIVE);
@@ -1967,9 +2053,14 @@ void EgoPlannerDriverNode::replanLoop()
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stop_ && replan_loop_enabled_)
   {
+    // 变更 C：retry 态（同输入失败计数中或 plan_fail_since_ 非零）用 0.6s
+    // replan_retry_period_s_，常态保持 replan_period_s_（1.0s）。
+    const double wait_period =
+        (same_input_failure_count_ > 0 || !plan_fail_since_.isZero())
+            ? replan_retry_period_s_
+            : replan_period_s_;
     const bool timed_out =
-        replan_cv_.wait_for(lock,
-                            std::chrono::duration<double>(replan_period_s_)) ==
+        replan_cv_.wait_for(lock, std::chrono::duration<double>(wait_period)) ==
         std::cv_status::timeout;
     if (stop_ || !replan_loop_enabled_)
       break;
@@ -1998,8 +2089,8 @@ void EgoPlannerDriverNode::replanLoop()
         continue;
       }
     }
-    // 事件置位或 1s 定时超时（timed_out）都执行一轮 replan。定时超时是软着陆
-    // 失败重试的固定节奏（保持悬停，每 1s 尝试恢复）。
+    // 事件置位或周期超时（timed_out）都执行一轮 replan。定时超时是 retry
+    // 失败重试的固定节奏（保持悬停/当前轨迹，常态 1s、失败态 0.6s 尝试恢复）。
     if (!timed_out && !planning_requested_ && !emergency_pending_)
       continue;
     lock.unlock();
@@ -2025,7 +2116,7 @@ void EgoPlannerDriverNode::replanLoop()
     }
     lock.lock();
     if (committed)
-      plan_fail_since_ = ros::Time();  // 成功提交（含 HOLD/制动/候选/资源收口）→ 退出软着陆
+      plan_fail_since_ = ros::Time();  // 成功提交（含 HOLD/候选/资源收口）→ 退出 retry 失败态
   }
 }
 
