@@ -1,545 +1,1130 @@
 # Offboard 新状态机设计（2026-09-02）
 
-本文定义 `swarm_uav_executor`、`ego_planner_driver` 与 `tcp_to_ros` 的职责边界、状态机动作和任务分配规则。本文严格区分 runtime 内部任务模型、TCP/ROS 任务协议和机载内部安全动作。当前 `tcp_to_ros` parser 支持的 Group A `command` 值包括 `MOVE_TO`、`FOLLOW_ROUTE`、`FAULT_EXIT`、`HOVER`、`HOLD`；上游 runtime 的 `hold-a-end` 计划实际使用普通命令 `HOVER`，不能把计划名称 `hold-a-end` 或普通 `HOVER` 与安全保持 `HOLD` 混为一谈。
-
-本文的关键边界是：多机 `MOVE_TO` 任务的执行对象分配和发布前冲突协调由 `tcp_to_ros` 完成；`ego_planner_driver` 只负责本机任务的连续执行、单层 nominal 轨迹更新和运行时安全收口。
+本文逐步整理 `swarm_uav_executor` 与 `ego_planner_driver` 的新状态机设计。任务名称与固定命令按《实物无人机上下层 TCP/IP 接口对接方案》区分：任务名称表示高层目的，可以任意命名；`MOVE_TO`、`FOLLOW_ROUTE`、`FAULT_EXIT`、`HOVER`、`HOLD` 等是固定的 `command` 字段。
 
 ---
 
-## 0. 适用范围与设计边界
+## 0. 尚待确认的反馈细节
 
-### 0.1 字段和命名约定
+以下反馈、状态动作和联动细节尚未最终确认，暂不作为已经实现的状态机事实：
 
-文档中出现的字段必须按所在层次解释，不能跨层替换：
+- 普通失败和 `EMERGENCY_HOLD` 是否使用不同的 `MotionResult` 语义
+  - 规划失败、跟随失败、超时、通信失败是否分别编码
+- `replanOnce()` 失败后的 `replanTimer` 重试策略
+  - 每隔约 1 秒允许重试
+  - 还是每条 `current_` 只尝试一次
+- `PI_EXECUTING` 的完成反馈边界
+  - leader 的 `SUCCESS` 如何发布和被 follower 识别
+  - follower 到达 `leader + offset` 后的悬停保持时长
 
-| 层次 | 本次任务/计划标识 | 单机身份字段 | 命令字段 | 说明 |
-|---|---|---|---|---|
-| runtime 内部 reviewed plan | `mission_id`、`plan_id` | `robot_id` | `command_type` | `plan_id` 是内部计划引用；`robot_id`/`command_type` 不直接等于 TCP/ROS 字段 |
-| TCP 整组协议 | `mission_id`、`command_id` | `assignments[].uav_id` | `command` | `command_id` 是本次整组命令实例的唯一标识 |
-| `ExecuteGroupTask` Action | `mission_id`、`command_id` | `TaskAssignment.uav_id` | `command` | Action 使用 `assignments` 数组，不使用 `robot_assignments` |
-| 单机 `UavTask` Service / `UavTaskState` | `mission_id`、`command_id` | `uav_id` + `exec_target` | `command` | Service 下发时二者都是执行层 UAVn；`UavTaskState` 也报告执行层 UAVn；GCS 再按活动任务映射还原为任务层 Axx |
-
-因此：外部 TCP/ROS 文档使用 `command` 和 `uav_id`；只有 runtime 内部 reviewed plan/`CommandEnvelope` 使用 `command_type` 和 `robot_id`。不能用 `command` 代替 `command_id` 去重，也不能用内部 `plan_id` 代替线上 `command_id`。当前 Group A 的 `hold-a-end` 是 runtime 内部计划名称，其线上 `command` 为 `HOVER`，不是 `HOLD`。
-
-安全保持还要再区分：普通任务 `HOVER` 完成后进入 `COMPLETED_HOLD`；本文内部 `HOLD` 表示安全保持请求并进入 `EMERGENCY_HOLD`；runtime abort fallback 的内部命令名 `SAFE_HOLD` 不作为 TCP/ROS 普通任务命令使用。
-
-### 0.2 文档阅读规则
-
-本文使用以下标记避免把设计目标误读为当前实现：
+已经确定的 EGO_EXECUTING 内部结构不再列为待确认事项：
 
 ```text
-源码事实
-  = 已存在的字段、状态、函数或当前控制流；使用现有名称。
-
-目标设计
-  = 本文要求后续实现的职责或事务；使用“目标逻辑名称”并明确它不是现有 API。
-
-迁移约束
-  = 当前实现与目标设计之间必须补上的适配、测试或状态映射。
+A. 轨迹执行分支：发布当前轨迹 setpoint，并提供 waypointTracker 所需的当前位姿和执行时间
+B. 轨迹更新分支：定时检查轨迹年龄，并消费统一的 REPLAN_REQUEST 执行 replanOnce()
+C. 条件触发分支：waypointsTracker、collisionChecker、emergencyDog
+请求优先级：BRAKE_REQUEST > COMPLETE_REQUEST > REPLAN_REQUEST
 ```
 
-### 0.3 本文解决的问题
+已经确定的安全动作边界是：
 
 ```text
-任务发布前：
-  tcp_to_ros 在当前 MOVE_TO 任务集合内选择 Axx -> UAVn 的执行分配，
-  验证该分配是否可行，并在无解时直接向上游返回任务失败。
-
-任务发布后：
-  ego_planner_driver 保证本机 setpoint 连续、轨迹更新串行、
-  过期规划结果不提交，并在实际安全条件失效时进入安全保持。
+emergencyDog 产生 BRAKE_REQUEST
+    → 请求仲裁器接受 brake
+    → 直接进入 EMERGENCY_HOLD
 ```
-
-状态机的实施价值不是在机载侧重新求解全局多机冲突，而是保证已发布任务能够以可控、可验证的方式执行。
-
-### 0.4 不属于机载状态机的职责
-
-`ego_planner_driver` 不负责：
-
-- 重新分配 Axx 与 UAVn；
-- 修改或恢复 `tcp_to_ros` 的运行时映射；
-- 通过 UAV 序号决定 STAND_ON/YIELD；
-- 在 nominal 规划失败后执行第二层 SLOW/LEFT/RIGHT 轨迹变形；
-- 保证每次 `replanOnce()` 都能产生新轨迹；
-- 用局部重规划替代任务发布前的全局冲突协调。
-
-### 0.5 当前设计与实现的关系
-
-以下内容是目标设计约束，不表示当前源码已经全部实现。特别是：
-
-- 当前 `tcp_to_ros` 的身份配置仍是静态基线；
-- 当前 `t_off` 实现的 `_schedule_applies()` 同时覆盖 `MOVE_TO` 和 `FAULT_EXIT`，这与本文“只有 `MOVE_TO` 进入新分配逻辑”的目标不同，后续实现必须显式收紧，不能把现状误写成已完成设计；
-- 当前 `ego_planner_driver` 仍存在第二层候选相关代码，目标设计不再使用该路径；
-- 第 6 章规定的运行时当前映射、MOVE_TO 分配和失败反馈需要后续在 `tcp_to_ros` 中实现。
 
 ---
+## 1. 系统分层
 
-## 1. 系统分层与身份边界
-
-### 1.1 总体职责
-
-```text
-runtime
-  │ 内部 reviewed plan 使用 plan_id、robot_assignments、robot_id、command_type
-  │ 对外发送整组 TCP command 时转换为 mission_id/command_id/command/assignments
-  ▼
-tcp_to_ros / GCS
-  │ 接收 TCP/ROS 层的 Axx 任务（assignments[].uav_id）
-  │ 维护当前运行时映射，仅对 command == MOVE_TO 做任务分配
-  │ 验证参与集合、路径冲突、状态和发布前预算
-  │ 将任务转换为对应 UAVn 的 executor 请求
-  ▼
-swarm_uav_executor
-  │ 按单机请求中的 uav_id + exec_target 接收、保存、启动和监控任务
-  │ 向 driver 提供 waypoints、leader/offset 或安全保持输入
-  ▼
-ego_planner_driver
-  │ 只执行本机已经分配的任务
-  │ 维护内部状态机、setpoint、nominal 轨迹和安全动作
-  ▼
-PX4
-  │ 接收 offboard setpoint 并执行飞行控制
-```
-
-### 1.2 两个身份命名空间
+### 1.1 总体职责关系
 
 ```text
-Axx / task_uav_id
-  = 任务层身份，由 runtime、TCP assignments[].uav_id 和 GCS GroupState 使用。
-  = `completed_uavs`、`failed_uavs` 等上游结果中的 ID。
-
-UAVn / exec_uav_id
-  = 执行层身份，由 executor 绑定的实际 UAV 执行对象使用。
-  = 下发 `UavTask` 时写入 `uav_id`，机载 `UavTaskState` 也报告该身份。
-
-exec_target
-  = 执行目标/路由字段，与执行层 UAVn 当前通常取相同字符串，
-    但它是独立字段，不能和 `uav_id` 在接口定义上合并。
+┌──────────────────────────────────────────────────────────────────────┐
+│                         tcp_to_ros / GCS                             │
+│                                                                      │
+│  · 接收批次任务、执行批次级 prepare、排程和任务协调                 │
+│  · 按 assignments 向各 UAV executor 发送单机任务请求                 │
+│  · 汇总各 UAV 的 ACCEPTED / START / SUCCESS / FAILURE 等反馈         │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ bridge 转发任务与状态话题/服务
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                      swarm_uav_executor                              │
+│                                                                      │
+│  任务接入与任务适配层                                                │
+│                                                                      │
+│  · 接收、校验、保存单机任务并返回 ACCEPTED，等待 GCS 后续发送 START  │
+│  · 按固定 command 整理 ego driver 所需信息并启动对应动作线程         │
+│  · 监控 ego driver 状态和本机运动结果，向 tcp_to_ros 反馈结果         │
+└───────────────┬──────────────────────────────┬───────────────────────┘
+                │ 提供不同任务信息             │ 接收 ego 状态/结果
+                ▼                              │
+┌──────────────────────────────────────────────────────────────────────┐
+│                       ego_planner_driver                             │
+│                                                                      │
+│  飞行控制与内部状态机层                                              │
+│                                                                      │
+│  · 接收 executor 提供的信息，并根据这些输入自行完成内部状态转换     │
+│    · INIT：初始化完成后等待 arm + OFFBOARD（一次性描述阶段）          │
+│    · TAKEOFF：arm + OFFBOARD 后执行起飞（一次性描述阶段）            │
+│    · EGO_EXECUTING：使用 ego 算法自主导航                            │
+│    · PI_EXECUTING：使用 PI 控制跟随 leader                            │
+│    · COMPLETED_HOLD：正常完成/悬停后的可退出保持                      │
+│    · EMERGENCY_HOLD：安全故障后的锁存保持                            │
+│  · 向 executor 提供任务执行所需的状态依据和运动结果                │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ setpoint / position / velocity control
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                              PX4                                     │
+│                                                                      │
+│  · 接收 offboard 控制 setpoint                                       │
+│  · 执行位置、速度或相关飞行控制                                      │
+│  · 遥控器切换 onboard 后可接管                                        │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-`tcp_to_ros` 是两套身份之间的唯一转换边界。executor 和 driver 不需要知道全局 Axx 分配过程，只处理收到的 UAVn 执行请求。
-
-### 1.3 配置映射与当前运行时映射
+### 1.2 核心边界
 
 ```text
-config map
-  = 配置文件提供的初始 Axx -> UAVn 基线。
+executor 不直接发送“切换 ego 状态”的专用命令
 
-current map
-  = tcp_to_ros 当前任务系统实际使用的运行时映射。
+executor 接收固定 command
+    │
+    ├─ 处理 command 内容
+    ├─ 发布 ego 所需信息
+    └─ 启动对应 driver 执行路径
+            │
+            ▼
+ego driver 根据收到的信息
+自行进行内部状态转换
 ```
 
-`current map`、`assignment snapshot` 和 `candidate version` 是本文目标设计中的概念名，不是当前源码已经存在的同名变量或类型。当前 backend 只有静态 `IdentityMap`、活动任务的 `GroupState.exec_by_uav` 和 Action goal 等隐式状态；后续实现必须明确把这些目标概念落到具体对象，并保持以下语义：当前 command 的执行快照不能被下一条 MOVE_TO 覆盖，MOVE_TO 分配失败不能部分更新运行时映射。当前 backend 还通过单活动任务限制拒绝并发 group command；在该限制取消前，“下一条 MOVE_TO 不覆盖正在执行快照”实际表现为新任务被拒绝，而不是两个 command 并存。
+“使 ego driver 进入某状态”表示：
 
-### 1.4 状态机骨架
+```text
+executor 提供足够且正确的输入
+    → ego driver 按自身状态机转换到预期状态
+```
+
+这不表示 executor 绕过 ego driver、直接写入或强制设置其内部状态。
+
+
+### 1.3 当前已确认的状态机骨架
 
 ```text
 程序启动
     │
     ▼
-INIT
-    │ arm + OFFBOARD
+INIT（一次性描述阶段：初始化并等待 arm + OFFBOARD）
+    │
+    │ 满足 arm + OFFBOARD
     ▼
-TAKEOFF
-    │ 达到起飞切换条件
+TAKEOFF（一次性描述阶段：内部起飞进度达到 takeoff_height - 0.1 m 后切换）
+    │
+    │ 立即切换
     ▼
 COMPLETED_HOLD
     │
-    ├─ MOVE_TO / FAULT_EXIT
-    │       └─ target_pose 或 waypoints → EGO_EXECUTING
+    ├─ MOVE_TO / FAULT_EXIT / FOLLOW_ROUTE（leader）
+    │       └─ executor 提供 waypoints
+    │               ▼
+    │         EGO_EXECUTING
     │
-    ├─ FOLLOW_ROUTE leader
-    │       └─ waypoints → EGO_EXECUTING
+    ├─ FOLLOW_ROUTE（follower）
+    │       └─ executor 提供 leader + offset
+    │               ▼
+    │         PI_EXECUTING
+    │
+    ├─ HOVER ───────────────────────────────────► COMPLETED_HOLD
+    │
+    └─ HOLD / 安全事件 ─────────────────────────► EMERGENCY_HOLD
+```
+
+`EGO_EXECUTING` 内部由三类动作分支共同维持：
+
+```text
+A. 轨迹执行分支
+   publish current trajectory setpoint
+   provide current pose and execution time to waypointTracker
+
+B. 轨迹更新分支
+   check latest trajectory age >= 1s
+   consume REPLAN_REQUEST and call replanOnce()
+
+C. 条件触发分支
+   waypointsTracker → REPLAN_REQUEST / COMPLETE_REQUEST
+   collisionChecker → REPLAN_REQUEST
+   emergencyDog → BRAKE_REQUEST
+
+请求优先级：BRAKE_REQUEST > COMPLETE_REQUEST > REPLAN_REQUEST
+```
+
+```text
+EMERGENCY_HOLD
+        │
+        ├─ 锁存
+        ├─ 不允许普通 command 或 START 退出
+        ├─ 不允许自动 replan 恢复普通执行
+        └─ 仅遥控器切换 onboard 后人工接管
+```
+
+该图是当前设计骨架；尚未确定的错误码细分、replan 失败重试策略和 PI_EXECUTING 完成反馈边界仍记录在第 0 章。
+
+---
+
+## 2. swarm_uav_executor 细节
+
+### 2.1 任务名称、固定 command 与 ACCEPTED/START
+
+```text
+上层任务名称
+    = 任意名称，表示高层目的
+    = 例如 prepare、coverage-segment-1、fault-exit、recovery、hold-end
+
+固定 command
+    = 协议规定的具体动作
+    = MOVE_TO、FOLLOW_ROUTE、FAULT_EXIT、HOVER、HOLD
+
+ACCEPTED
+    = executor 已校验并保存该 UAV 的单机任务，等待 START
+    = 不表示已经开始运动，也不表示 ego 已进入执行状态
+
+START
+    = GCS 要求 executor 启动已经 ACCEPTED 的单机任务
+```
+
+### 2.2 ACCEPTED/START 流程
+
+```text
+上层任务名称 + 固定 command + assignments
+        │
+        ▼
+tcp_to_ros 执行批次级协调/排程
+        │
+        │ 向各 UAV executor 发送单机任务请求
+        ▼
+executor 接收单机任务
+        │
+        ├─ 校验请求、command、uav_id 和任务参数
+        ├─ 检查 executor/driver 是否可用
+        ├─ 将请求转换为内部 goal
+        ├─ 保存任务记录
+        └─ 返回 ACCEPTED
+                │
+                ▼
+        任务已受理，但尚未开始运动
+                │
+                │ GCS 等待批次协调完成并按计划发送 START
+                ▼
+executor 收到 START
+        │
+        ├─ 查找对应 ACCEPTED 任务
+        ├─ 检查任务未启动且未终止
+        ├─ 启动本机动作线程
+        ├─ 向对应 driver 提供 command 对应的输入
+        └─ 返回 START accepted / started
+```
+
+START 的职责是启动已经 ACCEPTED 的单机任务，而不是重新解析或重新受理任务。
+
+### 2.3 批次任务与单机执行链路
+
+```text
+批次任务名称，例如 prepare
+        │
+        ▼
+tcp_to_ros 执行批次 prepare / 排程
+        │
+        ├─ 单机任务请求 ─► executor-1 ─► ACCEPTED
+        ├─ 单机任务请求 ─► executor-2 ─► ACCEPTED
+        └─ ...
+        │
+        ▼
+全部或规定参与者 ACCEPTED
+        │
+        ▼
+tcp_to_ros 按批次协调结果发送 START
+        │
+        ├─ executor-1 ─► 启动对应 command
+        ├─ executor-2 ─► 启动对应 command
+        └─ ...
+        │
+        ▼
+各 executor 向 ego driver 提供 command 对应的信息
+        │
+        ▼
+ego driver 自行进入预期状态
+```
+
+### 2.4 导航命令
+
+适用 command：
+
+```text
+MOVE_TO
+FAULT_EXIT
+FOLLOW_ROUTE（leader）
+以及其他“本机根据航点自主运动”的固定 command
+```
+
+```text
+ACCEPTED/START
+        │
+        ▼
+executor 读取 command 的航点参数
+        │
+        ├─ 生成 ego 可使用的 waypoints 序列
+        ├─ 执行必要的航点处理/密化
+        └─ 向 ego driver 发布 waypoints 等信息
+                │
+                ▼
+        ego driver 根据 waypoints 自行转换状态
+                │
+                ▼
+             EGO_EXECUTING
+                │
+                ▼
+        使用 ego 算法执行自主导航
+```
+
+示例：
+
+```text
+任务名称：prepare       command：MOVE_TO
+任务名称：fault-exit   command：FAULT_EXIT
+```
+
+二者的任务名称不同，但都可以通过航点输入使 ego driver 进入 `EGO_EXECUTING`。
+
+### 2.5 跟随命令
+
+适用 command：
+
+```text
+FOLLOW_ROUTE（follower）
+```
+
+```text
+ACCEPTED/START
+        │
+        ▼
+executor 读取 follower 参数
+        │
+        ├─ 提供 leader ID（UAVn）
+        ├─ 提供本机相对 leader 的 offset
+        └─ 向 ego driver 发布跟随所需信息
+                │
+                ▼
+        ego driver 根据 leader/offset 自行转换状态
+                │
+                ▼
+             PI_EXECUTING
+                │
+                ▼
+        使用 PI 控制跟随 leader
+```
+
+```text
+EGO_EXECUTING = 以 waypoints 为输入，使用 ego 算法自主导航
+PI_EXECUTING  = 以 leader ID 和 offset 为输入，使用 PI 控制跟随
+```
+
+### 2.6 悬停命令
+
+适用 command：
+
+```text
+HOVER
+```
+
+```text
+ACCEPTED/START
+        │
+        ▼
+executor 提供 HOVER 所需信息
+        │
+        ▼
+ego driver 执行悬停/保持动作
+        │
+        ▼
+      COMPLETED_HOLD
+```
+
+```text
+COMPLETED_HOLD
+      │
+      ├─ 允许新的 MOVE_TO / FAULT_EXIT command
+      ├─ 允许新的 FOLLOW_ROUTE command
+      ├─ 允许再次执行 HOVER command
+      └─ 收到安全 HOLD 或安全事件时转入 EMERGENCY_HOLD
+```
+
+### 2.7 安全命令
+
+适用 command：
+
+```text
+HOLD
+```
+
+```text
+收到 HOLD command 或确认的安全事件
+        │
+        ▼
+executor 提供安全保持所需信息
+        │
+        ▼
+ego driver 根据自身状态机转换
+        │
+        ▼
+      EMERGENCY_HOLD
+```
+
+```text
+COMPLETED_HOLD
+    = 正常完成/HOVER 后的保持状态
+    = 允许切换到其他普通状态
+
+EMERGENCY_HOLD
+    = 安全故障后的锁存保持状态
+    = 不允许普通 command、START 或自动 replan 退出
+    = 只能通过遥控器切换到 onboard 模式后人工接管
+```
+
+```text
+EMERGENCY_HOLD
+        │
+        ├─ 停止正常自主导航
+        ├─ 停止 PI 跟随
+        ├─ 保持当前安全位置/悬停
+        ├─ 拒绝普通 command 的自动启动
+        └─ 拒绝自动恢复到 EGO_EXECUTING 或 PI_EXECUTING
+
+        直到：遥控器切换 onboard → 人工接管
+```
+
+组级安全联动由 `tcp_to_ros` 负责：任一 UAV 的普通 `FAILURE` 由 `tcp_to_ros` 汇总为批次失败；任一 UAV 报告单机安全事件时，`tcp_to_ros` 立即向全组传播 `HOLD`，其他 UAV 收到组级 `HOLD` 后统一进入 `EMERGENCY_HOLD`。
+
+### 2.8 executor 监控和反馈
+
+```text
+ego driver 状态/运动结果
+        │
+        ▼
+executor 监控
+        │
+        ├─ 正常完成/COMPLETED_HOLD
+        │      └─ 向 tcp_to_ros 反馈 SUCCESS
+        │             （包括 MOVE_TO、FAULT_EXIT、FOLLOW_ROUTE 和 HOVER）
+        │
+        ├─ 普通执行失败
+        │      └─ 向 tcp_to_ros 反馈 FAILURE
+        │
+        └─ EMERGENCY_HOLD
+               └─ 反馈安全故障/FAILURE，记录锁存状态
+```
+
+本机运动结果可抽象为：
+
+```text
+MotionResult
+    = success / failure
+    + error_code
+    + message
+```
+
+反馈映射规则：
+
+- 对 runtime 要求的任务正常完成，ego 进入 `COMPLETED_HOLD` 后，executor 向 `tcp_to_ros` 反馈 `SUCCESS`。
+- 自动 TAKEOFF 完成并切换到 `COMPLETED_HOLD`，不单独向 `tcp_to_ros` 产生任务 `SUCCESS`；只有对应任务被执行并正常完成时，才反馈该任务的 `SUCCESS`。
+- `EMERGENCY_HOLD` 统一映射为带安全错误码的 `FAILURE`。
+- executor 只报告任务结果，不向 `tcp_to_ros` 持续转发 ego 当前状态。
+
+TCP 接口的线上状态仍使用协议规定的 `ACCEPTED`、`COMPLETED`、`FAILED`；executor 向 `tcp_to_ros` 提供 `SUCCESS`、`FAILURE` 等内部任务结果，`tcp_to_ros` 汇总各 UAV 结果后，按《实物无人机上下层 TCP/IP 接口对接方案》第 4 节向 runtime 返回整组结果。
+
+反馈时机沿用事件驱动语义：executor 在任务受理、启动、状态变化和终态时发布反馈；终态按配置进行有限次数重复发布，不按固定周期持续转发任务状态或 ego 当前状态。
+
+`detail_stage` 继续作为 executor 的任务状态反馈阶段字段，用于补充 `status`、`error_code` 和 `message`，不作为 ego 状态反馈，也不映射 `INIT`、`TAKEOFF`、`EGO_EXECUTING`、`PI_EXECUTING`、`COMPLETED_HOLD` 或 `EMERGENCY_HOLD`。当前任务阶段值的生成规则保持不变。
+
+---
+
+---
+
+## 3. ego_planner_driver 状态机详细描述
+
+### 3.1 状态机总图
+
+```text
+程序启动
+    │
+    ▼
+  INIT  （一次性描述阶段：初始化并等待 arm + OFFBOARD）
+    │
+    │ arm + OFFBOARD
+    ▼
+ TAKEOFF（一次性描述阶段：内部起飞进度达到 takeoff_height - 0.1 m 后切换）
+    │
+    │ 立即切换
+    ▼
+COMPLETED_HOLD
+    │
+    ├─ MOVE_TO / FAULT_EXIT / FOLLOW_ROUTE leader
+    │       └─ executor 提供 waypoints
+    │               ▼
+    │         EGO_EXECUTING
+    │               ├─ 到达 end_pt ─────────────► COMPLETED_HOLD
+    │               ├─ pose 距离门禁触发 ───────► EMERGENCY_HOLD
+    │               └─ 其他情况 ────────────────► 保持本状态
     │
     ├─ FOLLOW_ROUTE follower
-    │       └─ leader_id + formation_offset → PI_EXECUTING
+    │       └─ executor 提供 leader ID + offset
+    │               ▼
+    │         PI_EXECUTING
+    │               ├─ leader SUCCESS
+    │               │   + 到达 leader + offset
+    │               │   + 悬停达到规定时间 ─────► COMPLETED_HOLD
+    │               └─ 其他情况 ────────────────► 保持本状态
     │
-    ├─ HOVER ───────────────────────► COMPLETED_HOLD
+    ├─ HOVER ───────────────────────────────────► COMPLETED_HOLD
     │
-    └─ HOLD / 安全事件 ─────────────► EMERGENCY_HOLD
+    └─ HOLD / 安全事件 ─────────────────────────► EMERGENCY_HOLD
+                                                     │
+                                                     ├─ 锁存保持
+                                                     ├─ 禁止普通自动退出
+                                                     └─ onboard 人工接管
 ```
 
----
+本图先给出 ego 状态机的总体结构，后续小节分别说明各状态的进入条件、状态内动作和退出条件。
 
-## 2. executor 任务接入与反馈
-
-### 2.1 统一任务流程
-
-所有普通单机 command 使用同一基本生命周期：
+### 3.2 状态范围和描述性阶段
 
 ```text
-runtime 任务计划
-    → tcp_to_ros 批次校验与（仅 MOVE_TO 的目标）任务分配
-    → executor 接收单机 `UavTask` 请求并校验执行层 `uav_id`/`exec_target`
-    → executor 保存任务，返回 ACCEPTED
-    → tcp_to_ros 通过 `UavTaskControl.operation = START` 启动已接受任务
-    → executor 启动对应动作线程
-    → executor 向 driver 提供 command 输入
-    → driver 自行完成内部状态转换
-    → executor 汇总运动结果
-    → tcp_to_ros 汇总批次结果并反馈 runtime
-```
+INIT 和 TAKEOFF 是为了描述启动过程而使用的阶段名称。
+它们是一次性的启动过程，不是任务执行期间反复进入的正式长期运行状态。
 
-`ACCEPTED` 表示任务已校验和保存，不表示已经开始运动；`START` 只启动已接受的任务，不重新分配任务，也不重新解析另一份映射。
-
-### 2.2 command 与 driver 输入
-
-| command | executor 提供的主要输入 | driver 状态/动作 | 映射规则 |
-|---|---|---|---|
-| `MOVE_TO` | 单个 `target_pose`（当前协议语义）；executor 可在内部转换为单点目标或兼容的 waypoints | `EGO_EXECUTING` | 允许按第 6 章尝试更新 `current map` |
-| `FAULT_EXIT` | 每架任务独立的 `target_pose` 或 `waypoints` | `EGO_EXECUTING` | 沿用当前运行时映射，不进入新的 MOVE_TO 分配 |
-| `FOLLOW_ROUTE` leader | `waypoints` | `EGO_EXECUTING` | 沿用当前运行时映射 |
-| `FOLLOW_ROUTE` follower | `leader_id`、`formation_follow`、`formation_offset` | `PI_EXECUTING` | 沿用当前运行时映射和编队关系 |
-| `HOVER` | 仅参与 UAV 的 `uav_id`；不携带目标坐标 | `COMPLETED_HOLD` | 沿用当前运行时映射 |
-| `HOLD` | 仅参与 UAV 的 `uav_id`；安全保持输入 | `EMERGENCY_HOLD` | 沿用当前运行时映射 |
-
-任务集合外的 UAV 不因当前 `MOVE_TO` 分配而被改写。例如本批只允许 `A01–A12` 与 `UAV1–UAV12` 参与时，`A13–A15` 与 `UAV13–UAV15` 保持原有当前映射。
-
-### 2.3 executor 与 driver 的边界
-
-```text
-executor 接收单机 `UavTask`
-    ├─ 校验任务、command 和执行层 `uav_id`/`exec_target`
-    ├─ 保存当前 command 的执行快照
-    ├─ 接收 `UavTaskControl` 的 `START`/`ABORT`
-    ├─ 启动或终止对应动作
-    └─ 提供 driver 所需输入
-
-executor 不直接写入 driver 的内部状态。
-
-driver 根据收到的有效输入自行转换：
-    → target_pose/waypoints → EGO_EXECUTING
-    → leader_id + formation_follow/formation_offset → PI_EXECUTING
-    HOVER                 → COMPLETED_HOLD
-    HOLD/SAFE_HOLD/安全事件 → EMERGENCY_HOLD
-```
-
-### 2.4 反馈分层
-
-```text
-ego_planner_driver
-    → executor 内部运动结果
-    → UavTaskState：ACCEPTED / COMPLETED / FAILED
-    → tcp_to_ros Action 与 GroupTaskState
-    → TCP runtime：ACCEPTED / COMPLETED / FAILED
-```
-
-`detail_stage`、`error_code` 和 `message` 用于补充诊断，不直接等同于 driver 内部的 `INIT`、`TAKEOFF`、`EGO_EXECUTING`、`PI_EXECUTING`、`COMPLETED_HOLD` 或 `EMERGENCY_HOLD`。
-
-字段的身份语义随接口变化：TCP/Action goal 的 `assignments[].uav_id` 和 backend `GroupState.uav_ids` 是任务层 Axx；下发到 `UavTask` 的 `uav_id`、`exec_target` 以及机载 `UavTaskState.uav_id` 是执行层 UAVn；GCS 在吸收机载状态时通过活动任务的映射还原为 Axx。机载状态按每个任务层 Axx 的 `status_seq` 去重；TCP final-response cache 当前实际按 `command_id` 去重，不应把两种去重机制写成同一个键。
-
-`UavTaskState.status` 的主状态使用 `ACCEPTED`、`COMPLETED`、`FAILED`；runtime 内部可能使用 `SUCCESS`/`FAILURE`，由 GCS/TCP 边界归一化为线上 `COMPLETED`/`FAILED`。Action 取消路径还可能返回 `CANCELLED`，不得把所有 Action `final_status` 简化成只有三态。`GroupTaskState` 只有 `mission_id`、`command_id`、`command`、状态集合和 `detail`，没有 `exec_target`、`status_seq` 或独立 `error_code`。
-
----
-
-## 3. ego_planner_driver 状态机
-
-本章使用两套名称：源码事实使用当前 C++/executor 状态名；目标设计使用逻辑状态名。目标设计名不是现有 ROS `/exec_state` 的枚举值，实施时需要显式建立映射，不能直接假定源码已有同名状态。
-
-| 目标逻辑名称 | 当前源码对应 | 说明 |
-|---|---|---|
-| `INIT` | `IDLE`/启动前置逻辑 | 当前 driver 没有 `INIT` 状态常量；这里仅表示初始化和等待起飞条件 |
-| `TAKEOFF` | `TAKEOFF` | 当前源码已有起飞状态 |
-| `EGO_EXECUTING` | `EXECUTING` | 目标设计名称；当前普通 waypoint/目标执行发布 `EXECUTING` |
-| `PI_EXECUTING` | follower loop | 当前 follower 由 `FOLLOW_ROUTE + formation_follow` 选择，不发布同名 `/exec_state` |
-| `COMPLETED_HOLD` | `COMPLETED` 后的 `HOLD` | 当前完成终态和保持动作是两个状态/动作，不存在同名状态 |
-| `EMERGENCY_HOLD` | `EMERGENCY_BRAKE` → `BRAKE_HOLD` | 当前先执行制动轨迹，再进入锁存保持；目标名称是统一逻辑抽象 |
-| 规划失败/超时 | `EGO_PLAN_FAILED`、`EGO_EXEC_TIMEOUT` | 当前已有的失败终态，目标设计不能遗漏 |
-
-后续状态图描述目标逻辑行为；涉及当前源码字段时，使用上表中的实际名称。`PlanResult::SUCCESS` 只表示 planner 内部计算结果，不等同于 driver `COMPLETED`、executor `COMPLETED` 或 TCP `COMPLETED`。
-
-### 3.1 目标状态范围与源码映射
-
-```text
-目标逻辑阶段：
-  INIT
-  TAKEOFF
+正式运行状态：
   EGO_EXECUTING
   PI_EXECUTING
   COMPLETED_HOLD
   EMERGENCY_HOLD
-
-当前源码还包含：
-  IDLE
-  EXECUTING
-  COMPLETED
-  HOLD
-  EGO_PLAN_FAILED
-  EGO_EXEC_TIMEOUT
-  EMERGENCY_BRAKE
-  BRAKE_HOLD
 ```
 
-任务发布前的 assignment 由 `tcp_to_ros` 冻结；driver 状态机不修改 Axx/UAVn 分配。`current map` 和 `assignment snapshot` 仍是第 6 章规定的目标设计对象，不是当前 driver 或 backend 已有字段。
-
-### 3.2 目标状态转换
+### 3.3 INIT 阶段
 
 ```text
-INIT（当前实现对应 IDLE/启动前置逻辑）
-  → arm + OFFBOARD
-TAKEOFF
-  → 达到起飞切换条件
-COMPLETED_HOLD（当前实现对应 COMPLETED 后的 HOLD）
-  → MOVE_TO/FAULT_EXIT/FOLLOW_ROUTE leader：EGO_EXECUTING
-  → FOLLOW_ROUTE follower：PI_EXECUTING
-  → HOVER：保持 COMPLETED_HOLD
-  → 安全 HOLD：EMERGENCY_HOLD
-EGO_EXECUTING（当前实现对应 EXECUTING）
-  → end_pt 到达且稳定：COMPLETED_HOLD
-  → BRAKE_REQUEST：EMERGENCY_HOLD
-PI_EXECUTING（当前实现为 follower loop）
-  → leader 完成、本机到达 offset 且保持满足条件：COMPLETED_HOLD
-  → 安全事件：EMERGENCY_HOLD
+ego_planner_driver 程序启动
+        │
+        ▼
+完成程序初始化
+        │
+        ▼
+             INIT
+        │
+        ├─ 初始化 ego planner、executor 接口和内部数据
+        ├─ 准备接收 executor 提供的任务信息
+        ├─ 监测 PX4 状态
+        └─ 等待 arm + OFFBOARD
+                │
+                │ 满足 arm + OFFBOARD
+                ▼
+             TAKEOFF
 ```
 
-实际实现迁移时，必须同时定义目标逻辑状态与当前 `/exec_state`、executor `UavTaskState.status` 的映射，不得把目标名称直接写入现有协议而不更新接口。
+`INIT` 只用于表示“程序已经初始化，但尚未满足起飞前条件”的阶段。它不表示已经开始执行某个任务。
 
-### 3.3 COMPLETED_HOLD（目标逻辑状态）
+### 3.4 TAKEOFF 阶段
+
+```text
+TAKEOFF
+   │
+   ├─ 通过内部起飞进度计算目标高度
+   └─ 判断是否达到 takeoff_height - 0.1 m
+             │
+             │ 达到切换条件
+             ▼
+      COMPLETED_HOLD
+```
+
+`TAKEOFF` 的规则是：arm + OFFBOARD 后进入 `TAKEOFF`；通过内部起飞进度计算目标高度；到达 `takeoff_height - 0.1 m` 后立即切换到 `COMPLETED_HOLD`；锁存当前位置和 yaw，开始持续发布保持 setpoint。
+
+### 3.5 COMPLETED_HOLD 状态
+
+```text
+                         COMPLETED_HOLD
+                                │
+       ┌────────────────────────┼────────────────────────┐
+       │                        │                        │
+       │ 收到自主导航 command    │ 收到跟随 command        │ 收到 HOVER command
+       ▼                        ▼                        ▼
+  提供/接收 waypoints       提供 leader + offset       执行悬停保持
+       │                        │                        │
+       ▼                        ▼                        ▼
+ EGO_EXECUTING             PI_EXECUTING            COMPLETED_HOLD
+
+                         收到安全 command / 安全事件
+                                      │
+                                      ▼
+                              EMERGENCY_HOLD
+```
+
+`COMPLETED_HOLD` 相当于当前代码中的 `HOLD` 状态，核心动作保持不变：
 
 ```text
 COMPLETED_HOLD
-    ├─ 锁定当前位置和 yaw 的保持 setpoint
-    ├─ 持续发布保持控制
-    ├─ 等待新的 command
-    └─ 收到安全事件后进入 EMERGENCY_HOLD
+        │
+        ├─ 锁定当前位置/当前 yaw 的 setpoint
+        ├─ 持续发布保持悬停所需控制
+        ├─ 等待新的 command 或安全事件
+        └─ 允许切换到其他合法状态
 ```
 
-该状态允许后续普通任务进入，但任务的执行身份来自 `tcp_to_ros` 当前运行时映射，不重新恢复 config map。
+### 3.6 EGO_EXECUTING 状态
 
-### 3.4 EGO_EXECUTING（目标逻辑状态）
-
-`EGO_EXECUTING` 的跨层输入必须按 command 区分：
+适用 command：
 
 ```text
 MOVE_TO
-    → TCP/Action assignment.target_pose
-    → executor/driver 可转换为本机内部目标或 waypoints_
-
-FAULT_EXIT / FOLLOW_ROUTE leader
-    → waypoints
-
-FOLLOW_ROUTE follower
-    → 顶层 leader_id + assignment.formation_follow/formation_offset
-    → 不依赖 leader/follower 的 waypoints 混用
+FAULT_EXIT
+FOLLOW_ROUTE（leader）
+以及其他由本机根据 waypoints 自主执行的 command
 ```
 
-其中 `waypoints` 是 TCP/ROS/executor 的接口字段；`keypoint` 是本文对 driver 内部航点推进语义的称呼；C++ 实际存储仍是 `waypoints_` 和 `waypoint_consumed_`。`end_pt` 仅是 planner/driver 内部对最终目标的简称，实际通常来自 `target_pose` 或 `waypoints_.back()`，不是 ROS/TCP 字段。
+状态内主流程：
 
-状态内只负责：
+```text
+EGO_EXECUTING
+        │
+        ├─ 接收 executor 提供的 waypoints 序列
+        ├─ 以 ego 算法生成、执行和必要时更新轨迹
+        ├─ 持续发布自主导航 setpoint
+        ├─ 处理 waypoint 推进和 end_pt 到达判断
+        └─ 直接比较本机 pose 与邻机 pose，执行距离门禁
+```
 
-- 维持当前轨迹或首次规划前的 HOLD setpoint；
-- 推进未完成 waypoint 和判断最终目标到达；
-- 通过单一轨迹更新执行器调用 `replanOnce()`；
-- 检查本机轨迹、邻机状态和实际安全距离；
-- 在完成、规划失败或安全条件失效时执行规定的动作。
+状态转换：
 
-`EGO_EXECUTING` 不负责全局任务分配和第二层主动避让。
+```text
+EGO_EXECUTING
+        │
+        ├─ waypoints 序列完成，且到达 end_pt
+        │  （当前 waypoint 推进使用 `reach_thresh_m`；最终 `end_pt` 使用
+        │   `arrival_reach_thresh_m`，并连续满足 `arrival_stable_s`）
+        │       ▼
+        │   COMPLETED_HOLD
+        │
+        ├─ 直接 pose 距离门禁触发
+        │  （仅对 fresh 邻机 pose 进行直接中心距离比较；距离小于
+        │   `min_center_distance_m` 时触发，不使用 TTC 或未来轨迹预测）
+        │       ▼
+        │   EMERGENCY_HOLD
+        │
+        └─ 其他情况
+                └─ 保持 EGO_EXECUTING
+```
 
-### 3.5 PI_EXECUTING（目标逻辑状态）
+这里的距离门禁是当前设计中明确的安全切换条件：
+
+```text
+本机 pose + 邻机 pose
+        │
+        ▼
+直接计算当前中心距离
+        │
+        ├─ 未触发门禁 → 继续 EGO_EXECUTING
+        └─ 触发门禁   → 转入 EMERGENCY_HOLD
+```
+
+waypointsTracker 使用 `reach_thresh_m` 推进 waypoint 序列；最终 `end_pt` 使用 `arrival_reach_thresh_m` 判定到达，并连续满足 `arrival_stable_s` 后产生 `COMPLETE_REQUEST`，由请求仲裁器进入 `COMPLETED_HOLD`。直接 pose 距离门禁仅对 fresh 邻机 pose 进行直接中心距离比较，距离小于 `min_center_distance_m` 时直接进入 `EMERGENCY_HOLD`。具体动作分支见第 4 章。
+
+### 3.7 PI_EXECUTING 状态
+
+适用 command：
+
+```text
+FOLLOW_ROUTE（follower）
+```
+
+状态内主流程：
 
 ```text
 PI_EXECUTING
-    ├─ 读取执行层 leader UAVn 的运动/完成信息
-    ├─ 计算 leader + offset 跟随目标
-    ├─ 发布 PI 控制 setpoint
-    └─ leader 完成且本机达到 offset 后进入 COMPLETED_HOLD
+        │
+        ├─ 接收 executor 提供的 leader ID
+        ├─ 接收本机相对 leader 的 offset
+        ├─ 读取 leader 的运动状态/完成状态
+        ├─ 计算 leader + offset 的跟随目标
+        └─ 使用 PI 控制跟随并发布控制 setpoint
 ```
 
-跨层字段必须区分：TCP/Action 的 `leader_id` 仍是任务层 Axx；GCS 下发 `UavTask` 前将其转换为执行层 leader UAVn；`formation_follow` 和 `formation_offset` 位于 assignment。当前 driver/executor 用 follower loop 表达这一行为，不发布 `PI_EXECUTING` 这个状态字符串。
-
-leader/follower 关系属于当前任务的执行快照，不因新的 MOVE_TO 分配而在执行中改变。
-
-### 3.6 EMERGENCY_HOLD（目标逻辑状态）
-
-目标逻辑上的安全收口为：
+状态转换：
 
 ```text
-BRAKE_REQUEST
-    → EMERGENCY_HOLD
+PI_EXECUTING
+        │
+        ├─ leader 发布 SUCCESS
+        │       │
+        │       ├─ 本机尚未到达 leader + offset
+        │       │       └─ 保持 PI_EXECUTING，继续跟随/收敛
+        │       │
+        │       └─ 本机到达 leader + offset
+        │               │
+        │               └─ 悬停保持达到规定时间
+        │                       ▼
+        │                 COMPLETED_HOLD
+        │
+        └─ 其他情况
+                └─ 保持 PI_EXECUTING
 ```
 
-当前 C++ driver 的实际路径是：
+leader 成功通知、follower 到达判定和悬停持续时间的精确定义记录在第 0 章，后续补充。
+
+### 3.8 EMERGENCY_HOLD 状态
+
+适用进入来源：
 
 ```text
-emergency_pending_ / 安全条件
-    → EMERGENCY_BRAKE
-    → 制动轨迹耗尽
-    → BRAKE_HOLD
+HOLD command
+EGO_EXECUTING 触发直接 pose 距离门禁
+其他已确认的安全事件
 ```
 
-因此 `EMERGENCY_HOLD` 不是当前 `/exec_state` 的字面量。后续实现若保留该目标名称，必须将它映射到 `EMERGENCY_BRAKE` 与 `BRAKE_HOLD` 的完整过程，而不能在进入 `EMERGENCY_BRAKE` 时直接宣称已经进入最终保持状态。
-
-最终保持阶段的目标行为为：
+当前设计目标：
 
 ```text
-BRAKE_HOLD / EMERGENCY_HOLD
-    ├─ 锁存安全位置或悬停 setpoint
-    ├─ 停止正常 EGO 自主导航和 PI 跟随
-    ├─ 拒绝普通 command、START 和自动 replan 退出
-    └─ 等待遥控器切换 onboard 后人工接管
+EMERGENCY_HOLD
+        │
+        ├─ 锁定当前安全位置/悬停 setpoint
+        ├─ 停止正常 EGO 自主导航
+        ├─ 停止 PI 跟随
+        ├─ 不再允许普通 command 使其自动恢复
+        ├─ 不再允许 START 或自动 replan 退出
+        └─ 等待遥控器切换到 onboard 模式后人工接管
 ```
 
-组级安全联动仍由 `tcp_to_ros` 按现有规则处理。
+`EMERGENCY_HOLD` 的进入规则已经确定：`BRAKE_REQUEST` 经请求仲裁器接受后，直接锁定当前安全位置并进入 `EMERGENCY_HOLD`，不再先执行 EMERGENCY 制动轨迹。进入后停止正常自主导航、PI 跟随和正常 `trajectory_intent` 发布；不允许普通 command、START 或自动 replan 退出，只能等待遥控器切换到 onboard 模式后人工接管。
 
----
+任一 UAV 报告单机安全事件后，由 `tcp_to_ros` 立即向全组传播 `HOLD`；其他 UAV 收到组级 `HOLD` 后统一进入 `EMERGENCY_HOLD`。
 
-## 4. EGO_EXECUTING 内部动作分支
+## 4. EGO_EXECUTING 状态内部动作分支
 
-`EGO_EXECUTING` 由三个职责分支共同维持：
+`EGO_EXECUTING` 不是由一个串行死循环独占完成，而是由三类并行动作分支共同维持：
 
 ```text
                          EGO_EXECUTING
                                 │
           ┌─────────────────────┼─────────────────────┐
+          │                     │                     │
           ▼                     ▼                     ▼
- A. 轨迹执行分支       B. 请求仲裁/轨迹更新       C. 条件触发分支
- publish setpoint      合并请求并执行一次更新      只检测并产生请求
+   A. 轨迹执行分支        B. 轨迹更新分支        C. 条件触发分支
+   publishSetpoint()       request arbiter        条件检测器
+          │                     │                     │
+          │                     │                     ├─ replanTimer
+          │                     │                     ├─ waypointsTracker
+          │                     │                     ├─ collisionChecker
+          │                     │                     └─ emergencyDog
+          │                     │
+          │                     └─ 按优先级消费请求
+          │                           brake > complete > replan
+          │
+          └─ 持续向 PX4 发布当前轨迹 setpoint
 ```
+
+三类分支的职责边界是：
+
+```text
+A：执行已经提交的 current trajectory
+B：统一消费请求并执行轨迹更新
+C：只检测条件并产生动作请求
+```
+
+C 分支不直接提交新轨迹；B 分支不区分普通 `REPLAN_REQUEST` 的具体来源。
 
 ### 4.1 A. 轨迹执行分支
 
 ```text
 publishSetpoint() 周期运行
-    ├─ current_ 存在
-    │    ├─ 按执行时间采样轨迹
-    │    ├─ 发布 PX4 setpoint
-    │    └─ 提供 tracker 所需位姿和执行时间
-    └─ current_ 不存在
-         └─ 持续发布进入 EGO_EXECUTING 前锁存的 HOLD setpoint
+        │
+        ├─ current_ 存在
+        │      ├─ 根据执行时间采样位置、速度、加速度和 yaw
+        │      ├─ 发布当前轨迹 setpoint 给 PX4
+        │      └─ 提供 waypointTracker 所需的当前位姿和执行时间
+        │
+        └─ current_ 不存在
+               └─ 继续发布进入 EGO_EXECUTING 前锁存的 HOLD setpoint
+                   直到首条轨迹成功提交或状态退出
 ```
 
-A 分支只保证 setpoint 连续，不产生请求、不仲裁请求，也不直接提交新轨迹。
-
-### 4.2 B. 请求仲裁与轨迹更新分支
+A 分支只维持安全、连续的 setpoint 输出：已有轨迹时执行 `current_`；首次规划尚未完成时保持原悬停目标。它不负责产生规划请求、提交新轨迹或决定普通 replan、complete、brake。
 
 ```text
-replanTimer ─────────────► REPLAN_REQUEST ─┐
-waypointsTracker ────────► REPLAN_REQUEST  ├─► 请求仲裁器
-waypointsTracker ────────► COMPLETE_REQUEST│
-collisionChecker ────────► REPLAN_REQUEST  │
-safety supervisor ────────► BRAKE_REQUEST ──┘
-
-请求仲裁：BRAKE > COMPLETE > REPLAN
-    BRAKE    → EMERGENCY_HOLD
-    COMPLETE → COMPLETED_HOLD
-    REPLAN   → REPLAN 合并槽 → 单次 replanOnce(snapshot)
+A. 轨迹执行分支
+    = publish current trajectory setpoint
+    = provide current pose and execution time
+    = keep the current execution loop alive
 ```
 
-`BRAKE` 和 `COMPLETE` 不调用 `replanOnce()`。只有获准的 `REPLAN_REQUEST` 才进入第 5 章定义的轨迹更新执行器。
+### 4.2 B. 轨迹更新与请求仲裁分支
 
-`collisionChecker`、`REPLAN_REQUEST`、`COMPLETE_REQUEST`、`BRAKE_REQUEST` 和“单一轨迹更新执行器”是本文的目标逻辑名称，不是当前源码中同名的类、枚举或消息。当前实现中较接近的入口分别是 `collisionCheckTick()`/安全 supervisor、`planning_requested_`、到达检查、`emergency_pending_` 和 `replanLoop()`。后续实现可以沿用这些目标职责，但必须在代码中明确对应关系，不能把本文名称当成已经存在的 API。
+B 分支接收 C 分支产生的动作请求并执行统一仲裁。请求仲裁器属于 B 分支，位于 `replanOnce()` 上游；完整优先级和状态转换见第 4.4 节。
+
+```text
+replanTimer ──────────► REPLAN_REQUEST ─┐
+waypointsTracker ─────► REPLAN_REQUEST  ├─► B 分支收集/合并请求
+waypointsTracker ─────► COMPLETE_REQUEST│          │
+collisionChecker ─────► REPLAN_REQUEST  │          ▼
+emergencyDog ─────────► BRAKE_REQUEST ──┘       请求仲裁
+                                                   │
+                                                   └─ REPLAN
+                                                        │
+                                                        ▼
+                                                   replanOnce()
+                                                        │
+                                                        └─ 处理轨迹更新结果
+                                                           保持 EGO_EXECUTING
+```
+
+B 分支不根据普通 `REPLAN_REQUEST` 的来源选择不同规划算法。C 分支不直接调用 `replanOnce()`；`replanOnce()` 也不负责请求优先级仲裁。
 
 ### 4.3 C. 条件触发分支
 
-C 分支只产生请求，不修改 `current_`，不直接提交轨迹。
+C 分支只产生请求，不直接修改 `current_` 或提交新轨迹。
 
 #### 4.3.1 replanTimer
 
+`replanTimer` 属于 C 分支，因为它负责检查触发条件，而不是执行重规划。
+
 ```text
-current_ 不存在
-    → 产生 REPLAN_REQUEST
-    → 用于建立首条轨迹
-
-current_ 存在且 trajectory_age >= 1s
-    → 产生 REPLAN_REQUEST
-    → 用于更新执行中轨迹
-
-pending 或 replan_running
-    → 抑制重复请求
+replanTimer 周期检查
+        │
+        ├─ 已有 REPLAN_REQUEST 待仲裁
+        │  或 replanOnce() 正在运行
+        │      └─ 不重复产生请求
+        │
+        ├─ current_ 不存在
+        │      └─ 产生 REPLAN_REQUEST
+        │          用于进入 EGO_EXECUTING 后建立首条轨迹
+        │
+        └─ current_ 存在
+               │
+               ├─ trajectory_age < 1s
+               │      └─ 不产生请求
+               │
+               └─ trajectory_age >= 1s
+                      └─ 产生 REPLAN_REQUEST
+                          用于更新执行中的轨迹
 ```
 
-首次轨迹和执行中更新共用同一个 `replanOnce()` 输入/输出契约。首条轨迹成功提交前，A 分支继续发布锁存 HOLD setpoint。
+`replanTimer` 统一触发首次规划和按轨迹年龄更新：
+
+```text
+current_ 不存在
+    → 请求建立首条轨迹
+
+current_ 存在且年龄达到 1s
+    → 请求更新现有轨迹
+```
+
+首次规划不增加独立状态或独立规划入口。进入 `EGO_EXECUTING` 后，A 分支先继续发布原锁存 HOLD setpoint；`replanTimer` 产生普通 `REPLAN_REQUEST`，由 B 分支仲裁后调用同一个 `replanOnce()`。请求待仲裁或规划运行期间抑制同类重复请求。
+
+`replanOnce()` 失败后的再次请求间隔和结果处理仍由第 5 章讨论。
 
 #### 4.3.2 waypointsTracker
 
 ```text
-当前 waypoint 到达
-    → 推进执行索引
-    → REPLAN_REQUEST
-
-最终 end_pt 到达且满足稳定条件
-    → COMPLETE_REQUEST
+waypointsTracker
+        │
+        ├─ 当前 waypoint 已到达
+        │      ├─ 推进 waypoint 序列
+        │      └─ 产生 REPLAN_REQUEST
+        │
+        ├─ 最终 end_pt 已到达且满足稳定条件
+        │      └─ 产生 COMPLETE_REQUEST
+        │
+        └─ 其他情况
+               └─ 不产生请求
 ```
 
-辅助前视目标的计算不等于 waypoint 已消费；只有真实 odometry 满足到达阈值才推进执行索引。
+waypointsTracker 不直接提交轨迹，也不直接设置最终状态，而是把结果交给请求仲裁器。
 
 #### 4.3.3 collisionChecker
 
+collisionChecker 在收到新的邻机 `trajectory_intent` 并完成合法性校验后立即检查：
+
 ```text
-收到合法的新邻机 trajectory_intent 或有效规划输入变化
-    ├─ 当前轨迹仍满足安全约束
-    │    └─ 不产生请求或按需要产生 REPLAN_REQUEST
-    └─ 预测/实际安全边界即将违反或已经违反
-         └─ BRAKE_REQUEST
+收到新的邻机 trajectory_intent
+        │
+        ▼
+完成身份、协议、时间、版本和轨迹数据校验
+        │
+        ▼
+使用：本机当前轨迹 vs 新收到的邻机 intent
+        │
+        ├─ 未发现碰撞
+        │      └─ 不产生请求
+        │
+        └─ 发现预测碰撞
+               └─ 产生 REPLAN_REQUEST
 ```
 
-`collisionChecker` 不再负责选择 STAND_ON/YIELD，也不触发机载第二层主动避让。发布前的主要多机冲突由第 6 章的 `tcp_to_ros` 任务分配处理；运行时检查只负责发现新的有效输入和安全失效。
-
-#### 4.3.4 Safety supervisor
+collisionChecker 的边界：
 
 ```text
-读取本机和邻机 fresh pose
-    → 直接检查当前中心距离
-    → 触发紧急距离门禁时产生 BRAKE_REQUEST
+· 使用当前本机轨迹与新邻机 intent 做同刻轨迹检查
+· 与原版 ego 的收到新轨迹后检查逻辑一致
+· 只产生 REPLAN_REQUEST
+· 不直接 brake
+· 不直接进入 EMERGENCY_HOLD
+· 不把实时 pose 距离检查与 emergencyDog 重复
 ```
 
-目标设计中安全 supervisor 负责最高优先级安全请求；当前源码对应 `SafetyPredictor`、`runSafetySupervisor()`/`safetySupervisorTick()` 和 `emergency_pending_`，不调用 `replanOnce()`，不直接修改 `current_`，不等待普通规划重试。
+#### 4.3.4 emergencyDog
 
-### 4.4 请求优先级
+`emergencyDog` 是独立的最高优先级安全条件检测分支：
 
 ```text
-BRAKE_REQUEST > COMPLETE_REQUEST > REPLAN_REQUEST
+emergencyDog（20 Hz）
+        │
+        ▼
+读取本机 pose 和邻机 pose
+        │
+        ▼
+直接计算当前中心距离
+        │
+        ├─ 未触发紧急距离门禁
+        │      └─ 不产生请求
+        │
+        └─ 触发紧急距离门禁
+               └─ 产生 BRAKE_REQUEST
+```
+
+其明确边界是：
+
+```text
+· 不使用 TTC 或其他未来轨迹预测
+· 不等待邻机 intent 超时
+· 不产生普通 REPLAN_REQUEST
+· 不直接在检测回调中修改 current_
+· 只提交 BRAKE_REQUEST
+```
+
+### 4.4 请求仲裁器和动作优先级
+
+所有条件分支只提交请求，由统一仲裁器决定下一动作：
+
+```text
+请求集合：
+  BRAKE_REQUEST
+  COMPLETE_REQUEST
+  REPLAN_REQUEST
+
+优先级：
+  BRAKE_REQUEST > COMPLETE_REQUEST > REPLAN_REQUEST
 ```
 
 ```text
-存在 BRAKE_REQUEST
+请求仲裁器
+        │
+        ├─ 存在 BRAKE_REQUEST
+        │      └─ 直接进入 EMERGENCY_HOLD
+        │
+        ├─ 否则存在 COMPLETE_REQUEST
+        │      └─ 进入 COMPLETED_HOLD
+        │
+        ├─ 否则存在 REPLAN_REQUEST
+        │      └─ B 分支调用 replanOnce()
+        │
+        └─ 没有请求
+               └─ 保持 EGO_EXECUTING
+```
+
+优先级的含义：
+
+```text
+BRAKE_REQUEST 与 COMPLETE_REQUEST 同时存在
+    → 先 brake，不允许以完成状态掩盖安全事件
+
+COMPLETE_REQUEST 与 REPLAN_REQUEST 同时存在
+    → 先 complete，不为已经到达 end_pt 的任务继续普通 replan
+
+BRAKE_REQUEST 被接受
+    → 清除/废弃普通 COMPLETE_REQUEST 和 REPLAN_REQUEST
     → 直接进入 EMERGENCY_HOLD
-
-否则存在 COMPLETE_REQUEST
-    → 进入 COMPLETED_HOLD
-
-否则存在 REPLAN_REQUEST
-    → 进入 REPLAN 合并槽和轨迹更新执行器
-
-没有请求
-    → 保持 EGO_EXECUTING
 ```
 
-该优先级防止完成事件掩盖安全事件，也防止已经到达最终目标后继续普通 replan。
+### 4.5 EGO_EXECUTING 内部总流程
+
+```text
+进入 EGO_EXECUTING
+        │
+        ├─────────────────────────────────────────────────────────┐
+        │                                                         │
+        ▼                                                         │
+┌──────────────────────────────────────────────────────┐          │
+│ A. 轨迹执行分支                                       │          │
+│    current_ 存在：采样轨迹并发布 PX4 setpoint         │          │
+│    current_ 不存在：继续发布锁存 HOLD setpoint        │          │
+│    提供当前 pose 和执行时间                           │          │
+└──────────────────────────────────────────────────────┘          │
+                                                                  │
+        ┌─────────────────────────────────────────────────────────┘
+        ▼
+┌──────────────────────────────────────────────────────┐
+│ C. 条件触发分支                                       │
+│    replanTimer：无 current_ → REPLAN_REQUEST          │
+│    replanTimer：轨迹年龄 >= 1s → REPLAN_REQUEST      │
+│    waypointsTracker：推进 → REPLAN_REQUEST            │
+│    waypointsTracker：到达 end_pt → COMPLETE_REQUEST  │
+│    collisionChecker：新 intent 冲突 → REPLAN_REQUEST │
+│    emergencyDog：pose 门禁 → BRAKE_REQUEST            │
+│                                                       │
+│    只产生请求，不直接改变状态或提交轨迹               │
+└──────────────────────┬───────────────────────────────┘
+                       │ requests
+                       ▼
+┌──────────────────────────────────────────────────────┐
+│ B. 轨迹更新与请求仲裁分支                             │
+│                                                       │
+│    收集/合并请求                                      │
+│            │                                          │
+│            ▼                                          │
+│    仲裁：BRAKE > COMPLETE > REPLAN                   │
+└────────────┬──────────────┬───────────────┬───────────┘
+             │              │               │
+          BRAKE          COMPLETE         REPLAN
+             │              │               │
+             ▼              ▼               ▼
+  ┌────────────────┐ ┌────────────────┐ ┌────────────────────────┐
+  │ EMERGENCY_HOLD │ │ COMPLETED_HOLD │ │ replanOnce()           │
+  │                │ │                │ │ 处理轨迹更新结果       │
+  │ 退出            │ │ 退出            │ │ 保持 EGO_EXECUTING    │
+  │ EGO_EXECUTING  │ │ EGO_EXECUTING  │ └────────────────────────┘
+  └────────────────┘ └────────────────┘
+```
+
+仲裁结果边界以第 4.4 节为准。`replanOnce()` 只接收 B 分支仲裁产生的 `REPLAN` 响应，不负责状态退出请求的仲裁。尚未确定的失败重试策略、普通失败错误码细分和 `PI_EXECUTING` 完成反馈边界仍记录在第 0 章。
 
 ---
 
-## 5. 单层轨迹更新动作分支设计
+## 5. 轨迹更新动作分支设计
 
-本章定义 B 分支的最小可实施结构。轨迹更新的目标是生成并提交本机 nominal 轨迹，不承担任务分配或全局多机冲突求解。
+本章逐项确定新状态机中 B 分支的请求合并、请求仲裁、重规划调度、轨迹计算与提交，以及它们和其他状态动作的边界。讨论按第 5.0 节顺序进行：一个问题形成明确结论后，再讨论下一个问题。未形成结论的内容不作为最终设计。
 
-### 5.0 已确定设计边界
+### 5.0 待讨论问题
+
+1. **失败重试与多源重规划请求如何协调**
+   - 当前实现包含约 1 秒周期重试和最长约 10 秒的连续失败累计。
+   - 长时间失败处理占用统一重规划入口，可能与 `replanTimer`、`waypointsTracker`、`collisionChecker` 等频繁、多源 `REPLAN_REQUEST` 冲突。
+   - 需确定请求合并、失败退避、再次尝试和新请求抢占旧失败上下文的结构。
+
+2. **重规划动作是否应保证成功输出**
+   - 是否应把超时失败、紧急制动、状态退出全部移出重规划动作。
+   - 是否可以要求每次重规划一定输出一条可提交轨迹；若无法生成新轨迹，旧轨迹、悬停轨迹或无输出应如何定义。
+   - 需区分“规划计算失败”“没有新轨迹”和“状态机失败退出”。
+
+3. **`EGO_EXECUTING` 轨迹更新动作的最终逻辑结构**
+   - 结合本文件既定三分支结构和当前 `ego_planner_driver` 实现，确定轨迹更新动作的输入快照、规划、验证、提交及返回结果。
+   - 评估 `replanOnce()` 命名是否仍准确；可选名称包括 `tryReplan()`、`computeTrajectoryUpdate()` 或 `processReplanRequest()`。
+
+4. **与其他状态动作的耦合和冲突**
+   - 检查 `TAKEOFF`、`PI_EXECUTING`、`COMPLETED_HOLD`、`EMERGENCY_HOLD` 的动作函数是否共享 `current_`、setpoint 发布、HOLD 目标、计时器、请求标志或轨迹提交入口。
+   - 明确状态切换时如何取消在途规划，防止旧规划结果覆盖新状态。
+
+5. **多源请求的语义和去重粒度**
+   - `replanTimer`、waypoint 推进、邻机轨迹冲突产生的请求是否只需合并为一个 pending bit。
+   - 是否需要保存最新 waypoint 代次、邻机 intent 版本或原因集合，避免丢失比旧请求更新的输入。
+
+6. **首次轨迹与执行中更新是否使用同一动作**
+   - 进入 `EGO_EXECUTING` 时可能尚无 `current_`；执行中重规划则通常已有可继续执行的旧轨迹。
+   - 需确定二者能否共享同一输入/输出契约，以及首次规划失败时允许保持什么 setpoint。
+
+7. **并发计算结果的有效性判定**
+   - 规划期间可能发生 waypoint 推进、收到更新邻机 intent、状态切换或 `BRAKE_REQUEST`。
+   - 需确定提交时使用哪些 generation/version 检查，并规定过期结果只能丢弃、不能提交。
+
+8. **轨迹更新结果类型**
+   - 需决定返回 `bool`，还是返回可区分 `UPDATED`、`KEEP_CURRENT`、`STALE`、`NO_SOLUTION`、`RESOURCE_ERROR` 等语义的结果类型。
+   - 结果只描述轨迹更新事务，不直接承担状态机终态转换。
+
+### 5.1 失败重试与多源请求协调方案
+
+当前实现的失败重试由周期入口反复调用 `replanOnce()`，容易把失败重试、请求仲裁和轨迹更新混在一起。新设计保留必要的职责分工，但不引入完整异步任务队列：请求仲裁先过滤三类动作；只有获准的 `REPLAN_REQUEST` 才进入合并槽；轨迹更新由单一执行线程一次完成。
 
 ```text
-1. MOVE_TO 的主要多机冲突在 tcp_to_ros 发布前处理。
-2. ego_planner_driver 不修改 Axx/UAVn assignment。
-3. replanOnce() 单次、有界，不保证每次成功。
-4. 规划失败不强行提交退化或不安全轨迹。
-5. 有效 current_ 保留并继续执行；没有 current_ 时保持 HOLD。
-6. BRAKE/COMPLETE 由请求仲裁器处理，不进入 replanOnce()。
-7. REPLAN 请求合并，不建立 FIFO。
-8. 同一时刻只执行一个 replanOnce()。
-9. 输入版本变化时，过期候选只能丢弃，不能提交。
-10. 轨迹更新失败不直接承担状态机终态转换。
+动作请求
+BRAKE / COMPLETE / REPLAN
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 请求仲裁器                                                   │
+│                                                              │
+│ 快速过滤、按 BRAKE > COMPLETE > REPLAN 选择动作              │
+│                                                              │
+│ BRAKE / COMPLETE：执行对应状态退出                           │
+│ REPLAN：允许进入 REPLAN 请求合并槽                           │
+│ 不执行规划，不等待重试                                       │
+└───────────────┬──────────────────────────────────────────────┘
+                │ 仅获准的 REPLAN_REQUEST
+                ▼
+┌──────────────────────────────────────────────────────────────┐
+│ B. REPLAN 请求合并槽                                         │
+│                                                              │
+│ pending = true                                               │
+│ input_version++                                              │
+│                                                              │
+│ 不建立 FIFO；重复请求只合并，不逐条执行                       │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│ B. 轨迹更新执行器                                            │
+│                                                              │
+│ 判断条件：                                                   │
+│   pending == true                                            │
+│   replan_running == false                                    │
+│   且相同输入的 retry_not_before 已到达，                      │
+│      或 input_version 相对上次失败发生变化                   │
+│                                                              │
+│ 满足条件：                                                   │
+│   设置 replan_running = true                                 │
+│   复制最新 pose、目标和邻机 intent 快照                      │
+│   记录 started_input_version                                 │
+│   调用一次 replanOnce(snapshot)                              │
+│                                                              │
+│ 不满足条件：                                                 │
+│   不调用 replanOnce()；保留 pending，等待后续调度             │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               +-- 候选轨迹计算成功？
+                               │      │
+                               │      +-- 否：进入失败处理
+                               │      │       保留 current_ 或 HOLD setpoint
+                               │      │       设置 retry_not_before
+                               │      │
+                               │      `-- 是：比较 started_input_version
+                               │              与当前 input_version
+                               │                    │
+                               │        +-----------+-----------+
+                               │        │                       │
+                               │        v                       v
+                               │   版本不同                  版本相同
+                               │        │                       │
+                               │        +-- 丢弃候选            +-- 提交 current_
+                               │        +-- 不更新激活时间     +-- 更新激活时间
+                               │        +-- 不发布 intent       +-- 发布 intent
+                               │        +-- 不清除新 pending    +-- 清除本代 pending
+                               │        `-- 返回轨迹更新执行器  `-- 清除失败退避
+                               │            等待下一次调度
+                               │
+                               v
+                    replan_running = false
+                               │
+                               └─ 返回轨迹更新执行器调度循环
 ```
 
-### 5.1 请求合并、退避和版本检查
-
-请求先经过仲裁器；只有获准的 `REPLAN_REQUEST` 进入合并槽。
-
-```text
-REPLAN_REQUEST
-    → pending = true
-    → 记录会影响规划有效性的 input_version
-    → 重复请求合并，不建立 FIFO
-```
-
-最小运行状态：
+成功候选只有在 `started_input_version == input_version` 时才产生提交副作用。版本不同表示规划期间输入已更新：候选不得提交、不得更新激活时间、不得发布 `trajectory_intent`，也不得清除新请求设置的 `pending`；本次调用返回轨迹更新执行器，由执行器重新检查运行条件、创建最新快照并调用下一次 `replanOnce()`。状态退出由请求仲裁器负责，`replanOnce()` 不重复检查 `EGO_EXECUTING`、`BRAKE`、`COMPLETE` 或 `current_`/任务目标替换。
+最小状态如下：
 
 ```cpp
 struct ReplanSlot {
@@ -551,409 +1136,178 @@ bool replan_running{false};
 Time retry_not_before;
 ```
 
-执行条件：
+字段职责：
 
 ```text
-pending == true
-replan_running == false
-且：
-  相同输入的 retry_not_before 已到达，或
-  input_version 相对上次失败发生变化
+pending
+    = 是否存在待处理 REPLAN_REQUEST
+    = 获准的 REPLAN_REQUEST 到达时置 true
+    = 确认本次请求已处理后清 false
+
+input_version
+    = 任一影响规划的输入发生变化时递增
+    = 包括 waypoints/当前目标、邻机 intent 或其他规划输入
+    = 用于判断规划结果是否基于最新输入
+
+replan_running
+    = 由单一轨迹更新执行线程维护
+    = 防止并发执行两个 replanOnce()
+
+retry_not_before
+    = 失败后的最早再次尝试时间
+    = 属于重试调度，不属于请求身份
 ```
 
-执行器执行一次：
+请求处理规则：
 
 ```text
-设置 replan_running = true
-    → 复制最新 pose、目标、路径和邻机安全快照
-    → 记录 started_input_version
-    → 调用 replanOnce(snapshot)
-```
+BRAKE_REQUEST / COMPLETE_REQUEST
+    → 不进入 REPLAN 合并槽
+    → 按第 4.4 节执行状态退出
+    → 不调用 replanOnce()
 
-只有版本一致才允许提交：
+REPLAN_REQUEST
+    → 先经过请求仲裁器
+    → 获准后 pending = true
+    → 重复请求合并，不建立 FIFO
 
-```text
-候选成功
-    → started_input_version == input_version
-        → 提交 current_
-        → 更新激活时间
-        → 发布 trajectory_intent
-        → 清除本次 pending 和失败退避
-
-    → started_input_version != input_version
-        → 丢弃候选
-        → 不更新激活时间
-        → 不发布 intent
-        → 保留新 pending
-        → 返回轨迹更新执行器重新调度
-```
-
-规划失败时：
-
-```text
-保留有效 current_ 或 HOLD setpoint
+相同输入规划失败
+    → 保留 current_ 或 HOLD setpoint
     → 设置 retry_not_before
-    → replan_running = false
-    → 等待执行器再次调度
+    → 退避期内不重复计算
+
+waypoint 或邻机 intent 变化
+    → input_version++
+    → 新输入不受旧失败退避阻塞
+    → 若已有规划在运行，不并发；当前调用结束后重新执行
+
+replanOnce() 只执行一次有界轨迹更新
+    → 不等待 1s
+    → 不负责长期失败计时
+    → 不负责 BRAKE/COMPLETE/REPLAN 仲裁
 ```
 
-`input_version` 只在会影响候选有效性的语义变化时递增，例如路径替换、当前 waypoint 推进、有效邻机安全输入变化或任务替换；不应因每次普通 odometry 更新而递增。
+本节确定精简结构：请求先仲裁；仅 `REPLAN_REQUEST` 进入合并槽；请求不排队而合并为最新输入；轨迹更新单线程串行执行；失败使用简单退避；统一 `input_version` 检查结果新旧。长期失败是否导致状态退出、`replanOnce()` 是否必须保证成功输出，留待第 5.0 节问题 2 继续讨论。
 
-`input_version`、`started_input_version`、`ReplanSlot`、`retry_not_before` 和“轨迹更新执行器”是本章的目标设计对象；当前 `replanOnce()` 仍声明为 `bool replanOnce(bool timed_trigger = false)`，planner 内部实际返回 `PlanResult::SUCCESS`、`DEGENERATE_SEGMENT`、`RETRYABLE_FAILURE` 或 `RESOURCE_LIMIT`。实施时需要增加明确的适配层，不得把本文事务结果名称误认为当前 C++ 返回值。
+### 5.2 `replanOnce()` 轨迹更新流程
 
-### 5.2 单层 nominal `replanOnce()`
+本节承接 5.1：轨迹更新执行器满足运行条件后，复制最新输入快照并调用一次 `replanOnce(snapshot)`。`replanOnce()` 只负责本次轨迹计算、验证和提交，不负责 `BRAKE`、`COMPLETE` 请求仲裁或长期失败计时。
 
 ```text
 replanOnce(snapshot)
         │
         ▼
-选择规划起点
-    ├─ current_ 在当前时刻可采样
-    │    → 使用旧轨迹 P/V/A
-    └─ 没有可用 current_
-         → 使用实际 pose、零或安全初始 V/A
-        │
-        ▼
-选择当前未完成 keypoint
-        │
-        ▼
-沿当前 route segment 选择最多约 5 m 的局部目标
-        │
-        ├─ 下一 keypoint 距离 > 5 m
-        │    → 当前点沿该 segment 方向前视约 5 m
-        └─ 下一 keypoint 距离 <= 5 m
-             → 目标为下一 keypoint
-        │
-        ▼
-判断最终段
-    ├─ 非最终段：按当前 segment 方向设置目标速度
-    └─ 最终段：目标为 end_pt，末速度为 0
-        │
-        ▼
-core_->planOnce(...)
-        │
-        ▼
-finite / 资源 / 动力学 / clearance 检查
-        │
-        ├─ 失败 → 返回 NO_SOLUTION 或 RESOURCE_ERROR
-        └─ 成功 → 返回 nominal 候选轨迹
-```
+┌──────────────────────────────────────────────────────────────┐
+│ 第一层：nominal 轨迹规划                                     │
+│                                                              │
+│ 当前状态 P/V/A                                               │
+│     + 当前辅助 waypoint 或 end_pt                            │
+│     + fresh 邻机 trajectory_intent                           │
+│                                                              │
+│ 生成局部轨迹，并执行 finite、动力学、资源和 3D clearance 检查 │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                    +----------+-----------+
+                    │                      │
+                    v                      v
+             nominal 不可行             nominal 可行
+                    │                      │
+                    │                      +-- clearance 余量足够？
+                    │                             │
+                    │                    +--------+--------+
+                    │                    │                 │
+                    │                    v                 v
+                    │                  是                 否
+                    │                    │                 │
+                    │                    `-- 直接提交      按冲突对象
+                    │                        nominal       确定避让角色
+                    │                                      │
+                    │                           +----------+----------+
+                    │                           │                     │
+                    │                           v                     v
+                    │                        STAND_ON               YIELD
+                    │                     本机序号较低           本机序号较高
+                    │                           │                     │
+                    │                           `-- 提交 nominal       `-- 生成临时辅助目标候选
+                    │                               （若 nominal        │
+                    │                                 已通过检查）      v
+                    │                                      第二层：避让候选规划
+                    │                                      │
+                    │                                      │
+                    │                                      v
+                    │                           K_i → K_i'（临时辅助目标）
+                    │                                      │
+                    │                           对每个 K_i'：
+                    │                           当前状态 → K_i'
+                    │                           重新执行统一轨迹规划
+                    │                           完整检查并筛选
+                    │                                      │
+                    │                           +----------+----------+
+                    │                           │                     │
+                    │                           v                     v
+                    │                    找到可行候选             全部不可行
+                    │                           │                     │
+                    │                           v                     v
+                    │                    提交避让轨迹            返回无解结果
+                    │
+                    `-- STAND_ON 无主动避让目标
+                        → 返回无解结果
 
-5 m 是本次规划的辅助局部目标，不是任务完成目标，也不直接消费 waypoint。只有真实 odometry 到达当前 waypoint 的约 `0.5 m` 阈值后，`waypointsTracker` 才推进执行索引。局部目标不得跨越当前未完成的 route keypoint；`end_pt` 始终是唯一最终目标。
+                    注：若 nominal 不可行，STAND_ON 不能提交 nominal；
+                        只有已通过 nominal 检查的轨迹才允许 STAND_ON 提交。```
 
-如果当前 `max_advance_dist_m` 与 5 m 目标选择语义冲突，应拆分为明确的 `local_target_lookahead_m` 与 `waypoint_reach_thresh_m`，或删除不再需要的旧参数，不能让两个参数同时隐式控制目标选择和执行索引。
-
-本流程不包含：
-
-```text
-STAND_ON / YIELD
-SLOW / LEFT / RIGHT
-随机避让点
-移动 keypoint 后的第二层候选搜索
-已生成 TimedTrajectory 的直接横向或时间变形
-```
-
-### 5.3 更新结果与失败行为
-
-轨迹更新执行器应能够区分至少以下结果：
-
-```text
-UPDATED
-    候选通过检查且 input_version 一致，已提交 current_。
-
-KEEP_CURRENT
-    本次没有新轨迹，但已有 current_ 仍有效，继续执行并退避。
-
-HOLD
-    没有 current_ 或无法安全继续，保持锁存 HOLD setpoint。
-
-STALE
-    候选计算完成但 input_version 已变化，丢弃并保留 pending。
-
-NO_SOLUTION
-    nominal 规划不可行，未提交新轨迹。
-
-RESOURCE_ERROR
-    规划资源、输入或运行预算不足，未提交新轨迹。
-```
-
-这些结果描述轨迹更新事务，不直接决定状态机终态：
+nominal 轨迹可行且存在冲突时，序号角色规则如下：
 
 ```text
-轨迹失败且 current_ 安全
-    → KEEP_CURRENT + retry_not_before
+UAV 序号较低：STAND_ON
+    → 不生成主动避让目标
+    → 可提交已通过 nominal 检查的轨迹
 
-轨迹失败且没有 current_
-    → HOLD + retry_not_before
-
-实际安全边界失效
-    → BRAKE_REQUEST → EMERGENCY_HOLD
-
-BRAKE/COMPLETE 已被仲裁接受
-    → 丢弃普通 replan 结果，不提交到新状态
+UAV 序号较高：YIELD
+    → 生成临时辅助目标候选
+    → 通过候选规划和完整检查后提交避让轨迹
 ```
 
----
+该规则只用于普通冲突下的主动避让角色分配，防止双方同时改变路径；不覆盖 `BRAKE > COMPLETE > REPLAN` 的请求优先级。`BRAKE_REQUEST` 和 `COMPLETE_REQUEST` 已由上游仲裁器处理，不进入本函数。
 
-## 6. tcp_to_ros 的 MOVE_TO 任务分配与失败反馈
-
-### 6.1 适用范围与职责
-
-**当前实现事实：** `tcp_to_ros` 目前通过静态 `IdentityMap` 建立 `GroupState.exec_by_uav`，尚未实现 `current map`、MOVE_TO 候选分配或映射版本。以下 `current map` 和候选流程是目标设计，不能当作当前代码已经提供的能力。
+临时辅助目标只替代当前局部辅助 waypoint，不修改任务原始 waypoint 序列：
 
 ```text
-runtime
-    → 只发布任务层 Axx，不关心 UAVn 的具体分配
-
-tcp_to_ros
-    → 目标设计：维护 current map
-    → 仅对 command == MOVE_TO 的当前任务集合尝试任务分配
-    → 读取一致的 UAV 状态和路径输入
-    → 验证分配可行性
-    → 成功后发布对应 UAVn 任务
-    → 无有效分配时在 PREPARE 前向 runtime 返回任务失败
-
-swarm_uav_executor / ego_planner_driver
-    → 只执行已下发的 UAVn 任务
-    → 不修改任务分配
-    → 不知道全局 Axx 重排过程
+原始任务序列：K_0 → K_1 → K_2 → ... → end_pt
+                         │
+                         └─ 当前辅助点 K_i
+                              │
+                              +-- nominal：当前状态 → K_i
+                              `-- YIELD：当前状态 → K_i'
 ```
 
-例如，`prepare` 若只包含 `A01–A12`，分配算法只允许在 `A01–A12` 与 `UAV1–UAV12` 的闭集内工作；`A13–A15` 和 `UAV13–UAV15` 不参与，也不被改写。
-
-新的 MOVE_TO 分配用于替代目标设计中的 MOVE_TO 发布前 `t_off` 启动时间协调；但当前源码仍会在 backend 中按 `SCHEDULE_*` 规则为 `MOVE_TO` 和 `FAULT_EXIT` 计算 `schedule_tau`，并在全部 PREPARE accepted 后按独立 worker 延迟 START。迁移完成前，不能把 `t_off` 说成已删除；也不能让动态 MOVE_TO 分配和旧的 `schedule_tau` 同时承担同一批次的冲突协调。非 `MOVE_TO` 不进入新的分配算法；`FAULT_EXIT` 当前仍可能进入旧排程，是否移除必须单独实施和测试。
-
-### 6.2 current map 的持久运行时语义
-
-配置映射只提供初始值；任务发布后由 `tcp_to_ros` 维护 current map：
+其中：
 
 ```text
-启动/初始化
-    → 从 config map 建立 current map
-
-MOVE_TO
-    → 基于 current map 和本批参与集合生成候选
-    → 候选完整有效后原子更新 current map
-
-非 MOVE_TO
-    → 直接沿用 current map
-    → 不重新加载 config map
-    → 不恢复此前 MOVE_TO 已成功产生的映射
+K_i       = 原始任务中的中间辅助 waypoint
+K_i'      = 本次重规划生成的临时避让目标
+end_pt    = 原始任务最终目标，不允许被临时目标替代
 ```
 
-必须遵守：
+中间辅助点只用于引导轨迹。若本次避让轨迹到达 `K_i'`，waypoint tracker 可据当前执行进度继续推进后续任务点，不要求回到原 `K_i`。最终完成仍只能由原始 `end_pt` 的到达和稳定条件产生 `COMPLETE_REQUEST`。
 
-- 不修改、覆盖或写回 `uav_identity_map.yaml`；
-- 不把 config map 当作每条 command 的恢复目标；
-- MOVE_TO 失败时保持旧 current map 不变；
-- MOVE_TO 候选验证成功并提交 current map 后，即使后续 PREPARE/START 失败，也不得恢复 config map 或提交前的旧映射；
-- MOVE_TO 成功后，新的 current map 持续用于后续 command；
-- 正在执行的 command 使用其开始时冻结的 assignment snapshot；
-- 新 MOVE_TO 不得覆盖正在执行 snapshot；
-- current map 的更新只能整批原子提交，不能部分更新后继续尝试。
-
-### 6.3 MOVE_TO 分配范围和合法性
-
-分配算法只在当前 MOVE_TO 的闭集参与者内运行：
+临时目标候选建议采用有限、确定的集合；候选点可按当前运动方向的横向法向生成：
 
 ```text
-本次任务 assignments
-    → 任务参与集合 A_set
-    → 对应执行集合 U_set
-    → 只允许 A_set ↔ U_set 内的一一重新分配
+K_i' = K_i + d · n
+K_i' = K_i - d · n
 ```
 
-至少检查：
-
-- 每个任务层 Axx 只出现一次；
-- 每个执行层 UAVn 只绑定一个 Axx；
-- 候选不引入当前任务集合外的 UAV；
-- 所有执行目标来自已知、启用且健康的注册信息；
-- `exec_target`、Service、状态话题和 pose 来源相互一致；
-- 当前 UAV 实际位置到 MOVE_TO 路径的接入段也纳入冲突检查；
-- 路径、能力、状态、超时和计算资源满足本批任务要求；
-- 候选版本、参与集合和 assignment snapshot 一起冻结。
-
-分配不是修改实体 UAV 的身份。`UAVn` 到实际主机、IP、能力和通信对象的物理注册仍保持稳定。
-
-### 6.4 MOVE_TO 分配与发布事务
+每个候选必须重新经过统一轨迹规划和检查：
 
 ```text
-接收 MOVE_TO
-    │
-    ▼
-读取 current map 和一致的 pose/状态/路径快照
-    │
-    ▼
-在当前参与闭集内生成 Axx -> UAVn 候选
-    │
-    ▼
-检查一一映射、接入段、主路径、能力、状态和预算
-    │
-    ├─ 无有效候选
-    │    → 第 6.5 节的原子失败
-    │
-    └─ 候选有效
-         → 原子更新 current map
-         → 冻结本 command 的 assignment snapshot
-         → 仅使用该 snapshot 进入 PREPARE
-         → 全部 PREPARE accepted 后并发 START
-         → 执行期间不改变该 snapshot
+临时辅助目标
+    → 轨迹生成
+    → finite / 资源检查
+    → 速度、加速度等动力学检查
+    → 邻机 3D clearance 检查
+    → input_version 复验
+    → 通过后才允许提交
 ```
 
-候选生成和检查必须使用一致输入快照。不能在候选计算期间混用不同时间的 UAV pose、任务路径或映射版本。
-
-### 6.5 无有效分配时的原子失败
-
-以下任一情况都必须在 PREPARE 前失败：
-
-```text
-候选为空
-路径或接入段冲突不可行
-pose 缺失、过期或无法转换
-UAV 能力/状态不匹配
-参与集合或一一映射非法
-计算资源上限或 timeout 预算不足
-```
-
-失败动作固定为：
-
-```text
-丢弃候选
-    → current map 保持旧值
-    → 不发送任何 PREPARE
-    → 不发送任何 START
-    → 不产生部分成功
-    → 直接向 runtime 返回 FAILED
-```
-
-该语义与当前 `t_off` 排程前置失败一致：尚未向机载发布任务，因此不能把分配失败伪装成某架 UAV 的执行失败，也不需要对未启动任务发送 HOLD。
-
-### 6.6 MOVE_TO 的时间和发布约束
-
-**当前源码事实：** `gcs_a_backend_node.py` 将排程结果存为 `schedule_tau`；`t_off` 是设计/日志术语，不是 `ExecuteGroupTask`、`UavTask` 或 `TaskAssignment` 的字段。当前流程为：
-
-```text
-计算 schedule_tau
-    → 全部 PREPARE
-    → PREPARE 全部 accepted
-    → 每架按 t0 + schedule_tau[Axx] 独立 worker 调用 START
-```
-
-**目标设计约束：** MOVE_TO 动态分配验证成功后，不再让旧 `schedule_tau` 与新分配同时承担同一批次的主要冲突协调。迁移期间若仍保留旧排程，必须明确它是兼容路径，并把等待时间纳入 timeout 预算；不能把当前实现误写成“已并发无偏移 START”。
-
-不论采用哪条迁移路径，都必须保证：
-
-```text
-有效分配/兼容排程成功并冻结执行快照
-    → 全部 PREPARE
-    → 全部 PREPARE accepted
-    → 按明确的 START 规则发布
-```
-
-无有效分配或排程失败时，不得继续发送任务。
-
-### 6.7 失败反馈契约
-
-第 6.5 节是目标设计的反馈契约；当前代码的实际状态要单独说明：TCP 解析拒绝路径可以直接发布 `ros_status = REJECTED`，但 backend 内部的排程失败是在 Action goal 已发送后通过 `set_aborted()` 返回，当前 TCP 收口通常会发布 `ros_status = FAILED`。后续实现若要把 MOVE_TO 分配失败统一标为 `REJECTED`，必须显式增加该错误路径，不能仅修改本文文字。
-
-目标设计的分配或发布前验证失败反馈为：
-
-```text
-Action result
-    final_status = FAILED
-    failed_uavs = 原任务层 Axx，非空、无重复
-    error_code = 明确的 mapping/pose/infeasible/timeout 错误码
-    message = 简短原因
-
-GroupTaskState
-    tcp_status = FAILED
-    ros_status = REJECTED（仅在实现显式区分前置拒绝时）
-    failed_uavs = 同一批 Axx
-    detail = 诊断摘要
-
-TCP runtime
-    status = FAILED
-    failed_uavs = 只包含本次 assignments 的 Axx
-```
-
-当前 `GroupTaskState` 没有独立的 `error_code` 字段；映射失败、排程失败和执行失败的细节需要放入 `detail`，或通过 Action/TCP 的 `error_code` 传递。
-
-`REJECTED` 不是当前 backend 统一的 group 状态：TCP 解析拒绝路径可以使用它，但 Action/backend 的前置排程失败通常以 `final_status = FAILED` 收口并发布 `ros_status = FAILED`。如果目标设计要求 `ros_status = REJECTED`，必须新增并测试显式前置拒绝路径。
-
-`FAILED` 是当前 TCP/ROS 任务协议的失败状态；`FAILURE` 仅在 runtime 或自然语言语境中表示内部失败概念，不作为本文新增的主协议枚举。
-
-当前 `t_off` 失败码实际是 `SCHEDULE_POSE_UNAVAILABLE`、`SCHEDULE_GEOMETRY_UNSUITABLE`、`SCHEDULE_PAIR_SAFE_SET_EMPTY`、`SCHEDULE_INFEASIBLE`、`SCHEDULE_LIMIT_REACHED`、`SCHEDULE_TIMEOUT_INSUFFICIENT`，并且旧 scheduler 同时服务 `MOVE_TO`/`FAULT_EXIT`。第 6 章后续若增加 `MOVE_TO_ASSIGNMENT_*` 错误码，必须同时修改 parser/backend/TCP 映射和测试；本节列出的名称是目标设计候选，不是当前已有常量。
-
-详细候选、冲突区间、计算耗时、映射版本和预测距离写入日志或测试记录，不改变线上主状态协议。
-
-### 6.8 执行阶段失败与前置分配失败的区别
-
-```text
-前置分配失败
-    → 尚未 PREPARE
-    → 直接 FAILED
-    → current map 不变
-    → 不需要向未启动 UAV 发送 HOLD
-
-已 PREPARE/START 后执行失败
-    → 接收 executor 的 FAILED 或安全状态
-    → GCS 汇总 failed_uavs
-    → 按现有规则对其他已启动成员执行安全 HOLD
-    → 向 runtime 返回整组 FAILED
-```
-
-`EGO_PLAN_FAILED`、`EMERGENCY_HOLD`、链路丢失和执行超时属于执行阶段失败，不能与发布前分配失败混淆。
-
-### 6.9 非 MOVE_TO 的映射连续性
-
-必须保证以下行为：
-
-```text
-MOVE_TO 成功更新 current map
-    → 后续 FOLLOW_ROUTE / FAULT_EXIT / HOVER / HOLD
-      继续使用 current map
-    → 不重新加载 config map
-    → 不发生 Axx/UAVn 映射突变
-
-MOVE_TO 分配失败
-    → current map 保持失败前的值
-    → 后续 command 继续使用失败前的 current map
-```
-
-非 `MOVE_TO` 不应因为新 MOVE_TO 的候选算法而引入新的任务分配、回滚或跨集合改写。`FOLLOW_ROUTE` 的 leader/follower 关系尤其不能被隐式替换。
-
-### 6.10 最低回归测试要求
-
-后续实现至少需要验证：
-
-- `MOVE_TO` 成功后 current map 持续影响后续非 `MOVE_TO`；
-- `MOVE_TO` 失败时 current map 完全不变；
-- `A01–A12` 的分配不影响 `A13–A15/UAV13–UAV15`；
-- 无有效分配时不产生任何 PREPARE/START；
-- `failed_uavs` 使用任务层 Axx，且只来自原 assignments；
-- 正在执行的 assignment snapshot 不被下一条 MOVE_TO 覆盖；
-- `FOLLOW_ROUTE` 的 leader/follower 不被 MOVE_TO 候选污染；
-- status sequence 去重、终态重发、组级 FAILED/HOLD 收口继续有效；
-- 日志能够区分 mapping failure、schedule failure 和 executor/driver execution failure。
-
----
-
-## 7. 实施顺序
-
-```text
-1. 先在 tcp_to_ros 实现 current map、MOVE_TO 闭集分配和原子失败反馈。
-2. 再收紧 MOVE_TO 的 t_off/旧排程入口，避免同一批任务同时使用两套协调机制。
-3. 将 ego_planner_driver 的 replanOnce() 收敛为单层 nominal 更新。
-4. 删除或停用第二层 SLOW/LEFT/RIGHT 候选路径。
-5. 按第 4、5 章补齐状态机请求合并、版本检查和失败结果语义。
-6. 完成跨层回归测试后，再更新运行记录和部署参数。
-```
-
-本设计的最终职责划分为：
-
-```text
-任务发布前：tcp_to_ros 选择并验证 MOVE_TO 的执行分配。
-任务发布后：executor 按冻结 snapshot 管理单机任务。
-本机执行期间：ego_planner_driver 负责 nominal 轨迹、setpoint 连续性和安全退出。
-```
+因此，本节中的“成功”专指：候选轨迹已完成验证并可提交；它不表示存在数学上的必然可行解。若 nominal 和所有避让候选均不可行，`replanOnce()` 返回无解结果；旧轨迹保留、退避重试或安全状态处理由 5.1 的轨迹更新执行器和上游请求仲裁器负责。
