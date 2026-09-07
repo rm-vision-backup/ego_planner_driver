@@ -1,7 +1,7 @@
 # Safety/TTC/stale/emergency 参数 canonical 默认（implementation_plan_26082916 §4）。
 # 加载方式：node 私有 namespace（~）。
 # 校验：所有 double finite；TTC 检查 emergency_ttc_s <= warning_ttc_s；
-# emergency_maximum_duration_s >= emergency_minimum_duration_s；枚举白名单 {active,shadow,off}。
+# 枚举白名单 {active,shadow,off}。
 # peer_data_age_cap_s 为诊断参数：不参与安全决策（schema 注明）。
 # 语义速查（消费者见每行注释；单位 SI）。
 
