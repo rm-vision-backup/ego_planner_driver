@@ -22,7 +22,8 @@ struct YieldCandidateConfig
   double swarm_clearance = 0.5;
   double lateral_max_m = 2.2;   // LEFT/RIGHT 峰值横向偏移上限
   double slow_min_scale = 0.3;  // SLOW 最低时间缩放（速度 ×scale，时长 ÷scale）
-  // 档位（26082621 迭代）：SLOW {0.5, 0.8, 1.2}（0.8/1.2 微调与加速）；
+  // 档位（26082621 迭代；260908 增 1.5 更高加速档）：SLOW {0.5, 0.8, 1.2, 1.5}
+  //   （0.8/1.2/1.5 微调与加速）；
   //   LEFT/RIGHT lateral {1.3, 1.8, 2.2} × scale {0.7, 0.5}。
   double max_velocity_mps = 2.5;  // 候选/加速档允许的轨迹速度上限（26082621 迭代，独立于制动）
   double max_acceleration_mps2 = 6.0;
@@ -75,7 +76,7 @@ private:
   bool validate(const TimedTrajectory& traj,
                 const std::vector<NeighborTrajectory>& neighbors,
                 double& min_clear) const;
-  // 生成 SLOW 候选（时间缩放 scale ∈ {0.7, 0.5}，叠加速度驱动时间轴）。
+  // 生成 SLOW 候选（时间缩放 scale ∈ {0.5, 0.8, 1.2, 1.5}，叠加速度驱动时间轴）。
   YieldCandidate makeSlow(const TimedTrajectory& remaining, double remaining_nominal,
                           const std::vector<NeighborTrajectory>& neighbors) const;
   // 生成 LEFT/RIGHT 候选：远离 peer 重叠时段平均位置的 plateau 偏移（覆盖时空

@@ -185,13 +185,16 @@ YieldCandidate YieldCandidateGenerator::makeSlow(
     const TimedTrajectory& remaining, double remaining_nominal,
     const std::vector<NeighborTrajectory>& neighbors) const
 {
-  // 变速档位 {0.5, 0.8, 1.2}（26082621 迭代）：0.5/0.8 减速等待错开、1.2 加速先过；
-  // 穿越时刻相对 peer 移动轨迹错开。最终速度 v_max×factor ≤ max_velocity_mps。
+  // 变速档位 {0.5, 0.8, 1.2, 1.5}（260908 新增 1.5 更高加速档）：0.5/0.8
+  // 减速等待错开、1.2/1.5 加速先过；穿越时刻相对 peer 移动轨迹错开。最终
+  // 速度 v_max×factor ≤ max_velocity_mps。档序保持"先验低速再高速"的原有
+  // 首档有效即返回语义（不改变既有行为/单测），1.5 只在更慢档与 1.2 档均
+  // 无法满足 min_clear 门槛时作为更高加速档兜底。
   double v_max = 0.0;
   for (const auto& v : remaining.vel)
     v_max = std::max(v_max, v.norm());
   const double slow_min = std::max(0.05, config_.slow_min_scale);
-  for (double scale : {0.5, 0.8, 1.2})
+  for (double scale : {0.5, 0.8, 1.2, 1.5})
   {
     double factor = std::max(scale, slow_min);
     // 速度约束（含加速档）：加速后不得超 max_velocity_mps。
