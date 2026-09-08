@@ -162,58 +162,101 @@ TEST(EgoStateMachine, ShadowSafetyTickDoesNotChangeFlightBehavior)
   EXPECT_EQ(node.lastSafetyPrediction().pairs.size(), 1u);
 }
 
-TEST(EgoStateMachine, EmergencyBrakeDirectBrakeHoldNoTrajectory)
+TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
 {
-  // 变更 D（26090802）：制动直接锁存悬停 BRAKE_HOLD。无 kStateEmergencyBrake
-  // 中间态、无制动轨迹、无 PHASE_BRAKING intent；触发源 = executor 实时 3D
-  // 门禁 / 组级安全指令（sendBrakeHold → /brake_hold）。
+  // 方案 Y（implementation_plan_26082621）：监督层 EMERGENCY 只置 emergency_pending_，
+  // 制动由 replan 线程（replanOnce）在"常规 replan 失败且 ttc 紧急"时提交。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
   node.setReplanLoopEnabled(false);
   node.setClockSource([&clock]() { return clock.now(); });
+  node.setSafetySupervisorModeForTest("active");
   ASSERT_TRUE(setupHold(node, clock, 5.0));
   node.sendGoal(5.0, 0.0, 5.0);
   ASSERT_TRUE(node.replanOnce());
-  ASSERT_EQ(node.execState(), kStateExecuting);
 
-  node.sendBrakeHold();
-  ASSERT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
-  // 无制动轨迹（current_ 直接清空），锁存悬停目标。
-  EXPECT_FALSE(static_cast<bool>(node.currentTrajectory()));
-  const auto hold = node.steadyTarget();
-  ASSERT_TRUE(static_cast<bool>(hold));
+  auto peer = makeIntent(100.0, 1, "UAV2");
+  // peer 与本机完全同轨迹（同刻、同位置）：任何本机轨迹均侵入固定 1m 硬门，
+  // 常规 replan 必然失败 → ttc 紧急 → replanOnce 提交受约束制动。
+  peer.t = {0.0, 5.0};
+  peer.sampled_traj[0].position.x = 0.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+  node.safetySupervisorTick();
+  // 监督回调不再直接改轨迹：置位后由 replanOnce 统一提交。
+  ASSERT_EQ(node.execState(), kStateExecuting);
+  ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+  const auto braking = node.currentTrajectory();
+  ASSERT_TRUE(braking);
+  ASSERT_GT(braking->duration, 0.0);
+
+  while (clock.get() <= 100.0 + braking->duration + 0.1)
+  {
+    node.publishSetpointTick();
+    clock.advance(0.02);
+  }
   node.publishSetpointTick();
-  const mavros_msgs::PositionTarget sp = node.lastSetpoint();
-  EXPECT_EQ(sp.type_mask, ego_planner_driver::kMaskHold);
-  EXPECT_NEAR(sp.position.x, hold->pos.x(), 1e-9);
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
+  const auto hold = node.steadyTarget();
+  ASSERT_TRUE(hold);
+  EXPECT_LT((hold->pos - braking->pts.back()).norm(), 1e-8);
+  EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
 }
 
-TEST(EgoStateMachine, BrakeHoldRejectsGoalHoldAndDirectControl)
+TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
 {
-  // 变更 D 锁存守卫：BRAKE_HOLD 后 onGoal/onWaypoints/onHold/direct_control
-  // 均不可转出，状态保持锁存。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
   node.setReplanLoopEnabled(false);
   node.setClockSource([&clock]() { return clock.now(); });
+  node.setSafetySupervisorModeForTest("active");
   ASSERT_TRUE(setupHold(node, clock, 5.0));
   node.sendGoal(5.0, 0.0, 5.0);
   ASSERT_TRUE(node.replanOnce());
   ASSERT_EQ(node.execState(), kStateExecuting);
 
-  node.sendBrakeHold();
-  ASSERT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
-  node.sendGoal(9.0, 0.0, 5.0);
-  node.sendWaypoints(std::vector<geometry_msgs::Point32>());
-  node.sendHold();
-  node.setDirectControlActive(true);
-  EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
-  EXPECT_FALSE(node.planningRequested());
-  // 锁存悬停 setpoint 持续发布。
+  auto peer = makeIntent(100.0, 1, "UAV2");
+  // peer 与本机完全同轨迹：常规 replan 失败 → 制动（方案 Y 提交唯一化）。
+  peer.t = {0.0, 5.0};
+  peer.sampled_traj[0].position.x = 0.0;
+  peer.sampled_traj[0].position.z = 5.0;
+  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.z = 5.0;
+  ASSERT_TRUE(node.injectNeighborIntent(peer));
+  node.safetySupervisorTick();
+  ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+  const auto braking = node.currentTrajectory();
+  ASSERT_TRUE(braking);
+  ASSERT_GT(braking->duration, 0.0);
+  const ros::Time brake_start = node.planStart();
+
+  // 缺陷 8 回归：紧急制动后常规 replan 提交必须被拒绝，制动轨迹不能被覆盖。
+  // 制动期间 replanOnce 直接返回（emergency_braking_ 门禁）。
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+  const auto after = node.currentTrajectory();
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->pts.size(), braking->pts.size());
+  EXPECT_TRUE(after->pts.front().isApprox(braking->pts.front()));
+  EXPECT_EQ(node.planStart(), brake_start);
+
+  // 制动轨迹正常走完 → BRAKE_HOLD（不再被 replan 打断恢复 EXECUTING）。
+  while (clock.get() <= 100.0 + braking->duration + 0.1)
+  {
+    node.publishSetpointTick();
+    clock.advance(0.02);
+  }
   node.publishSetpointTick();
-  EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
+  const auto hold = node.steadyTarget();
+  ASSERT_TRUE(hold);
+  EXPECT_LT((hold->pos - braking->pts.back()).norm(), 1e-8);
 }
 
 TEST(EgoStateMachine, FirstPlanReadyForLeaderImmediately)
@@ -260,12 +303,10 @@ TEST(EgoStateMachine, FirstPlanTimeoutReleasesWithoutPredecessor)
   EXPECT_TRUE(node.firstPlanReadyForTest());
 }
 
-TEST(EgoStateMachine, PredictorEmergencyNoDirectBrakeLock)
+TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
 {
-  // 变更 D/E（26090802）：SafetyPredictor EMERGENCY 只置 emergency_pending_ +
-  // planning_requested_（“需立即绕开”的 replan/预警输入，比 10Hz collision 更早），
-  // 不再经 emergency_pending_→制动路径进入 BRAKE_HOLD。直接锁存只由 executor
-  // 实时 3D 门禁 / 组级安全指令（onBrakeHold）触发。
+  // 方案 Y：EMERGENCY 先尝试常规重规划（绕开），成功则提交并清除 emergency_pending_，
+  // 不触发制动；失败且 ttc ≥ emergency_replan_time_s 时收口 PLAN_FAILED（不制动）。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -277,65 +318,24 @@ TEST(EgoStateMachine, PredictorEmergencyNoDirectBrakeLock)
   ASSERT_TRUE(node.replanOnce());
   ASSERT_EQ(node.execState(), kStateExecuting);
 
-  // 与本机同刻同轨迹的挡路 peer → 预测 EMERGENCY。
+  // 对向交叉 peer：与本机直线轨迹在 x=2.5 交叉（<1m），预测越界时间 ttc≈2.0s
+  // > emergency_replan_time_s(1.0) → 常规 replan 失败则收口 PLAN_FAILED，不制动。
   auto peer = makeIntent(100.0, 1, "UAV2");
   peer.t = {0.0, 5.0};
-  peer.sampled_traj[0].position.x = 0.0;
+  peer.sampled_traj[0].position.x = 5.0;
   peer.sampled_traj[0].position.z = 5.0;
-  peer.sampled_traj[1].position.x = 5.0;
+  peer.sampled_traj[1].position.x = 0.0;
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
   node.safetySupervisorTick();
-  // 预测 EMERGENCY → 只请求 replan，不直接锁存。
-  EXPECT_EQ(node.execState(), kStateExecuting);
-  EXPECT_TRUE(node.planningRequested());
-  // replanOnce 常规失败 → retry（同输入计数），绝不进入 BRAKE_HOLD。
-  EXPECT_FALSE(node.replanOnce());
-  EXPECT_NE(node.execState(), ego_planner_driver::kStateBrakeHold);
-  clock.advance(0.5);
-  node.injectLocalPose(makePose(0.0, 0.0, 5.0, clock.get()));
-  EXPECT_FALSE(node.replanOnce(true));
-  EXPECT_NE(node.execState(), ego_planner_driver::kStateBrakeHold);
-  // 直接锁存入口仍可用（executor 实时门禁/组级指令侧）。
-  node.sendBrakeHold();
-  EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
-}
-
-TEST(EgoStateMachine, EmergencyPendingPreventsTickArrivalCompletion)
-{
-  // 变更 A：完成转换（checkArrival 分支 B）在 emergency_pending_ 置位时让位，
-  // 不清标志，交 replan 线程处理——不允许以 COMPLETED 掩盖安全事件。
-  FakeClock clock;
-  clock.set(100.0);
-  EgoPlannerDriverNode node;
-  node.setReplanLoopEnabled(false);
-  node.setClockSource([&clock]() { return clock.now(); });
-  node.setSafetySupervisorModeForTest("active");
-  ASSERT_TRUE(setupHold(node, clock, 5.0));
-  node.sendGoal(5.0, 0.0, 5.0);
-  ASSERT_TRUE(node.replanOnce());
+  // 监督回调只置位；replanOnce 统一处理（可能成功绕开，也可能 PLAN_FAILED）。
   ASSERT_EQ(node.execState(), kStateExecuting);
-
-  // 同刻同轨迹 peer → 预测 EMERGENCY（置 emergency_pending_ + planning_requested_）。
-  auto peer = makeIntent(100.0, 1, "UAV2");
-  peer.t = {0.0, 5.0};
-  peer.sampled_traj[0].position.x = 0.0;
-  peer.sampled_traj[0].position.z = 5.0;
-  peer.sampled_traj[1].position.x = 5.0;
-  peer.sampled_traj[1].position.z = 5.0;
-  ASSERT_TRUE(node.injectNeighborIntent(peer));
-  node.safetySupervisorTick();
-  ASSERT_TRUE(node.planningRequested());
-  // 稳定窗口满（pose 固定在最终关键点）→ completion 判据满足，但 pending 让位：
-  // 不允许 COMPLETED。
-  clock.advance(2.0);
-  for (int i = 0; i < 5; ++i)
-  {
-    node.injectLocalPose(makePose(5.0, 0.0, 5.0, clock.get()));
-    node.arrivalCheckTick();
-    clock.advance(0.3);
-  }
-  EXPECT_NE(node.execState(), kStateCompleted);
+  node.replanOnce();
+  EXPECT_NE(node.execState(), ego_planner_driver::kStateEmergencyBrake);
+  EXPECT_NE(node.execState(), ego_planner_driver::kStateBrakeHold);
+  // 要么重规划成功（继续执行），要么 ttc 充足收口 PLAN_FAILED（安全 HOLD）。
+  EXPECT_TRUE(node.execState() == kStateExecuting ||
+              node.execState() == ego_planner_driver::kStatePlanFailed);
 }
 
 TEST(EgoStateMachine, YieldHighIdCommitsLateralCandidate)
@@ -522,25 +522,20 @@ TEST(EgoStateMachine, YieldReplanStandOnFailsToPlan)
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
 
-  // retry 计数（变更 C 26090802）：首败保持 HOLD（未进入 EXECUTING，不立即收口），
-  // 相同输入连续失败达 max_same_input_retries_(5) 才收口 EGO_PLAN_FAILED。
+  // 软着陆（26082700）：首败保持 HOLD（未进入 EXECUTING，不立即收口），
+  // 连续失败累计 >10s 才收口 EGO_PLAN_FAILED。
   EXPECT_FALSE(node.replanOnce());
   EXPECT_EQ(node.execState(), kStateHold);
-  EXPECT_EQ(node.sameInputFailureCountForTest(), 1u);
-  for (int i = 0; i < 4; ++i)
-  {
-    clock.advance(0.1);
-    node.injectLocalPose(makePose(0.0, 0.0, 5.0, clock.get()));
-    EXPECT_FALSE(node.replanOnce(true));
-  }
+  clock.advance(11.0);
+  node.injectLocalPose(makePose(0.0, 0.0, 5.0, clock.get()));
+  EXPECT_FALSE(node.replanOnce(true));
   EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
-  EXPECT_EQ(node.sameInputFailureCountForTest(), 0u);  // 收口后清零
 }
 
-TEST(EgoStateMachine, ReplanFailRetryResetsOnCommit)
+TEST(EgoStateMachine, ReplanFailSoftLandingResetsOnCommit)
 {
-  // retry 恢复（变更 C 26090802）：失败后成功提交 → plan_fail_since_ 清空且
-  // 同输入失败计数清零，避免恢复后旧失败累计直接收口。
+  // 软着陆恢复（26082700）：失败后成功提交（定时 replan 恢复）→ plan_fail_since_
+  // 清空重新计时，避免恢复后旧失败累计直接收口。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -579,7 +574,6 @@ TEST(EgoStateMachine, ReplanFailRetryResetsOnCommit)
   ASSERT_TRUE(node.replanOnce(true));
   EXPECT_EQ(node.execState(), kStateExecuting);
   EXPECT_TRUE(node.planFailSinceForTest().isZero());  // 已重置
-  EXPECT_EQ(node.sameInputFailureCountForTest(), 0u);  // 计数清零
 }
 
 
@@ -882,7 +876,6 @@ TEST(EgoStateMachine, CompletedFreezesInHold)
   FakeClock clock;
   clock.set(0.0);
   EgoPlannerDriverNode node;
-  node.setReplanLoopEnabled(false);  // 确定性：禁用后台 replan 线程（避免并发干扰）
   node.setClockSource([&clock]() { return clock.now(); });
 
   ASSERT_TRUE(setupHold(node, clock, 15.0));
@@ -1002,8 +995,7 @@ TEST(EgoStateMachine, DegenerateWhileFailingClosesAfterTimeout)
   // 推进时钟模拟轨迹执行（elapsed 接近 duration）：pose 固定 (4.3,0,5)
   // （距最终点 (5,0,5) 0.7m > 0.5m 到达阈值，不算到达）。planned_start 采样
   // clamp 到轨迹末端 (5,0,5) == target → core 返回 DEGENERATE_SEGMENT；此时已有
-  // 失败状态 → 走 retry 失败路径：不清计时、不提交、定时重试直到同输入连续
-  // 失败达 max_same_input_retries_(5) 收口。
+  // 失败计时 → 走软着陆失败路径：不清计时、不提交、定时重试直到 10s 收口。
   for (int i = 0; i < 14; ++i)
   {
     clock.advance(1.0);
@@ -1018,10 +1010,9 @@ TEST(EgoStateMachine, DegenerateWhileFailingClosesAfterTimeout)
     if (node.execState() == ego_planner_driver::kStatePlanFailed)
       break;
   }
-  // 同输入连续失败达到上限 → EGO_PLAN_FAILED 收口。
+  // 总失败时长超过 plan_fail_timeout_s_（10s）→ EGO_PLAN_FAILED 收口。
   EXPECT_EQ(node.execState(), ego_planner_driver::kStatePlanFailed);
   EXPECT_TRUE(node.planFailSinceForTest().isZero());  // 收口后清计时
-  EXPECT_EQ(node.sameInputFailureCountForTest(), 0u);
 }
 
 // §4.2（260828 方式 B，node 层）：RESOURCE_LIMIT 零 activation retry、零 yield、

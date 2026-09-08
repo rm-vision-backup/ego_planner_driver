@@ -127,7 +127,7 @@ PREPARE ─────┤
 follower 失败：LEADER_LOST / POSE_STALE / MIN_DISTANCE_BREACH / LOCAL_TIMEOUT / COMMAND_HELD
 `prepare()`：ego 可见+pose 新鲜+MAVROS connected+armed+OFFBOARD(+MOVE_TO origin_confirmed)；不自动 arm。
 
-## 5. C++ driver 状态机（现状 7 态；26090802 已实施）
+## 5. C++ driver 状态机（现状 8 态）
 
 ```text
 程序启动 ──► HOLD（初始；常量另有 IDLE 仅供 arm+OFFBOARD guard 兼容）
@@ -143,9 +143,10 @@ EXECUTING ◄──────────────────────�
    │ 推进(距当前目标<0.5m→切下一点) ──► 置位→replan（保持 EXECUTING）
    │ 到达(距最终点<0.5m 且稳定 1s) ──► COMPLETED ──► HOLD(冻结终点)
    │ 执行超时 ──► EGO_EXEC_TIMEOUT ──(executor)──► HOLD
-   │ 同输入 replan 失败 ≥5 次 ──► EGO_PLAN_FAILED ──(executor)──► HOLD
-   │ 实时 3D 门禁 / 组级安全指令 ──► BRAKE_HOLD（直接锁存悬停，无制动轨迹；
-   │   onBrakeHold(/brake_hold) 触发；BRAKE_HOLD 不可被新 goal/HOLD/direct_control 转出）
+   │ replan 连续失败 ≥10s ──► EGO_PLAN_FAILED ──(executor)──► HOLD
+   │ EMERGENCY：replan 失败 + ttc<1s ──► EMERGENCY_BRAKE ──制动轨迹耗尽──► BRAKE_HOLD(锁存)
+   │                                     ⚑26090802：改为直接锁存 BRAKE_HOLD（去制动轨迹），
+   │                                       且 BRAKE_HOLD 不再可被新 goal/HOLD/direct_control 转出
    └─ 其他 → 保持 EXECUTING
 ```
 
@@ -183,18 +184,17 @@ replanOnce(timed_trigger)
   │     └─ SUCCESS            ─► checkClearance → 提交（锁内复验最新 intent + safety_generation_）
   │
   └─ 失败分支
-        ├─ retry（变更 C：同输入计数 ≤5）──► EGO_PLAN_FAILED
+        ├─ EMERGENCY_pending_ ? ──► tryEmergencyBrakeLocked（受控制动轨迹，现状 ⚑26090802 改直接锁存）
         └─ 普通失败 ──► tryYieldReplan（SLOW/LEFT/RIGHT + STAND_ON/YIELD）
               ├─ COMMITTED → 提交候选
               ├─ RESOURCE_LIMIT → EGO_PLAN_FAILED
               └─ NOT_AVAILABLE → 保留 current_/末端
-                    └─ retry 0.6s×同输入最多 5 次（replan_retry_period_s/max_same_input_retries）
-                          （26090802 已实施，替代旧 soft-landing 10s 时间窗）
+                    └─ soft-landing：1s 定时+事件重试；连续 ≥ plan_fail_timeout_s(10s) → EGO_PLAN_FAILED
+                          ⚑26090802：改 retry 0.6s×同输入最多5次（参数），去 soft-landing 词
 ```
 
 现状**无**：`ReplanSlot/input_version/replan_running/retry_not_before/仲裁器对象`；
-`ReplanSnapshot.target_consumed` = waypoint_consumed_ 快照，提交前推进则丢弃（⚑26090802 变更 B 已实施）；
-`safety_generation_` 只作安全/提交代次检查（BrakeHold 代次）。
+`safety_generation_` 只作安全/制动代次检查，不含 waypoint/intent 输入版本（⚑26090802 变更 B 补）。
 
 ## 7. setpoint 出口（relay）
 
@@ -216,14 +216,13 @@ replanOnce(timed_trigger)
 |---|---|---|
 | 提交入口 | replanLoop 唯一（✅一致） | 单一执行器 |
 | 请求 | planning_requested_/emergency_pending_ bool | BRAKE>COMPLETE>REPLAN 仲裁对象（⚑A） |
-| 结果新旧 | safety_generation_ + ReplanSnapshot.target_consumed（⚑B 已实施） | input_version 覆盖目标/intent |
+| 结果新旧 | safety_generation_（仅安全/制动） | input_version 覆盖目标/intent（⚑B） |
 | 失败重试 | soft-landing 1s / 10s 收口 | retry 0.6s×5 参数（⚑C） |
 | 制动 | 受控轨迹→BRAKE_HOLD（可被转出） | 直接锁存 BRAKE_HOLD 且不转出（⚑D） |
 | 状态名 | 8 态现状名 | 逻辑名（INIT/…_HOLD）未实施 |
 | 身份 | 静态 IdentityMap | 动态 current map 未实施 |
 
-⚑ = 26090802 变更标记；A/B/C/D 已实施（2026-09-08）。请求仲裁对象、动态 current map、
-逻辑状态名不在该计划范围内。
+⚑ = `implementation_plan_26090802.md` 已批准未实施；除 A/B/C/D 外其余目标项不在该计划。
 
 ## 9. 证据文件
 

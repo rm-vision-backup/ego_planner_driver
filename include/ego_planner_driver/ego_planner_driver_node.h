@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 #include "ego_planner_driver/ego_planner_core.h"
+#include "ego_planner_driver/emergency_brake.h"
 #include "ego_planner_driver/safety_logger.h"
 #include "ego_planner_driver/safety_predictor.h"
 #include "ego_planner_driver/yield_candidates.h"
@@ -44,6 +45,7 @@ static constexpr const char* kStateHold = "HOLD";
 static constexpr const char* kStatePlanFailed = "EGO_PLAN_FAILED";
 static constexpr const char* kStateExecTimeout = "EGO_EXEC_TIMEOUT";
 static constexpr const char* kStateTakeoff = "TAKEOFF";
+static constexpr const char* kStateEmergencyBrake = "EMERGENCY_BRAKE";
 static constexpr const char* kStateBrakeHold = "BRAKE_HOLD";
 
 constexpr double kSetpointRateHz = 30.0;
@@ -94,10 +96,6 @@ public:
   void sendGoal(double x, double y, double z);
   void sendWaypoints(const std::vector<geometry_msgs::Point32>& points);
   void sendHold();
-  // 组级/实时安全锁存（变更 D/F）：直接在当前安全位置锁存悬停并进入
-  // BRAKE_HOLD，无制动轨迹中间态。由 executor 实时 3D 门禁事件或组级安全
-  // 指令（UavHold reason=GROUP_SAFETY → 本节点 /brake_hold）触发。
-  void sendBrakeHold();
   bool replanOnce(bool timed_trigger = false);
   void advanceHoldHandling();
   void publishSetpointTick();
@@ -128,10 +126,8 @@ public:
   bool yieldCommittedForTest() const;
   // 测试用：禁用 replanLoop 线程（单测手动 replanOnce 驱动时避免线程抢占）。
   void setReplanLoopEnabled(bool enabled);
-  // retry 测试：查询首次失败时刻（isZero = 未在 retry 失败中）。
+  // 软着陆测试：查询首次失败时刻（isZero = 未在软着陆失败中）。
   ros::Time planFailSinceForTest() const;
-  // retry 测试：查询同输入连续失败计数。
-  std::size_t sameInputFailureCountForTest() const { return same_input_failure_count_; }
   // 资源边界测试查询：分别返回配置的自然上限（用于 resource-limit 单测）。
   std::size_t maxNeighborIntentSamplesForTest() const { return max_neighbor_intent_samples_; }
 
@@ -153,8 +149,6 @@ private:
   bool acceptNeighborIntentLocked(
       const swarm_uav_interfaces::UavTrajectoryIntent& msg, const ros::Time& now);
   void onHold(const std_msgs::Empty::ConstPtr& msg);
-  // 变更 D：直接锁存悬停 BRAKE_HOLD（组级安全指令入口，无制动轨迹）。
-  void onBrakeHold(const std_msgs::Empty::ConstPtr& msg);
   void onMavrosState(const mavros_msgs::State::ConstPtr& msg);
   void onDirectControl(const std_msgs::Bool::ConstPtr& msg);
   // Receding-horizon 窗口滚动已删除（implementation_plan_26082621）：plan-exec
@@ -188,10 +182,6 @@ private:
       const ros::Time& candidate_activation);
   std::vector<NeighborTrajectory> freshAbsoluteNeighborsLocked(
       const ros::Time& now) const;
-  // 变更 C：当前规划输入签名（waypoint_consumed_ + 目标 + 各 fresh 邻机
-  // (epoch, traj_id)）。调用方持 mutex_。同签名连续失败计数递增；签名变化即
-  // 视为新输入，清计数重新累计。
-  uint64_t replanInputSignatureLocked() const;
 
   ros::Time nowFunc() const { return clock_source_ ? clock_source_() : ros::Time::now(); }
   void resetRun();
@@ -218,7 +208,7 @@ private:
   enum class YieldResult
   {
     COMMITTED,      // 候选提交成功
-    NOT_AVAILABLE,  // 无有效候选（常规规划失败保持 retry）
+    NOT_AVAILABLE,  // 无有效候选（常规规划失败保持软着陆）
     RESOURCE_LIMIT  // 候选生成内部出现资源失败，必须向上传播并 §9.6 立即收口
   };
   // 方案 A（§10 扩展）：replanOnce 规划失败（safe_candidate=false）时尝试让路候选：
@@ -234,14 +224,13 @@ private:
     Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
     bool final_segment = false;
     uint64_t safety_generation = 0;
-    // 变更 B：snapshot 时的目标推进代次（waypoint_consumed_）。提交前若已推进
-    // （值不等），候选基于过期目标 → 丢弃结果、不发布 intent、不清 pending。
-    size_t target_consumed = 0;
   };
   YieldResult tryYieldReplan(const ReplanSnapshot& snap);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
-  // 变更 D：BRAKE_HOLD 直接锁存实现（调用方持 mutex_）。
-  void lockBrakeHoldLocked(const ros::Time& now);
+  // 方案 Y：EMERGENCY 且 ttc 紧急时生成并提交受约束制动轨迹（replan 线程内调用，
+  // 持 mutex_）。返回 true 表示已提交制动/fallback；false 表示不满足制动条件
+  // （ttc 充足 → 调用方 PLAN_FAILED 收口）。
+  bool tryEmergencyBrakeLocked();
   void processHoldLocked();
   void handleMavrosStateEdgeLocked();
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base);
@@ -273,13 +262,6 @@ private:
   // → COMMAND_HELD；0.5m/arrival_stable_s=1.0s 锁存覆盖该偏差，COMPLETED 可靠触发。
   double arrival_reach_thresh_m_ = 0.5;
   int activation_replan_attempts_ = 3;
-  // 变更 C：失败 retry 语义（去 soft-landing / plan_fail_timeout_s 时间窗）。
-  // replan_retry_period_s_ = 失败/retry 态下 replanLoop 的等待周期；常态仍用
-  // replan_period_s_。max_same_input_retries_ = 相同输入签名（waypoint_consumed_
-  // /primary intent traj_id 与 epoch/目标未变）连续失败次数上限，达到后收口
-  // EGO_PLAN_FAILED；输入变化或成功提交则清零。
-  double replan_retry_period_s_ = 0.6;
-  int max_same_input_retries_ = 5;
   bool direct_control_active_ = false;
   volatile bool replan_loop_enabled_ = true;
   std::string safety_supervisor_mode_ = "active";
@@ -287,26 +269,30 @@ private:
   double episode_release_hysteresis_s_ = 1.0;
   SafetyPredictorConfig safety_config_;
   std::unique_ptr<SafetyPredictor> safety_predictor_;
+  std::unique_ptr<EmergencyBrakeGenerator> emergency_brake_generator_;
   SafetyLogger safety_logger_;
   ConflictEpisode conflict_episode_;
   SafetyPrediction last_safety_prediction_;
   uint64_t safety_generation_ = 0;
-  // 变更 D/E（26090802）：BRAKE_HOLD 直接锁存入口 = /brake_hold（executor
-  // 实时 3D 门禁/组级安全指令）；SafetyPredictor EMERGENCY 不再直接驱动锁存，
-  // 只置 emergency_pending_ + planning_requested_ 作“需立即绕开”的 replan/
-  // 预警输入。emergency_pending_ 仍是“安全事件优先于完成”标记：完成转换
-  // （handleArrivalBeforeSnapshotLocked/checkArrival）在其置位时让位且不清标志；
-  // replan 提交成功/新目标/普通 HOLD 清空。
+  bool emergency_braking_ = false;
+  // 对齐原版 EGOReplanFSM：EMERGENCY 时先尝试立即重规划（planFromCurrentTraj
+  // 语义）；重规划失败且预测越界时间 < emergency_replan_time_s 才触发受约束
+  // 制动，否则收口 PLAN_FAILED（对齐原版 emergency_time=1.0s）。
+  double emergency_replan_time_s_ = 1.0;
+  // 方案 Y（implementation_plan_26082621）：监督层检测到 EMERGENCY 只置位
+  // emergency_pending_（记录 primary peer + ttc）并唤醒 replanLoop；制动由
+  // replan 线程在"常规 replan 失败且 ttc < emergency_replan_time_s_"时提交
+  // （提交唯一化，监督回调不再直接改轨迹）。
   bool emergency_pending_ = false;
   std::string emergency_peer_id_;
   double emergency_peer_ttc_ = std::numeric_limits<double>::infinity();
   // replanOnce 失败时是否置 PLAN_FAILED+HOLD 收口（常规 replan 为 true）；
   bool replan_failure_fatal_ = true;
-  // retry 失败计数（变更 C）：同输入连续失败达到 max_same_input_retries_ 收口
-  // EGO_PLAN_FAILED；提交成功或输入签名变化清零。
-  size_t same_input_failure_count_ = 0;
-  uint64_t last_failure_signature_ = 0;
-  bool last_failure_signature_valid_ = false;
+  // 软着陆（26082700 EGO_PLAN_FAILED 修复）：常规 replan 失败不立即 PLAN_FAILED，
+  // 保持当前轨迹（执行完自然悬停），由 1s 定时/事件继续重试；连续失败超过
+  // plan_fail_timeout_s_（10s）才 EGO_PLAN_FAILED 收口（executor 收口后经
+  // backend 对全组活动机发 HOLD）。
+  double plan_fail_timeout_s_ = 10.0;
   // 资源边界（implementation_plan_26082722 §11）：与 EgoPlannerConfig 中同名
   // 参数同步读取；node 启动时 fail-fast 校验。max_neighbor_intent_samples_ 只
   // 属于 node 侧 intent consumer（§10）。
@@ -315,7 +301,7 @@ private:
   std::size_t max_trajectory_samples_ = 4096;
   std::size_t max_neighbor_intent_samples_ = 256;
   double segment_direction_epsilon_m_ = 0.05;
-  ros::Time plan_fail_since_;  // 首次失败时刻（isZero = 当前不在 retry 失败中，变更 C）
+  ros::Time plan_fail_since_;  // 首次失败时刻（isZero = 当前不在软着陆失败中）
   // 机间让路候选（SLOW/LEFT/RIGHT + right-of-way，implementation_plan_26082602 §10）：
   // collisionCheckTick 检测冲突（min_clear < 1.2×clearance，yield_clearance_factor=1.2）
   // → 本机 YIELD（ID 小于 primary peer）生成候选，cost 最小者提交发布；STAND_ON 交常规 replan。
@@ -362,8 +348,6 @@ private:
   ros::Subscriber pose_sub_;
   ros::Subscriber intent_sub_;
   ros::Subscriber hold_sub_;
-  // 变更 D：直接锁存悬停入口（组级安全指令 → /brake_hold，std_msgs/Empty）。
-  ros::Subscriber brake_hold_sub_;
   ros::Subscriber mavros_state_sub_;
   ros::Subscriber direct_control_sub_;
   ros::Subscriber own_bias_sub_;
@@ -381,7 +365,7 @@ private:
   // semantics of the former kNeighborStaleS constant).
   double neighbor_intent_stale_s_ = 30.0;
   // Serializes traj_id_ increment + intent_pub_ publish across the replan
-  // thread and safety-timer commits.
+  // thread and the safety-timer emergency-brake commit.
   std::mutex intent_pub_mutex_;
 
   mutable std::mutex mutex_;
