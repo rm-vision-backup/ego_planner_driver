@@ -1,7 +1,7 @@
-# Safety/TTC/stale/emergency 参数 canonical 默认（implementation_plan_26082916 §4）。
+# Safety/TTC/stale 参数 canonical 默认（implementation_plan_26082916 §4）。
 # 加载方式：node 私有 namespace（~）。
 # 校验：所有 double finite；TTC 检查 emergency_ttc_s <= warning_ttc_s；
-# emergency_maximum_duration_s >= emergency_minimum_duration_s；枚举白名单 {active,shadow,off}。
+# 枚举白名单 {active,shadow,off}。
 # peer_data_age_cap_s 为诊断参数：不参与安全决策（schema 注明）。
 # 语义速查（消费者见每行注释；单位 SI）。
 
@@ -28,14 +28,6 @@ warning_ttc_s: 3.0                     # WARNING TTC（s，>0）：预测碰撞�
 emergency_ttc_s: 1.5                   # EMERGENCY TTC（s，>0 且 <=warning_ttc_s）：预测碰撞时间低于该值进入 EMERGENCY
 minimum_prediction_window_s: 0.25      # 最短预测窗口（s，>0）：预测时间跨度下限
 safety_episode_release_s: 1.0          # 危险 episode 释放时间（s，>=0）：解除危险等级后的锁存保持时长
-emergency_replan_time_s: 1.0           # 紧急重规划周期（s，>0）：EMERGENCY 状态下重规划尝试间隔
-
-# —— 紧急制动轨迹 ——
-emergency_max_velocity_mps: 1.5        # 紧急制动速度上限（m/s，>0）：EmergencyBrake 速度约束
-emergency_jerk_mps3: 8.0               # 紧急制动 jerk 上限（m/s³，>0）：EmergencyBrake 平滑约束
-emergency_sample_period_s: 0.02        # 紧急制动采样步长（s，>0）：EmergencyBrake 采样
-emergency_minimum_duration_s: 0.4      # 紧急制动最短时长（s，>0）：制动轨迹最小时间
-emergency_maximum_duration_s: 12.0     # 紧急制动最长时长（s，>0 且 >=minimum）：制动轨迹最大时间
 
 # —— 邻机 intent 新鲜度 ——
 neighbor_intent_stale_s: 30.0          # 邻机 intent 接收窗（s，>0）：[now±stale] 外 intent 判 stale；

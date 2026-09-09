@@ -55,12 +55,12 @@ EXECUTING ──分支A 推进───► EXECUTING（距当前目标<0.5m 切�
 EXECUTING ──分支B 到达───► COMPLETED（距最终关键点<0.5m 稳定 1s）──► HOLD
 EXECUTING ──执行超时───────► EGO_EXEC_TIMEOUT ──(executor 收口)──► HOLD
 EXECUTING ──replan 全失败≥10s──► EGO_PLAN_FAILED ──(executor 收口)──► HOLD
-EXECUTING ──EMERGENCY+replan失败+ttc<1s──► EMERGENCY_BRAKE ──轨迹耗尽──► BRAKE_HOLD（锁存，不自动恢复）
-EXECUTING ──EMERGENCY+replan失败+ttc≥1s──► EGO_PLAN_FAILED（立即）──► HOLD
+EXECUTING ──EMERGENCY+replan/让路失败──► BRAKE_HOLD（直接锁存本机当前位置，26090900；无 EMERGENCY_BRAKE 中间态）
 ```
 
 - 状态集：`HOLD / TAKEOFF / EXECUTING / COMPLETED / EGO_PLAN_FAILED /
-  EGO_EXEC_TIMEOUT / EMERGENCY_BRAKE / BRAKE_HOLD`（8 个；`POSE_STALE` 与 `NEGOTIATING` 已删除）。
+  EGO_EXEC_TIMEOUT / BRAKE_HOLD`（7 个；`POSE_STALE`、`NEGOTIATING` 与
+  `EMERGENCY_BRAKE` 已删除——26090900 统一所有安全出口为直接 `BRAKE_HOLD` 锁存）。
 - `HOLD` 锁存进入时位置/yaw 为 setpoint，不随 pose 漂移（删 POSE_STALE 后无 pose 过期态；
   pose 过期期间不发布无效 setpoint，pose 恢复后自愈）。
 - `TAKEOFF`：arm+OFFBOARD 沿后从当前 z 以 `takeoff_ascend_speed` 软上升到 `takeoff_height_m`，
@@ -97,16 +97,16 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 ## replanOnce（唯一提交者，按优先级）
 
 ```
-① EMERGENCY 且常规 replan 失败：
-     ttc < emergency_replan_time_s(1.0s) → 受约束制动（EMERGENCY_BRAKE → BRAKE_HOLD，方案 Y）
-     ttc ≥ 1.0s                          → EGO_PLAN_FAILED（立即收口）
+① EMERGENCY（SafetyPredictor 预测 min_d≤1.0 或 ttc≤1.5）→ 先常规 replan + 让路候选
+     （成功提交清除紧急标志继续执行）；绕开失败 → 直接 lockBrakeHoldLocked → BRAKE_HOLD
+     （捕获本机当前位置/yaw，无 EMERGENCY_BRAKE 制动轨迹，26090900）
 ② 常规 replan（planOnce，激活时刻对齐 ≤3 次重试）：
      checkClearance（固定 swarm_clearance×2=1m 硬门，规划/激活/提交三处）→ 提交
 ③ 常规规划"成功但裕度不足"：min_clear < 1.2m → tryYieldReplan 生成候选替换（失败保持原轨迹）
 ④ 常规 replan 失败：tryYieldReplan 候选（right-of-way）→ 成功提交
 ⑤ 软着陆（26082700）：全失败不立即 PLAN_FAILED——保持当前轨迹执行（末端自然悬停），
    由 1s 定时/冲突/推进事件继续重试；连续失败 ≥ plan_fail_timeout_s(10s) 才 EGO_PLAN_FAILED
-   （EMERGENCY 分支保持立即收口）
+   （预测级 EMERGENCY 已在上方直锁，不进入软着陆）
 ```
 
 提交段安全校验：提交锁内用最新邻机 intent 复验 1m 硬门；`safety_generation_` 防晚到结果覆盖
@@ -162,7 +162,9 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 | `RETRYABLE_FAILURE` | 普通有限数值失败（optimizer/clearance/动力学） | 保留现有轨迹，1s/事件 soft-landing 重试；连续 ≥10s（`plan_fail_timeout_s`）→ `EGO_PLAN_FAILED` |
 | `RESOURCE_LIMIT` | 样本/点数超限、checked arithmetic、`bad_alloc` | 同事务不重试不 yield → 立即 `EGO_PLAN_FAILED → executor HOLD → backend ALL HOLD`（§9.6） |
 
-- 短段/方向退化/final 段动力学不可行不得升级为紧急制动；`EMERGENCY_BRAKE` 仍只由 SafetyPredictor 紧急事件 + replan 失败 + TTC 门槛共同触发。
+- 短段/方向退化/final 段动力学不可行不进入安全锁存；直接 `BRAKE_HOLD` 锁存仅由
+  SafetyPredictor 预测紧急（min_d≤1.0 / ttc≤1.5）+ replan/让路绕开失败，或 runtime/
+  组级安全 HOLD（/brake_hold）、executor MIN_DISTANCE_BREACH 兜底触发（26090900）。
 - replan 线程最外层 `std::bad_alloc` containment（§9.9）：转为 `EGO_PLAN_FAILED`，不允许异常逃出进程。
 - `parameterizeToBspline` 改为 bounded single-QR（一次分解、x/y/z 三列 RHS、rank/residual/finite 校验、失败清空输出）。
 
@@ -216,9 +218,7 @@ identity/path/明确 deployment override（`uav_id`/`exec_target`/`frame_id`/`se
 | `safety_supervisor_mode` / `safety_supervisor_rate_hz` | active / 25.0 | 监督模式 / 频率；可显式设为 shadow / off |
 | `protected_distance_m` | 1.0 | EMERGENCY 物理距离 |
 | `warning_ttc_s` / `emergency_ttc_s` | 3.0 / 1.5 | WARNING/EMERGENCY ttc（校验 emergency<=warning） |
-| `emergency_replan_time_s` | 1.0 | 制动前重规划窗口 |
-| `emergency_decel_mps2` / `emergency_max_velocity_mps` / `emergency_jerk_mps3` | 2.0 / 1.5 / 8.0 | 制动动力学 |
-| `emergency_minimum_duration_s` / `emergency_maximum_duration_s` | 0.4 / 12.0 | 制动时长下限/上限（校验 max>=min） |
+| `emergency_decel_mps2` | 2.0 | SafetyPredictor 动态 margin 减速（制动轨迹参数随 EmergencyBrakeGenerator 删除） |
 | `safety_prediction_horizon_s` / `safety_sample_period_s` | 3.0 / 0.05 | 监督预测窗（260830 由 5.0 缩短）/ 采样步长 |
 | `peer_data_age_cap_s` | 2.0 | 诊断参数，**不参与安全决策** |
 | `neighbor_intent_stale_s` | 30.0 | 邻机 intent 接收窗 `[now±stale]`（接入实际 stale 判断） |

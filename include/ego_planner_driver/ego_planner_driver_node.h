@@ -23,7 +23,6 @@
 #include <thread>
 #include <vector>
 #include "ego_planner_driver/ego_planner_core.h"
-#include "ego_planner_driver/emergency_brake.h"
 #include "ego_planner_driver/safety_logger.h"
 #include "ego_planner_driver/safety_predictor.h"
 #include "ego_planner_driver/yield_candidates.h"
@@ -45,7 +44,6 @@ static constexpr const char* kStateHold = "HOLD";
 static constexpr const char* kStatePlanFailed = "EGO_PLAN_FAILED";
 static constexpr const char* kStateExecTimeout = "EGO_EXEC_TIMEOUT";
 static constexpr const char* kStateTakeoff = "TAKEOFF";
-static constexpr const char* kStateEmergencyBrake = "EMERGENCY_BRAKE";
 static constexpr const char* kStateBrakeHold = "BRAKE_HOLD";
 
 constexpr double kSetpointRateHz = 30.0;
@@ -96,6 +94,7 @@ public:
   void sendGoal(double x, double y, double z);
   void sendWaypoints(const std::vector<geometry_msgs::Point32>& points);
   void sendHold();
+  void sendBrakeHold();
   bool replanOnce(bool timed_trigger = false);
   void advanceHoldHandling();
   void publishSetpointTick();
@@ -149,6 +148,10 @@ private:
   bool acceptNeighborIntentLocked(
       const swarm_uav_interfaces::UavTrajectoryIntent& msg, const ros::Time& now);
   void onHold(const std_msgs::Empty::ConstPtr& msg);
+  // 直接 BRAKE_HOLD 锁存入口（runtime 指定 HOLD / 组级安全 HOLD 经 executor →
+  // driver → /brake_hold 到达；implementation_plan_26090900 §4.4）：捕获本机
+  // 当前位置/yaw → steady_target_ → BRAKE_HOLD，无 EMERGENCY_BRAKE 中间态。
+  void onBrakeHold(const std_msgs::Empty::ConstPtr& msg);
   void onMavrosState(const mavros_msgs::State::ConstPtr& msg);
   void onDirectControl(const std_msgs::Bool::ConstPtr& msg);
   // Receding-horizon 窗口滚动已删除（implementation_plan_26082621）：plan-exec
@@ -187,6 +190,12 @@ private:
   void resetRun();
   void setState(const std::string& state);
   bool captureHoldTargetLocked(const ros::Time& now);
+  // implementation_plan_26090900 §0/§4.4：直接 BRAKE_HOLD 锁存。捕获本机当前
+  // 有效位置/yaw，清除普通 current_/待执行轨迹，设置 steady_target_，进入
+  // BRAKE_HOLD（持续发布固定位置 setpoint）。与普通 HOLD（captureHoldTargetLocked）
+  // 的区别仅在最终状态字面量；无 fresh pose 时保持 brake_hold_requested_ 等
+  // 下一轮重试（pose 恢复后自动补锁存）。
+  bool lockBrakeHoldLocked();
   // Unified command construction/publish: business fields stay ROS ENU, MAVROS
   // converts them to NED for the PX4 raw local setpoint.  velocity/acceleration
   // are only meaningful for kMaskEgoTrajectory (ignored by HOLD masks).
@@ -227,11 +236,12 @@ private:
   };
   YieldResult tryYieldReplan(const ReplanSnapshot& snap);
   void checkArrival(const Eigen::Vector3d& target, double yaw, const ros::Time& now);
-  // 方案 Y：EMERGENCY 且 ttc 紧急时生成并提交受约束制动轨迹（replan 线程内调用，
-  // 持 mutex_）。返回 true 表示已提交制动/fallback；false 表示不满足制动条件
-  // （ttc 充足 → 调用方 PLAN_FAILED 收口）。
-  bool tryEmergencyBrakeLocked();
+  // implementation_plan_26090900 §4.4：普通失败回退之外的直接锁存判定仅在两处——
+  // ① 监督层 EMERGENCY（预测紧急）且 replan/让路绕开失败；② executor 实时兜底
+  // （MIN_DISTANCE_BREACH）与 runtime/组级安全 HOLD 经 /brake_hold 进入。删除了
+  // 方案 Y 的 EMERGENCY_BRAKE 制动轨迹生成/执行分支（EmergencyBrakeGenerator）。
   void processHoldLocked();
+  void processBrakeHoldLocked();
   void handleMavrosStateEdgeLocked();
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base);
   void publishIntent(const TimedTrajectory& traj, const ros::Time& base,
@@ -269,23 +279,19 @@ private:
   double episode_release_hysteresis_s_ = 1.0;
   SafetyPredictorConfig safety_config_;
   std::unique_ptr<SafetyPredictor> safety_predictor_;
-  std::unique_ptr<EmergencyBrakeGenerator> emergency_brake_generator_;
   SafetyLogger safety_logger_;
   ConflictEpisode conflict_episode_;
   SafetyPrediction last_safety_prediction_;
   uint64_t safety_generation_ = 0;
-  bool emergency_braking_ = false;
-  // 对齐原版 EGOReplanFSM：EMERGENCY 时先尝试立即重规划（planFromCurrentTraj
-  // 语义）；重规划失败且预测越界时间 < emergency_replan_time_s 才触发受约束
-  // 制动，否则收口 PLAN_FAILED（对齐原版 emergency_time=1.0s）。
-  double emergency_replan_time_s_ = 1.0;
-  // 方案 Y（implementation_plan_26082621）：监督层检测到 EMERGENCY 只置位
-  // emergency_pending_（记录 primary peer + ttc）并唤醒 replanLoop；制动由
-  // replan 线程在"常规 replan 失败且 ttc < emergency_replan_time_s_"时提交
-  // （提交唯一化，监督回调不再直接改轨迹）。
+  // implementation_plan_26090900 §0：预测级 EMERGENCY 只置 emergency_pending_
+  // （记录 primary peer）并唤醒 replanLoop；replan/让路绕开成功即清除继续执行，
+  // 失败才直接锁存 BRAKE_HOLD（lockBrakeHoldLocked）。保留 replan 余地、不在
+  // 监督回调直接改轨迹/锁存（提交唯一化）。
   bool emergency_pending_ = false;
   std::string emergency_peer_id_;
-  double emergency_peer_ttc_ = std::numeric_limits<double>::infinity();
+  // /brake_hold 请求（executor/driver 安全 HOLD 路由）待处理标志：由 replanLoop
+  // 唯一处理为直接 BRAKE_HOLD 锁存。与普通 /hold（hold_requested_）并列。
+  bool brake_hold_requested_ = false;
   // replanOnce 失败时是否置 PLAN_FAILED+HOLD 收口（常规 replan 为 true）；
   bool replan_failure_fatal_ = true;
   // 软着陆（26082700 EGO_PLAN_FAILED 修复）：常规 replan 失败不立即 PLAN_FAILED，
@@ -348,6 +354,7 @@ private:
   ros::Subscriber pose_sub_;
   ros::Subscriber intent_sub_;
   ros::Subscriber hold_sub_;
+  ros::Subscriber brake_hold_sub_;
   ros::Subscriber mavros_state_sub_;
   ros::Subscriber direct_control_sub_;
   ros::Subscriber own_bias_sub_;

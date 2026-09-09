@@ -162,10 +162,12 @@ TEST(EgoStateMachine, ShadowSafetyTickDoesNotChangeFlightBehavior)
   EXPECT_EQ(node.lastSafetyPrediction().pairs.size(), 1u);
 }
 
-TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
+TEST(EgoStateMachine, EmergencyPredictionDirectLocksBrakeHold)
 {
-  // 方案 Y（implementation_plan_26082621）：监督层 EMERGENCY 只置 emergency_pending_，
-  // 制动由 replan 线程（replanOnce）在"常规 replan 失败且 ttc 紧急"时提交。
+  // implementation_plan_26090900 §0：监督层 EMERGENCY（预测 min_d<=1.0 或
+  // ttc<=1.5）只置 emergency_pending_；replanOnce 先尝试常规 replan（同轨迹
+  // peer → 必然失败）与让路候选（默认关闭）→ 绕开失败 → 直接 BRAKE_HOLD 锁存，
+  // 不再生成制动轨迹、无 EMERGENCY_BRAKE 中间态。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -175,10 +177,9 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
   ASSERT_TRUE(setupHold(node, clock, 5.0));
   node.sendGoal(5.0, 0.0, 5.0);
   ASSERT_TRUE(node.replanOnce());
+  ASSERT_EQ(node.execState(), kStateExecuting);
 
   auto peer = makeIntent(100.0, 1, "UAV2");
-  // peer 与本机完全同轨迹（同刻、同位置）：任何本机轨迹均侵入固定 1m 硬门，
-  // 常规 replan 必然失败 → ttc 紧急 → replanOnce 提交受约束制动。
   peer.t = {0.0, 5.0};
   peer.sampled_traj[0].position.x = 0.0;
   peer.sampled_traj[0].position.z = 5.0;
@@ -186,77 +187,49 @@ TEST(EgoStateMachine, ActiveEmergencyBrakeStopsAndHoldsEndpoint)
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
   node.safetySupervisorTick();
-  // 监督回调不再直接改轨迹：置位后由 replanOnce 统一提交。
+  // 监督回调不直接改轨迹/锁存：先保持 EXECUTING，由 replanOnce 统一处理。
   ASSERT_EQ(node.execState(), kStateExecuting);
   ASSERT_TRUE(node.replanOnce());
-  ASSERT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
-  const auto braking = node.currentTrajectory();
-  ASSERT_TRUE(braking);
-  ASSERT_GT(braking->duration, 0.0);
-
-  while (clock.get() <= 100.0 + braking->duration + 0.1)
-  {
-    node.publishSetpointTick();
-    clock.advance(0.02);
-  }
-  node.publishSetpointTick();
-  EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
+  // 无 EMERGENCY_BRAKE 中间态：直接 BRAKE_HOLD。
+  ASSERT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
   const auto hold = node.steadyTarget();
   ASSERT_TRUE(hold);
-  EXPECT_LT((hold->pos - braking->pts.back()).norm(), 1e-8);
+  // 锁存位置来自本机当前有效位置（fresh pose (0,0,5)），非 runtime 目标/邻机点。
+  EXPECT_NEAR(hold->pos.x(), 0.0, 1e-6);
+  EXPECT_NEAR(hold->pos.y(), 0.0, 1e-6);
+  EXPECT_NEAR(hold->pos.z(), 5.0, 1e-6);
+  // 普通轨迹已清除；setpoint 为固定位置 HOLD mask。
+  EXPECT_FALSE(static_cast<bool>(node.currentTrajectory()));
+  node.publishSetpointTick();
   EXPECT_EQ(node.lastSetpoint().type_mask, ego_planner_driver::kMaskHold);
 }
 
-TEST(EgoStateMachine, ActiveEmergencyBrakeRejectsReplanCommit)
+TEST(EgoStateMachine, DirectBrakeHoldRequestLocksAtCurrentPose)
 {
+  // implementation_plan_26090900 §4.4：runtime 指定 HOLD / 组级安全 HOLD 经
+  // executor → driver → /brake_hold 到达。replanOnce 在顶部门禁处理：捕获本机
+  // 当前位置锁存 BRAKE_HOLD，后续 replan 不得覆盖（steady_target_ 拦截）。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
   node.setReplanLoopEnabled(false);
   node.setClockSource([&clock]() { return clock.now(); });
-  node.setSafetySupervisorModeForTest("active");
   ASSERT_TRUE(setupHold(node, clock, 5.0));
   node.sendGoal(5.0, 0.0, 5.0);
   ASSERT_TRUE(node.replanOnce());
   ASSERT_EQ(node.execState(), kStateExecuting);
 
-  auto peer = makeIntent(100.0, 1, "UAV2");
-  // peer 与本机完全同轨迹：常规 replan 失败 → 制动（方案 Y 提交唯一化）。
-  peer.t = {0.0, 5.0};
-  peer.sampled_traj[0].position.x = 0.0;
-  peer.sampled_traj[0].position.z = 5.0;
-  peer.sampled_traj[1].position.x = 5.0;
-  peer.sampled_traj[1].position.z = 5.0;
-  ASSERT_TRUE(node.injectNeighborIntent(peer));
-  node.safetySupervisorTick();
+  node.sendBrakeHold();
   ASSERT_TRUE(node.replanOnce());
-  ASSERT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
-  const auto braking = node.currentTrajectory();
-  ASSERT_TRUE(braking);
-  ASSERT_GT(braking->duration, 0.0);
-  const ros::Time brake_start = node.planStart();
-
-  // 缺陷 8 回归：紧急制动后常规 replan 提交必须被拒绝，制动轨迹不能被覆盖。
-  // 制动期间 replanOnce 直接返回（emergency_braking_ 门禁）。
-  EXPECT_FALSE(node.replanOnce());
-  EXPECT_EQ(node.execState(), ego_planner_driver::kStateEmergencyBrake);
-  const auto after = node.currentTrajectory();
-  ASSERT_TRUE(after);
-  EXPECT_EQ(after->pts.size(), braking->pts.size());
-  EXPECT_TRUE(after->pts.front().isApprox(braking->pts.front()));
-  EXPECT_EQ(node.planStart(), brake_start);
-
-  // 制动轨迹正常走完 → BRAKE_HOLD（不再被 replan 打断恢复 EXECUTING）。
-  while (clock.get() <= 100.0 + braking->duration + 0.1)
-  {
-    node.publishSetpointTick();
-    clock.advance(0.02);
-  }
-  node.publishSetpointTick();
   EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
   const auto hold = node.steadyTarget();
   ASSERT_TRUE(hold);
-  EXPECT_LT((hold->pos - braking->pts.back()).norm(), 1e-8);
+  EXPECT_NEAR(hold->pos.x(), 0.0, 1e-6);
+  EXPECT_NEAR(hold->pos.z(), 5.0, 1e-6);
+  EXPECT_FALSE(static_cast<bool>(node.currentTrajectory()));
+  // 已锁存后后续 replanOnce 不覆盖（steady_target_ 拦截返回 false）。
+  EXPECT_FALSE(node.replanOnce());
+  EXPECT_EQ(node.execState(), ego_planner_driver::kStateBrakeHold);
 }
 
 TEST(EgoStateMachine, FirstPlanReadyForLeaderImmediately)
@@ -305,8 +278,9 @@ TEST(EgoStateMachine, FirstPlanTimeoutReleasesWithoutPredecessor)
 
 TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
 {
-  // 方案 Y：EMERGENCY 先尝试常规重规划（绕开），成功则提交并清除 emergency_pending_，
-  // 不触发制动；失败且 ttc ≥ emergency_replan_time_s 时收口 PLAN_FAILED（不制动）。
+  // implementation_plan_26090900 §0：EMERGENCY 先尝试常规重规划/让路绕开，
+  // 成功提交则清除 emergency_pending_ 继续执行（不锁存）；绕开失败才直接
+  // 锁存 BRAKE_HOLD（无 EMERGENCY_BRAKE 中间态）。
   FakeClock clock;
   clock.set(100.0);
   EgoPlannerDriverNode node;
@@ -318,8 +292,9 @@ TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
   ASSERT_TRUE(node.replanOnce());
   ASSERT_EQ(node.execState(), kStateExecuting);
 
-  // 对向交叉 peer：与本机直线轨迹在 x=2.5 交叉（<1m），预测越界时间 ttc≈2.0s
-  // > emergency_replan_time_s(1.0) → 常规 replan 失败则收口 PLAN_FAILED，不制动。
+  // 对向交叉 peer：与本机直线轨迹在 x=2.5 交叉（<1m，预测 EMERGENCY）。
+  // 监督回调只置位；replanOnce 统一处理：常规绕开成功 → 继续执行，失败 →
+  // 直接锁存 BRAKE_HOLD（不再收口 PLAN_FAILED / 无 EMERGENCY_BRAKE）。
   auto peer = makeIntent(100.0, 1, "UAV2");
   peer.t = {0.0, 5.0};
   peer.sampled_traj[0].position.x = 5.0;
@@ -328,14 +303,14 @@ TEST(EgoStateMachine, EmergencyReplanFirstMitigatesCollision)
   peer.sampled_traj[1].position.z = 5.0;
   ASSERT_TRUE(node.injectNeighborIntent(peer));
   node.safetySupervisorTick();
-  // 监督回调只置位；replanOnce 统一处理（可能成功绕开，也可能 PLAN_FAILED）。
+  // 监督回调只置位；replanOnce 统一处理（可能成功绕开，也可能直接 BRAKE_HOLD）。
   ASSERT_EQ(node.execState(), kStateExecuting);
   node.replanOnce();
-  EXPECT_NE(node.execState(), ego_planner_driver::kStateEmergencyBrake);
-  EXPECT_NE(node.execState(), ego_planner_driver::kStateBrakeHold);
-  // 要么重规划成功（继续执行），要么 ttc 充足收口 PLAN_FAILED（安全 HOLD）。
+  // 重规划成功（清除紧急标志继续执行）或直接 BRAKE_HOLD；不出现 PLAN_FAILED
+  // 与 EMERGENCY_BRAKE 中间态。
+  EXPECT_NE(node.execState(), ego_planner_driver::kStatePlanFailed);
   EXPECT_TRUE(node.execState() == kStateExecuting ||
-              node.execState() == ego_planner_driver::kStatePlanFailed);
+              node.execState() == ego_planner_driver::kStateBrakeHold);
 }
 
 TEST(EgoStateMachine, YieldHighIdCommitsLateralCandidate)
