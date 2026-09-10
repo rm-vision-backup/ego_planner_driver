@@ -9,6 +9,9 @@
   <!-- safety_supervisor_mode 业务默认来自 safety_defaults.yaml（active）；launch arg
        默认空，仅命令行显式传入时条件覆盖（implementation_plan_26083018 §3）。 -->
   <arg name="safety_supervisor_mode" default=""/>
+  <!-- 诊断日志目录使用 ~/catkin_swarm6-2/runtime_logs/ego_planner 约定，
+       不硬编码固定 home（implementation_plan_26091101 §7）。 -->
+  <arg name="diagnostic_log_dir" default="$(env HOME)/catkin_swarm6-2/runtime_logs/ego_planner"/>
 
   <!-- 身份参数放全局（/uav_id、/exec_target），供 EgoSwarmDriver 与 bridge 发现。 -->
   <param name="uav_id" value="$(arg uav_id)"/>
@@ -27,7 +30,7 @@
     <param name="frame_id" value="map"/>
     <param name="setpoint_out_topic" value="/setpoint/ego"/>
     <param name="safety_supervisor_mode" value="$(arg safety_supervisor_mode)" if="$(eval arg('safety_supervisor_mode') != '')"/>
-    <param name="diagnostic_log_dir" value="/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner"/>
+    <param name="diagnostic_log_dir" value="$(arg diagnostic_log_dir)"/>
     <param name="diagnostic_log_queue_size" value="2048"/>
   </node>
 </launch>
