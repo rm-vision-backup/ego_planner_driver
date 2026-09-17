@@ -149,7 +149,7 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 - `safety_supervisor_mode`：`off`（关闭）/ `shadow`（仅诊断日志，不改行为）/ `active`（接制动兜底）。
   正式 launch 与裸节点参数缺省均为 `active`；需要仅观测或关闭时可显式设置 `shadow` / `off`。
 - `SafetyLogger` 有界队列 + 单写线程，覆盖写
-  `/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner/UAVn-ego-planner.log`。
+  `/home/yjq/catkin_swarm6-2/runtime_logs/ego_planner/UAVn-ego-planner.log`。
 
 ## 结果分类（PlanResult，implementation_plan_26082722 §5）
 
@@ -246,8 +246,8 @@ identity/path/明确 deployment override（`uav_id`/`exec_target`/`frame_id`/`se
 为避免 ROS 运行日志散落在 `~/.ros/log`，本工作空间统一将运行日志重定向到 `.ros_home/`：
 
 ```bash
-export ROS_HOME=/home/ub20tg/catkin_swarm6-2/.ros_home
-export ROS_LOG_DIR=/home/ub20tg/catkin_swarm6-2/.ros_home/log
+export ROS_HOME=/home/yjq/catkin_swarm6-2/.ros_home
+export ROS_LOG_DIR=/home/yjq/catkin_swarm6-2/.ros_home/log
 mkdir -p "$ROS_LOG_DIR"
 ```
 

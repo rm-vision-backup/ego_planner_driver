@@ -315,7 +315,7 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
     }
     const std::string log_dir = pnh_.param(
         "diagnostic_log_dir",
-        std::string("/home/ub20tg/catkin_swarm6-2/runtime_logs/ego_planner"));
+        std::string("/home/yjq/catkin_swarm6-2/runtime_logs/ego_planner"));
     const int queue_capacity = std::max(1, pnh_.param("diagnostic_log_queue_size", 2048));
     if (!safety_logger_.start(log_dir, identity, static_cast<size_t>(queue_capacity)))
       ROS_WARN("[%s] safety diagnostic file unavailable; ROS logging remains active",

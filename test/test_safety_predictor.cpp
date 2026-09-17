@@ -154,7 +154,7 @@ TEST(ConflictEpisode, LatchesPeerAndReleasesAfterHysteresis)
 
 TEST(SafetyLogger, SanitizesOverwritesAndDrains)
 {
-  const std::string dir = "/home/ub20tg/catkin_swarm6-2/.tmp/safety_logger_test_" +
+  const std::string dir = "/home/yjq/catkin_swarm6-2/.tmp/safety_logger_test_" +
       std::to_string(static_cast<long long>(::getpid()));
   EXPECT_EQ(SafetyLogger::sanitizeIdentity("UAV1"), "UAV1");
   EXPECT_EQ(SafetyLogger::sanitizeIdentity("../UAV1"), "UNKNOWN");
@@ -176,7 +176,7 @@ TEST(SafetyLogger, SanitizesOverwritesAndDrains)
 
 TEST(SafetyLogger, BoundedQueueDropsOldestWithoutBlockingProducer)
 {
-  const std::string dir = "/home/ub20tg/catkin_swarm6-2/.tmp/safety_logger_queue_" +
+  const std::string dir = "/home/yjq/catkin_swarm6-2/.tmp/safety_logger_queue_" +
       std::to_string(static_cast<long long>(::getpid()));
   SafetyLogger logger;
   ASSERT_TRUE(logger.start(dir, "UAV2", 1));
