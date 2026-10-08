@@ -313,14 +313,14 @@ EgoPlannerDriverNode::EgoPlannerDriverNode()
       char hostname[256] = {};
       if (::gethostname(hostname, sizeof(hostname) - 1) == 0) identity = hostname;
     }
-    // 缺省路径从 $HOME 推导，与各 launch 的 $(env HOME)/catkin_swarm6-2/... 一致。
-    // 硬编码某个用户的 home 会在换机/换用户（机载是 nvidia）时静默丢监督日志：
-    // mkdir 失败只留一条 WARN，整架次没有 planner 诊断文件。
+    // 缺省路径从 $HOME 推导，与各 launch 的 $(env HOME)/catkin_swarm6-2/.ros_home/... 一致
+    // （采集脚本 log_fetch.sh 按同一路径回取，两边必须同源）。硬编码某个用户的 home 会在
+    // 换机/换用户（机载是 nvidia）时静默丢监督日志：mkdir 失败只留一条 WARN。
     std::string home;
     ros::get_environment_variable(home, "HOME");
     const std::string default_log_dir =
         home.empty() ? std::string()
-                     : home + "/catkin_swarm6-2/runtime_logs/ego_planner";
+                     : home + "/catkin_swarm6-2/.ros_home/log/ego_planner";
     const std::string log_dir = pnh_.param("diagnostic_log_dir", default_log_dir);
     const int queue_capacity = std::max(1, pnh_.param("diagnostic_log_queue_size", 2048));
     if (!safety_logger_.start(log_dir, identity, static_cast<size_t>(queue_capacity)))

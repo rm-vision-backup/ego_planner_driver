@@ -1458,7 +1458,7 @@ int main(int argc, char** argv)
   }
 
   // 单测不得写真实日志目录：节点的 diagnostic_log_dir 缺省是
-  // $HOME/catkin_swarm6-2/runtime_logs/ego_planner（与 launch 一致），而 SafetyLogger
+  // $HOME/catkin_swarm6-2/.ros_home/log/ego_planner（与 launch 一致），而 SafetyLogger
   // 以 trunc 打开——用缺省跑本文件会把真机/SITL 的 UAVn-ego-planner.log 清空。
   // 所有用例共用同一节点名，故在此一次性把私有参数指到临时目录。
   ros::param::set(ros::this_node::getName() + "/diagnostic_log_dir",

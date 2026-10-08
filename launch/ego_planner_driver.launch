@@ -9,9 +9,9 @@
   <!-- safety_supervisor_mode 业务默认来自 safety_defaults.yaml（active）；launch arg
        默认空，仅命令行显式传入时条件覆盖（implementation_plan_26083018 §3）。 -->
   <arg name="safety_supervisor_mode" default=""/>
-  <!-- 诊断日志目录使用 ~/catkin_swarm6-2/runtime_logs/ego_planner 约定，
-       不硬编码固定 home（implementation_plan_26091101 §7）。 -->
-  <arg name="diagnostic_log_dir" default="$(env HOME)/catkin_swarm6-2/runtime_logs/ego_planner"/>
+  <!-- 诊断日志目录使用 ~/catkin_swarm6-2/.ros_home/log/ego_planner 约定（与其余运行日志同根，
+       采集脚本 log_fetch.sh 按同一路径回取），不硬编码固定 home（implementation_plan_26091101 §7）。 -->
+  <arg name="diagnostic_log_dir" default="$(env HOME)/catkin_swarm6-2/.ros_home/log/ego_planner"/>
 
   <!-- 身份参数放全局（/uav_id、/exec_target），供 EgoSwarmDriver 与 bridge 发现。 -->
   <param name="uav_id" value="$(arg uav_id)"/>

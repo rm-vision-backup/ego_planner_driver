@@ -149,7 +149,7 @@ C++ 侧 `waypoint_consumed_` 指向当前目标（初始 = 相邻下一个 keypo
 - `safety_supervisor_mode`：`off`（关闭）/ `shadow`（仅诊断日志，不改行为）/ `active`（接制动兜底）。
   正式 launch 与裸节点参数缺省均为 `active`；需要仅观测或关闭时可显式设置 `shadow` / `off`。
 - `SafetyLogger` 有界队列 + 单写线程，覆盖写
-  `$HOME/catkin_swarm6-2/runtime_logs/ego_planner/UAVn-ego-planner.log`
+  `$HOME/catkin_swarm6-2/.ros_home/log/ego_planner/UAVn-ego-planner.log`
   （缺省路径由 `$HOME` 推导，与各 launch 的 `$(env HOME)` 一致；也可用 launch 参数覆盖）。
 
 ## 结果分类（PlanResult，implementation_plan_26082722 §5）
