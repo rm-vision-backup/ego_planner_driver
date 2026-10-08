@@ -154,7 +154,9 @@ TEST(ConflictEpisode, LatchesPeerAndReleasesAfterHysteresis)
 
 TEST(SafetyLogger, SanitizesOverwritesAndDrains)
 {
-  const std::string dir = "/home/yjq/catkin_swarm6-2/.tmp/safety_logger_test_" +
+  // 临时目录用 gtest 的 TempDir()（尊重 $TMPDIR），不写死某个用户的 home：
+  // 否则换机/换用户（机载 nvidia）跑 test 会直接红。
+  const std::string dir = testing::TempDir() + "safety_logger_test_" +
       std::to_string(static_cast<long long>(::getpid()));
   EXPECT_EQ(SafetyLogger::sanitizeIdentity("UAV1"), "UAV1");
   EXPECT_EQ(SafetyLogger::sanitizeIdentity("../UAV1"), "UNKNOWN");
@@ -176,7 +178,7 @@ TEST(SafetyLogger, SanitizesOverwritesAndDrains)
 
 TEST(SafetyLogger, BoundedQueueDropsOldestWithoutBlockingProducer)
 {
-  const std::string dir = "/home/yjq/catkin_swarm6-2/.tmp/safety_logger_queue_" +
+  const std::string dir = testing::TempDir() + "safety_logger_queue_" +
       std::to_string(static_cast<long long>(::getpid()));
   SafetyLogger logger;
   ASSERT_TRUE(logger.start(dir, "UAV2", 1));
