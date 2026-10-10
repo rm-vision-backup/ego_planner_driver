@@ -720,7 +720,11 @@ bool EgoPlannerDriverNode::replanOnce(bool timed_trigger)
     // epoch; it must never be added to relative samples or duration.
     current_.reset(new TimedTrajectory(traj));
     plan_start_ = completed_at;
-    arrival_since_.reset();
+    // 不清 arrival_since_：例行重规划（replanLoop 每 replan_period_s 定时兜底，
+    // 见 1988 起）不改变"已在最终航点附近"这一事实，清窗会让 1.0s 稳定窗永远
+    // 攒不满（2026-10-08 十机 SITL 实测：距终航点 0.3m 悬停、1Hz 重规划 184s
+    // 无一次 COMPLETED，被迫卡在目标下方）。新目标/悬停的清理由 resetRun() 与
+    // captureHoldTargetLocked() 负责；离开 0.5m 球由 checkArrival 的距离分支清零。
     steady_target_.reset();
     plan_fail_since_ = ros::Time();  // 常规 replan 提交 = 软着陆恢复（退出失败计时）
     // 常规 replan 成功 → 清除 EMERGENCY 事件（监督层对提交后新轨迹重新评估）。
