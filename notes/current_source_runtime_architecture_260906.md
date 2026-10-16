@@ -1,4 +1,8 @@
-# 当前源码运行架构（现状图鉴，2026-09-08 重构）
+# 历史源码运行架构（2026-09-08 快照）
+
+> **历史快照，不是当前源码图鉴（2026-10-16 标注）。** 后续 26090900 直锁 BRAKE_HOLD、
+> 实机入口、swarm_pose 与 bundle 等演进未完整回填。当前实现查 [本包 README](../README.md)、
+> [executor README](../../swarm_uav_executor/README.md) 和源码；下文“当前/将落地”仅指记录当时。
 
 > 只画「当前源码怎么跑」，不是设计。目标设计见 `offboard_new_state_machine_260902.md`（051e84e）；
 > 将落地的加固见 `src/tcp_to_ros/plans/implementation_plan_26090802.md`（未实施，图中以 ⚑26090802 标注；

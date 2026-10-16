@@ -5,13 +5,14 @@
 - 抽取 ego-planner-swarm 内核的 bspline 优化与轨迹生成，纯数值无 ROS 依赖（`EgoPlannerCore`）。
 - 保留 jerk 平滑、动态可行性、reciprocal swarm 避碰三项代价；排除感知/静态障碍外挂。
 - 通过 ROS 节点订阅本机目标/邻机轨迹意图，发布 setpoint 与本机轨迹意图。
-- 该包是独立 Git 仓库，不 push、不配置 remote。
+- 该包是总工作区登记的独立 Git 子模块；提交与主仓指针同步按总工作区 `claude.md`。
 
 > 本文档是本包**状态机 + replan 策略的单一权威**。实现计划的演进记录见
 > `src/tcp_to_ros/plans/README.md`「当前状态」；测试证据见 `src/tcp_to_ros/test_records/`。
 >
 > 历史注记（2026-09-08）：本包曾按 implementation_plan_26090802 实施 A-D（提交 9a798e6/9a4a662），当日因复测
-> 需求由新增提交 dd27824 回退至实施前源码（c8ba068）；本文档内容即当前（回退后）状态。
+> 需求由新增提交 dd27824 回退至实施前源码（c8ba068）；后续 26090900 又落地了新的直锁 BRAKE_HOLD，
+> 不能把当前实现等同于 09-08 回退基线。`notes/` 中两份状态机/架构文档仅作历史设计和快照。
 
 ## 接口与命名空间
 
@@ -19,7 +20,7 @@
 
 | Topic | 类型 | 方向 |
 |---|---|---|
-| `exec_state` | `std_msgs/String`（latched） | 出：8 态（见下方状态机） |
+| `exec_state` | `std_msgs/String`（latched） | 出：7 态（见下方状态机） |
 | `setpoint/ego` | `mavros_msgs/PositionTarget` | 出：30 Hz 候选命令（`FRAME_LOCAL_NED`，业务字段 ROS ENU；`setpoint_relay` 独占转发 `/mavros/setpoint_raw/local`） |
 | `trajectory_intent` | `swarm_uav_interfaces/UavTrajectoryIntent` | 出：本机带时轨迹（生成即发） |
 | `goal` | `geometry_msgs/PointStamped` | 入：单点目标 |
@@ -46,7 +47,7 @@
 - `direct_control_active=true` 时本节点停止发布候选，MAVROS 所有权由 relay 保证；
 - `setpoint_relay`（swarm_uav_executor）是 `/mavros/setpoint_raw/local` 唯一发布者，本节点不直接发 MAVROS setpoint。
 
-## 状态机（8 态）
+## 状态机（7 态）
 
 ```
 HOLD(初始) ──arm+OFFBOARD──► TAKEOFF ──爬升到 takeoff_height_m(5m)──► HOLD

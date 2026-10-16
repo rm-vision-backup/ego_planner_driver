@@ -1,5 +1,9 @@
 # Offboard 新状态机设计（2026-09-02）
 
+> **历史设计提案，未整体按本文实现（2026-10-16 标注）。** 部分思路曾由 26090802 实施后回退，
+> 之后 26090900 采用了不同的安全收口方案。保留用于追溯设计原因，不作为现有状态机/门禁的依据；
+> 当前说明见 [本包 README](../README.md) 与 [计划状态索引](../../tcp_to_ros/plans/README.md)。
+
 本文逐步整理 `swarm_uav_executor` 与 `ego_planner_driver` 的新状态机设计。任务名称与固定命令按《实物无人机上下层 TCP/IP 接口对接方案》区分：任务名称表示高层目的，可以任意命名；`MOVE_TO`、`FOLLOW_ROUTE`、`FAULT_EXIT`、`HOVER`、`HOLD` 等是固定的 `command` 字段。
 
 ---
